@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fd-airquality"
+version = "0.1.0"
+description = "Station-local federated air-quality forecasting with Flower"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+    "flwr[simulation]>=1.40,<1.41",
+    "darts[torch]>=0.48.1,<0.49",
+    # TTM-R3 is not implemented in the PyPI 0.3.10 release. Pin upstream source.
+    "granite-tsfm @ git+https://github.com/ibm-granite/granite-tsfm.git@3d92535ca4138648b9d1e2f3f1421b5dec4dc3aa",
+    "datasets>=4,<5",
+    "transformers==4.57.6",
+    "mlflow==3.17.2",
+    "matplotlib>=3.10.8",
+    "numpy>=2.3.5",
+    # Prevent the resolver from falling back to pre-Python-3.11 Numba sdists.
+    "numba>=0.62.1",
+    # Flower resolves its own runtime: keep evaluation identical to the uv lock.
+    "pandas==2.3.3",
+    "prophet>=1.3.0",
+    "requests>=2.32.5",
+    "scikit-learn>=1.7.2",
+    "scipy>=1.17.1",
+    "seaborn>=0.13.2",
+    "statsmodels>=0.14.6",
+    "statsforecast>=1.4",
+    "tabulate>=0.9.0",
+    "torch==2.11.0+cu128",
+    "urllib3>=2.6.3",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.2.0",
+    "pytest>=9.0.3",
+    "ruff>=0.11",
+]
+
+[project.scripts]
+fd-airquality = "fd_airquality.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: real pinned foundation checkpoints (explicit FD_AIRQUALITY_REAL_MODELS=1)"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.flwr.app]
+publisher = "fd-airquality"
+fab-include = ["src/fd_airquality/**"]
+
+[tool.flwr.app.components]
+serverapp = "fd_airquality.server_app:app"
+clientapp = "fd_airquality.client_app:app"
+
+[tool.flwr.app.config]
+manifest = "data/federated/manifest.json"
+output-dir = "reports/federated"
+num-server-rounds = 5
+local-epochs = 1
+batch-size = 128
+learning-rate = 0.001
+weight-decay = 0.01
+hidden-size = 64
+strategy = "fedavg"
+proximal-mu = 0.01
+seed = 42
+device = "cpu"
+torch-threads = 1
+model = "mlp"
+latent-size = 16
+reconstruction-weight = 0.1
+hf-revision = ""
+flowstate-scale-factor = 1.0
+mlflow-tracking-uri = ""
+mlflow-experiment = "fd-airquality"
+mlflow-log-models = 1
+adaptation = "auto"
+lora-rank = 4
+lora-alpha = 8.0
+lora-dropout = 0.0
+lora-targets = "auto"
+fair-iterations = 1000
+fair-learning-rate = 0.01
+fair-lambda = 1.0
+selection-metric = "macro-mase"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

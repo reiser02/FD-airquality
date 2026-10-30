@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Station-local prepared data and simulation artifacts
+data/
+reports/
+.pytest_cache/
+.ruff_cache/
+.flwr/
+ray_results/
+*.fab
+
+
+.agents
