@@ -1,0 +1,82 @@
+# Se carga automáticamente al ejecutar fd-airquality desde este directorio.
+# Prioridad: argumentos CLI > sección del comando > [run] > valores internos.
+# Las rutas relativas se interpretan desde el directorio de ejecución, como en CLI.
+
+[prepare]
+raw-root = "data/raw/datos_estaciones_5m"
+output = "data/federated"
+pollutant = "NO2"
+context = 90
+horizon = 12
+stride = 6
+train-stride = 1
+min-train-windows = 1
+min-validation-windows = 7
+min-test-windows = 15
+# max-train-windows = 128  # Solo para pruebas; omitir para usar todas las ventanas.
+# station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+seasonality = 24
+error-scale-hours = 672
+min-run = 6
+min-useful = 1
+zero-run-hours = 24
+split-mode = "global"
+quality-mode = "causal"
+validation-start = "2026-03-01"
+test-start = "2026-03-29"
+test-end = "2026-04-26"
+validation-hours = 48
+test-hours = 96
+
+# Opciones compartidas por simulate, baseline y benchmark.
+[run]
+# manifest = "data/federated/<preparacion>/manifest.json"  # Omitir: la más reciente.
+num-server-rounds = 5
+local-epochs = 1
+batch-size = 128
+learning-rate = 0.001
+weight-decay = 0.01
+hidden-size = 64
+strategy = "fedavg"
+proximal-mu = 0.01
+seed = 42
+device = "cpu"
+torch-threads = 1
+model = "mlp"
+latent-size = 16
+reconstruction-weight = 0.1
+hf-revision = ""
+flowstate-scale-factor = 1.0
+mlflow-tracking-uri = ""
+mlflow-experiment = "fd-airquality"
+mlflow-log-models = 1
+adaptation = "auto"
+lora-rank = 4
+lora-alpha = 8.0
+lora-dropout = 0.0
+lora-targets = "auto"
+fair-iterations = 1000
+fair-learning-rate = 0.01
+fair-lambda = 1.0
+selection-metric = "macro-mase"
+
+[simulate]
+output-dir = "reports/federated"
+workers = 2
+client-gpus = 0.0
+print-command = false
+
+[baseline]
+output-dir = "reports/non_federated"
+mode = "local"
+
+[benchmark]
+output-dir = "reports/benchmarks"
+models = ["mlp", "autoencoder", "darts-nlinear", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
+modes = ["federated", "local", "centralized", "zero-shot"]
+adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
+workers = 2
+client-gpus = 0.0
+# seeds = [42, 43, 44]
+# lora-ranks = [4, 8]
+# strategies = ["fedavg", "fedprox"]
