@@ -9,12 +9,12 @@ pollutant = "NO2"
 context = 90
 horizon = 12
 stride = 6
-train-stride = 1
+train-stride = 6
 min-train-windows = 1
 min-validation-windows = 7
 min-test-windows = 15
 # max-train-windows = 128  # Solo para pruebas; omitir para usar todas las ventanas.
-# station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
 seasonality = 24
 error-scale-hours = 672
 min-run = 6
@@ -59,6 +59,8 @@ fair-iterations = 1000
 fair-learning-rate = 0.01
 fair-lambda = 1.0
 selection-metric = "macro-mase"
+heartbeat-seconds = 60.0
+log-level = "INFO"
 
 [simulate]
 output-dir = "reports/federated"
@@ -73,10 +75,11 @@ mode = "local"
 [benchmark]
 output-dir = "reports/benchmarks"
 models = ["mlp", "autoencoder", "darts-nlinear", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
-modes = ["federated", "local", "centralized", "zero-shot"]
+modes = ["local", "centralized", "federated", "zero-shot"]
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
 workers = 2
 client-gpus = 0.0
 # seeds = [42, 43, 44]
 # lora-ranks = [4, 8]
 # strategies = ["fedavg", "fedprox"]
+# max-parallel-models = 2  # Omitir: un candidato por GPU utilizable. CPU: secuencial.

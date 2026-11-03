@@ -358,7 +358,21 @@ existente, ajustado con entrenamiento, por lo que no representa un protocolo sin
 ningún acceso a historia de entrenamiento. Se evalúa validación una vez y después
 test, sin seleccionar escala, revisión o hiperparámetros con este último.
 
-`benchmark` fija un manifest y ejecuta la matriz solicitada secuencialmente.
+`benchmark` fija un manifest y ejecuta los modos secuencialmente en el orden
+solicitado: por defecto local, centralizado, federado y zero-shot. Entre modos hay
+una barrera: no comienza el siguiente hasta completar todos los candidatos del anterior.
+Dentro de local/centralizado/zero-shot, los candidatos completos pueden ejecutarse
+en procesos independientes, uno por GPU utilizable, sin cambiar ventanas, semillas,
+presupuestos ni criterios de selección. `max-parallel-models` limita esa concurrencia;
+no distribuye estaciones de un mismo candidato local ni implementa entrenamiento
+de un modelo entre varias GPUs. CPU/fallback se mantiene secuencial.
+
+En federado los candidatos permanecen secuenciales: Ray gestiona el paralelismo de
+clientes de una sola federación, con los recursos declarados por `workers` y
+`client-gpus`. No se presupone coordinación de GPUs entre runtimes Ray independientes.
+Un fallo detiene/cancela los procesos del benchmark, marca los casos no finalizados
+y evita comparar un panel o una matriz incompletos. El orden de terminación de
+candidatos no cambia la identidad ni el orden de las filas de resultados.
 `compare` requiere el mismo SHA del manifest, clientes completos y recuentos de
 targets compatibles. Emite una tabla global y otra por estación, además de
 `pairwise_comparison.csv` y `station_pairwise_comparison.csv`: todos los pares
@@ -376,6 +390,16 @@ si la MAE de persistencia es cero. Las comparaciones son descriptivas, sin afirm
 significación estadística ni independencia de los orígenes rolling solapados.
 
 ## Trazabilidad con MLflow
+
+El logging operativo es independiente del tracking: `benchmark.log` global,
+logs por candidato y `run.log` se actualizan durante la ejecución. Una cola
+serializa los registros en el coordinador; los subprocesos envían su salida por
+pipes y cada uno recibe una única GPU visible. El flujo externo de Flower se
+captura expresamente en `flower.log`, no se presupone que los handlers Python del
+coordinador capturen automáticamente procesos externos. Los actores guardan su
+detalle por partición en `clients/`. Los logs no incluyen series ni predicciones.
+El heartbeat informa de estado y tiempo sin nuevos eventos; no mide avance real,
+porcentaje de cómputo o ETA. `benchmark.json` se actualiza con reemplazo atómico.
 
 Cada ejecución registra un run MLflow desde el servidor o coordinador del control,
 no desde cada actor Ray. Se guardan parámetros, geometría, hash del manifest,
@@ -399,3 +423,6 @@ código de esta aplicación. Flower resuelve su entorno aislado con uv y puede
 diferir del lock de desarrollo; esos cambios deben revisarse antes de interpretar
 comparaciones. MLflow no anonimiza nombres/rutas ni convierte la simulación en
 privacidad formal; los runs y checkpoints deben protegerse según su sensibilidad.
+El experimento se inicializa en el coordinador antes de los procesos concurrentes.
+Los eventos y métricas de cada candidato permanecen en su propio run; el log
+adjuntado al terminar tracking es un snapshot, no un servicio remoto de streaming.

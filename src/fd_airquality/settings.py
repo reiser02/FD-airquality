@@ -39,6 +39,8 @@ class RunSettings:
     fair_learning_rate: float = 0.01
     fair_lambda: float = 1.0
     selection_metric: str = "macro-mase"
+    heartbeat_seconds: float = 60.0
+    log_level: str = "INFO"
 
     def __post_init__(self) -> None:
         for name in ("num_server_rounds", "local_epochs", "batch_size", "hidden_size", "torch_threads", "latent_size", "lora_rank", "fair_iterations"):
@@ -76,6 +78,10 @@ class RunSettings:
             raise ValueError("Hiperparámetros LoRA/LoRA-FAIR inválidos.")
         if self.selection_metric not in {"macro-mase", "macro-rmsse", "mae"}:
             raise ValueError("selection_metric debe ser macro-mase, macro-rmsse o mae.")
+        if not isfinite(self.heartbeat_seconds) or self.heartbeat_seconds <= 0:
+            raise ValueError("heartbeat_seconds debe ser finito y positivo.")
+        if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
+            raise ValueError("log_level debe ser DEBUG, INFO, WARNING o ERROR.")
 
     @classmethod
     def from_mapping(cls, config: Mapping) -> "RunSettings":

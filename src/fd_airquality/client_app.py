@@ -1,6 +1,8 @@
 """Flower Message API client; only this layer opens station-local artifacts."""
 
+from contextlib import nullcontext
 from dataclasses import replace
+from pathlib import Path
 
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
@@ -9,6 +11,7 @@ from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.data import WindowDataset, load_client_data
 from fd_airquality.federated_adapters import tensor_bytes
 from fd_airquality.models import load_shared_state, shared_state
+from fd_airquality.run_logging import RunLogging, progress_context, report_progress, run_label
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import configure_torch, evaluate_local, make_model, train_local
 
@@ -19,6 +22,15 @@ def _local_task(message: Message, context: Context, training: bool) -> Message:
     if "manifest" in config:
         settings = replace(settings, manifest=str(config["manifest"]))
     partition = int(config.get("partition-id", context.node_config["partition-id"]))
+    logs = (RunLogging(Path(config["log-dir"]), run_label(settings, "federated") + f" partition={partition}",
+                       filename=f"client_{partition:03d}.log", level=settings.log_level,
+                       heartbeat_seconds=settings.heartbeat_seconds) if "log-dir" in config else nullcontext())
+    with logs, progress_context(partition=partition, round=config.get("server-round", 0)):
+        report_progress("client", f"training={training}")
+        return _execute_task(message, settings, partition, training)
+
+
+def _execute_task(message, settings, partition, training):
     manifest, artifact = load_client_data(settings.manifest, partition)
     if source_fingerprints() != manifest["preparation_sources"]:
         raise ValueError("Cambió el código local de preparación; vuelve a ejecutar prepare.")

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
+import re
 import shlex
+import shutil
 import subprocess
 import tomllib
 from dataclasses import asdict, fields, replace
@@ -22,9 +25,11 @@ from fd_airquality.models import (
     validate_run_mode,
 )
 from fd_airquality.panels import prepare_runtime_panel
+from fd_airquality.processes import ProcessRunner
+from fd_airquality.run_logging import RunLogging, report_progress, run_label
 from fd_airquality.settings import RunSettings, resolve_manifest
 from fd_airquality.task import resolve_device, validate_selection_coverage
-from fd_airquality.tracking import tracking_uri
+from fd_airquality.tracking import initialize_tracking, tracking_uri
 
 
 def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
@@ -40,12 +45,14 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     data.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
     for field in fields(DataConfig):
         data.add_argument(f"--{field.name.replace('_', '-')}", type=str if isinstance(getattr(DataConfig(), field.name), str) else int)
+    data.add_argument("--heartbeat-seconds", type=float, default=60.0)
+    data.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     audit = commands.add_parser("inspect", help="Resumen del soporte y las exclusiones, sin entrenar.")
     audit.add_argument("--manifest")
     simulation = commands.add_parser("simulate", help="Ejecutar flwr run en el simulador local oficial.")
     simulation.add_argument("--manifest", help="Por defecto: la preparación más reciente.")
     simulation.add_argument("--output-dir", default="reports/federated")
-    simulation.add_argument("--workers", type=int, default=2, help="Máximo de clientes CPU simultáneos.")
+    simulation.add_argument("--workers", type=int, default=2, help="Máximo de clientes federados simultáneos.")
     simulation.add_argument("--client-gpus", type=float, default=0.0)
     simulation.add_argument("--print-command", action=argparse.BooleanOptionalAction, default=False,
                             help="Preparar el comando sin lanzarlo.")
@@ -58,7 +65,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     benchmark.add_argument("--output-dir", default="reports/benchmarks")
     benchmark.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
     benchmark.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
-                           default=["federated", "local", "centralized", "zero-shot"])
+                           default=["local", "centralized", "federated", "zero-shot"])
     benchmark.add_argument("--workers", type=int, default=2)
     benchmark.add_argument("--client-gpus", type=float, default=0.0)
     benchmark.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
@@ -66,6 +73,8 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     benchmark.add_argument("--seeds", nargs="+", type=int)
     benchmark.add_argument("--lora-ranks", nargs="+", type=int)
     benchmark.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
+    benchmark.add_argument("--max-parallel-models", type=int,
+                           help="Límite de candidatos por modo no federado; por defecto uno por GPU. CPU: secuencial.")
     comparison = commands.add_parser("compare", help="Comparar resultados completos del mismo manifest.")
     comparison.add_argument("runs", nargs="*", type=Path)
     comparison.add_argument("--output", type=Path)
@@ -88,6 +97,21 @@ def _toml_scalar(value: str | float) -> str:
 
 
 def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, dry_run: bool) -> Path | None:
+    project = Path.cwd()
+    with (project / "pyproject.toml").open("rb") as stream:
+        config = tomllib.load(stream)
+    if config["project"]["name"] != "fd-airquality":
+        raise ValueError("Ejecuta simulate desde la raíz de FD-airquality.")
+    home = project / ".flwr"
+    launches = home / "launches"
+    launches.mkdir(parents=True, exist_ok=True)
+    overrides = launches / f"{datetime.now(UTC):%Y%m%d_%H%M%S_%f}.toml"
+    with RunLogging(overrides.with_suffix(""), run_label(settings, "launcher"), level=settings.log_level,
+                    heartbeat_seconds=settings.heartbeat_seconds):
+        return _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides)
+
+
+def _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides):
     validate_run_mode(settings, "federated")
     if workers < 1 or client_gpus < 0:
         raise ValueError("workers debe ser positivo y client-gpus no negativo.")
@@ -98,17 +122,10 @@ def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, d
             client_gpus = 0.0
         elif client_gpus <= 0:
             raise ValueError("Con device=cuda reserva recursos mediante --client-gpus.")
+    else:
+        client_gpus = 0.0
     manifest = read_manifest(settings.manifest)
     validate_model_geometry(manifest["geometry"], settings)
-    project = Path.cwd()
-    with (project / "pyproject.toml").open("rb") as stream:
-        config = tomllib.load(stream)
-    if config["project"]["name"] != "fd-airquality":
-        raise ValueError("Ejecuta simulate desde la raíz de FD-airquality.")
-    home = project / ".flwr"
-    launches = home / "launches"
-    launches.mkdir(parents=True, exist_ok=True)
-    overrides = launches / f"{datetime.now(UTC):%Y%m%d_%H%M%S_%f}.toml"
     settings, manifest = prepare_runtime_panel(settings, overrides.with_suffix(""))
     validate_selection_coverage(manifest, settings, "federated")
     overrides.write_text("\n".join(
@@ -123,7 +140,7 @@ def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, d
         "uv", "run", "--frozen", "flwr", "run", ".", "local", "--stream",
         "--run-config", str(overrides), "--federation-config", federation,
     ]
-    print(f"{nodes} estaciones; hasta {min(workers, nodes)} clientes CPU simultáneos.", flush=True)
+    print(f"{nodes} estaciones; hasta {min(workers, nodes)} clientes federados simultáneos.", flush=True)
     print(shlex.join(command), flush=True)
     if not dry_run:
         results_root = Path(settings.output_dir)
@@ -136,21 +153,46 @@ def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, d
             MKL_NUM_THREADS=str(settings.torch_threads),
         )
         Path(env["RAY_TMPDIR"]).mkdir(parents=True, exist_ok=True)
-        subprocess.run(command, check=True, env=env)
-        # A successful CLI submission/logstream alone does not prove the ServerApp succeeded.
-        completed = [
-            path for path in set(results_root.glob("*/run.json")) - previous_runs
-            if json.loads(path.read_text(encoding="utf-8"))["settings"] == asdict(settings)
-            and (path.parent / "test_metrics.json").is_file()
-        ]
-        if not completed:
-            raise RuntimeError(
-                "Flower terminó sin resultados de test completos para esta configuración. "
-                "Revisa los errores del logstream y .flwr/local-superlink/superlink.log."
-            )
-        if len(completed) != 1:
-            raise RuntimeError("Se encontraron varias ejecuciones completas; no se puede atribuir el resultado.")
-        return completed[0].parent
+        env["PYTHONUNBUFFERED"] = "1"
+        flower_log = overrides.with_suffix("") / "flower.log"
+        run_id = None
+
+        def on_line(line):
+            nonlocal run_id
+            match = re.fullmatch(r"Successfully started run\s+(\d+)", line.strip())
+            if run_id is None and match:
+                run_id = match.group(1)
+
+        report_progress("flower", f"workers={workers} client_gpus={client_gpus} log={flower_log}")
+        try:
+            ProcessRunner().stream(command, env, flower_log, "flower", on_line=on_line)
+            # A successful logstream alone does not prove the ServerApp succeeded.
+            completed = [
+                path for path in set(results_root.glob("*/run.json")) - previous_runs
+                if json.loads(path.read_text(encoding="utf-8"))["settings"] == asdict(settings)
+                and (path.parent / "test_metrics.json").is_file()
+            ]
+            if not completed:
+                raise RuntimeError(
+                    "Flower terminó sin resultados de test completos para esta configuración. "
+                    "Revisa los errores del logstream y .flwr/local-superlink/superlink.log."
+                )
+            if len(completed) != 1:
+                raise RuntimeError("Se encontraron varias ejecuciones completas; no se puede atribuir el resultado.")
+            shutil.copyfile(flower_log, completed[0].parent / "flower.log")
+            return completed[0].parent
+        except BaseException:
+            if run_id is not None:
+                try:
+                    stopped = subprocess.run(
+                        ["uv", "run", "--frozen", "flwr", "stop", run_id, "local"],
+                        check=True, env=env, text=True, stdout=subprocess.PIPE,
+                        stderr=subprocess.STDOUT, timeout=30,
+                    )
+                    logging.getLogger(__name__).warning("Flower run %s detenido: %s", run_id, stopped.stdout)
+                except (OSError, subprocess.SubprocessError):
+                    logging.getLogger(__name__).exception("No se pudo detener Flower run %s", run_id)
+            raise
     return None
 
 
@@ -165,9 +207,9 @@ def build_benchmark_matrix(models: list[str], modes: list[str], adaptations: lis
         raise ValueError("Combinación desconocida en la matriz.")
     matrix = []
     controls = (["lora"] if set(adaptations) - {"ffa-lora"} else []) + (["ffa-lora"] if "ffa-lora" in adaptations else [])
-    for model in models:
-        foundation = model in GRANITE
-        for mode in modes:
+    for mode in modes:
+        for model in models:
+            foundation = model in GRANITE
             if mode == "zero-shot":
                 if foundation:
                     matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
@@ -184,10 +226,16 @@ def build_benchmark_matrix(models: list[str], modes: list[str], adaptations: lis
 
 def run_benchmark(settings: RunSettings, models: list[str], modes: list[str], workers: int, client_gpus: float,
                   adaptations: list[str] | None = None, seeds: list[int] | None = None,
-                  lora_ranks: list[int] | None = None, strategies: list[str] | None = None) -> Path:
+                  lora_ranks: list[int] | None = None, strategies: list[str] | None = None,
+                  max_parallel_models: int | None = None) -> Path:
     from fd_airquality.baselines import run_baseline
     from fd_airquality.comparison import compare_runs
+    from fd_airquality.execution import execute_plan
 
+    if max_parallel_models is not None and (type(max_parallel_models) is not int or max_parallel_models < 1):
+        raise ValueError("max-parallel-models debe ser un entero positivo.")
+    if workers < 1 or client_gpus < 0:
+        raise ValueError("workers debe ser positivo y client-gpus no negativo.")
     manifest = read_manifest(settings.manifest)
     matrix = build_benchmark_matrix(models, modes, adaptations or ["lora", "ffa-lora", "flora", "lora-fair"], strategies or [settings.strategy])
     seeds, ranks = seeds or [settings.seed], lora_ranks or [settings.lora_rank]
@@ -204,39 +252,28 @@ def run_benchmark(settings: RunSettings, models: list[str], modes: list[str], wo
         current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
         validate_model_geometry(manifest["geometry"], current)
         validate_run_mode(current, case["mode"])
-    # Validate ALL geometries first, then all requested target/rank inventories.
-    # No classic run starts before discovering an invalid foundation setting.
-    checked = set()
-    for case in plan:
-        if case["model"] in GRANITE and case["mode"] != "zero-shot":
-            key = (case["model"], case["lora_rank"])
-            if key not in checked:
-                current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
-                model_metadata(manifest["geometry"], current)
-                checked.add(key)
     root = Path(settings.output_dir).resolve() / f"benchmark_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
     root.mkdir(parents=True, exist_ok=False)
-    settings, manifest = prepare_runtime_panel(settings, root)
-    settings = replace(settings, output_dir=str(root / "runs"))
-    paths = []
-    progress = [case | {"status": "pending"} for case in plan]
-    progress_path = root / "benchmark.json"
-    for index, case in enumerate(plan):
-        mode = case["mode"]
-        print(f"\nCaso {index + 1}/{len(plan)}: {case}", flush=True)
-        current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
-        progress[index]["status"] = "running"
-        progress_path.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
-        try:
-            path = launch_simulation(current, workers, client_gpus, dry_run=False) if mode == "federated" else run_baseline(current, mode)
-        except Exception as exc:
-            progress[index].update(status="failed", error=str(exc))
-            progress_path.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
-            raise
-        paths.append(path)
-        progress[index].update(status="completed", output=str(path))
-        progress_path.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
-    return compare_runs(paths, root / "comparison")
+    with RunLogging(root, "benchmark", filename="benchmark.log", level=settings.log_level,
+                    heartbeat_seconds=settings.heartbeat_seconds) as progress_log:
+        settings, manifest = prepare_runtime_panel(settings, root)
+        checked = set()
+        for case in plan:
+            if case["model"] in GRANITE and case["mode"] != "zero-shot":
+                key = (case["model"], case["lora_rank"])
+                if key not in checked:
+                    report_progress("preflight", f"loading model={case['model']} rank={case['lora_rank']}")
+                    current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
+                    model_metadata(manifest["geometry"], current)
+                    checked.add(key)
+        settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
+        report_progress("tracking", "initializing MLflow before concurrent candidates")
+        initialize_tracking(settings, root / "mlflow-artifacts")
+        paths = execute_plan(settings, plan, root, workers=workers, client_gpus=client_gpus,
+                             max_parallel_models=max_parallel_models, baseline=run_baseline,
+                             launch=launch_simulation, progress_log=progress_log)
+        report_progress("comparison", f"completed_candidates={len(paths)}")
+        return compare_runs(paths, root / "comparison")
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -250,11 +287,18 @@ def main(argv: list[str] | None = None) -> None:
                 field.name: getattr(args, field.name)
                 for field in fields(DataConfig) if getattr(args, field.name) is not None
             }
-            manifest = prepare(
-                args.raw_root.expanduser().resolve(),
-                args.output, args.pollutant, DataConfig(**overrides),
-                set(args.station) if args.station else None,
-            )
+            log_dir = args.output / "logs" / f"prepare_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
+            with RunLogging(log_dir, f"prepare pollutant={args.pollutant}", level=args.log_level,
+                            heartbeat_seconds=args.heartbeat_seconds) as log:
+                report_progress("prepare", f"raw_root={args.raw_root} pollutant={args.pollutant}")
+                manifest = prepare(
+                    args.raw_root.expanduser().resolve(),
+                    args.output, args.pollutant, DataConfig(**overrides),
+                    set(args.station) if args.station else None,
+                )
+                report_progress("prepare", f"manifest={manifest}")
+            if manifest.is_file():
+                shutil.copyfile(log.path, manifest.parent / "prepare.log")
             print(f"Manifest: {manifest}")
             _inspect(manifest)
         elif args.command == "inspect":
@@ -287,7 +331,8 @@ def main(argv: list[str] | None = None) -> None:
                 run_baseline(settings, args.mode)
             else:
                 run_benchmark(settings, args.models, args.modes, args.workers, args.client_gpus,
-                              args.adaptations, args.seeds, args.lora_ranks, args.strategies)
+                               args.adaptations, args.seeds, args.lora_ranks, args.strategies,
+                               args.max_parallel_models)
     except (ValueError, FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
         parser.exit(2, f"Error: {exc}\n")
 

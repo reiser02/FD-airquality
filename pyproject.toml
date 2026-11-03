@@ -91,6 +91,8 @@ fair-iterations = 1000
 fair-learning-rate = 0.01
 fair-lambda = 1.0
 selection-metric = "macro-mase"
+heartbeat-seconds = 60.0
+log-level = "INFO"
 
 [tool.setuptools.packages.find]
 where = ["src"]

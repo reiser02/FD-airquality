@@ -64,7 +64,9 @@ def test_benchmark_validates_adapter_ranks_before_training_classics(global_prepa
         main(["benchmark", "--manifest", str(path), "--models", "mlp", "ttm-r3", "--lora-targets", "proj",
               "--lora-ranks", "99", "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
-    assert not (tmp_path / "runs").exists()
+    log, = (tmp_path / "runs").glob("*/benchmark.log")
+    assert "Run failed" in log.read_text()
+    assert not list((tmp_path / "runs").glob("**/test_metrics.json"))
 
 
 def test_benchmark_rejects_empty_effective_panel_before_any_training(global_prepared, tmp_path, monkeypatch):
@@ -141,16 +143,48 @@ def test_launch_requires_successful_server_results(prepared, tmp_path, monkeypat
     (tmp_path / "pyproject.toml").write_bytes(project_config)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "reports"))
 
-    def successful_submission(*args, **kwargs):
+    def successful_submission(self, command, env, path, label, **kwargs):
+        path.write_text("Flower output streamed dynamically\n")
         if completed:
             result = tmp_path / "reports" / "new_run"
             result.mkdir(parents=True)
             (result / "run.json").write_text(json.dumps({"settings": asdict(settings)}))
             (result / "test_metrics.json").write_text("{}")
 
-    monkeypatch.setattr("fd_airquality.cli.subprocess.run", successful_submission)
+    monkeypatch.setattr("fd_airquality.cli.ProcessRunner.stream", successful_submission)
     if completed:
-        launch_simulation(settings, workers=1, client_gpus=0.0, dry_run=False)
+        result = launch_simulation(settings, workers=1, client_gpus=0.0, dry_run=False)
+        assert "streamed dynamically" in (result / "flower.log").read_text()
     else:
         with pytest.raises(RuntimeError, match="sin resultados de test completos"):
             launch_simulation(settings, workers=1, client_gpus=0.0, dry_run=False)
+
+
+def test_interrupted_launcher_requests_native_flower_stop_and_preserves_logs(prepared, tmp_path, monkeypatch):
+    path, _ = prepared
+    project_config = Path("pyproject.toml").read_bytes()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_bytes(project_config)
+    stopped = []
+
+    def stream(self, command, env, path, label, on_line):
+        path.write_text("Successfully started run 123456\n")
+        on_line("Successfully started run 123456\n")
+        on_line("Some unrelated log: Successfully started run 999999\n")
+        on_line("Successfully started run 999999\n")
+        raise KeyboardInterrupt
+
+    def stop(command, **kwargs):
+        from subprocess import CompletedProcess
+
+        stopped.append(command)
+        return CompletedProcess(command, 0, stdout="stopped")
+
+    monkeypatch.setattr("fd_airquality.cli.ProcessRunner.stream", stream)
+    monkeypatch.setattr("fd_airquality.cli.subprocess.run", stop)
+    with pytest.raises(KeyboardInterrupt):
+        launch_simulation(RunSettings(manifest=str(path)), workers=1, client_gpus=0, dry_run=False)
+    assert stopped == [["uv", "run", "--frozen", "flwr", "stop", "123456", "local"]]
+    log, = (tmp_path / ".flwr" / "launches").glob("*/run.log")
+    assert "Run interrupted" in log.read_text()
+    assert "123456" in log.with_name("flower.log").read_text()

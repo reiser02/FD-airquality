@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
+import os
 import resource
 import sys
 import time
@@ -14,6 +16,7 @@ from pathlib import Path
 
 from fd_airquality.artifacts import file_digest
 from fd_airquality.models import model_metadata
+from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
 
 
@@ -25,6 +28,18 @@ def tracking_uri(settings: RunSettings) -> str:
         return uri
     database = Path(settings.output_dir).resolve().parent / "mlflow.db"
     return f"sqlite:///{database}"
+
+
+def initialize_tracking(settings: RunSettings, artifacts: Path) -> None:
+    if settings.mlflow_tracking_uri == "disabled":
+        return
+    from mlflow import MlflowClient
+
+    client = MlflowClient(tracking_uri=tracking_uri(settings))
+    if client.get_experiment_by_name(settings.mlflow_experiment) is None:
+        client.create_experiment(settings.mlflow_experiment, artifact_location=(
+            artifacts.resolve().as_uri() if tracking_uri(settings).startswith(("sqlite:", "file:")) else None
+        ))
 
 
 def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) -> None:
@@ -44,6 +59,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         "python": sys.version, "versions": versions,
         "granite_source": json.loads(distribution("granite-tsfm").read_text("direct_url.json") or "null"),
         "application_sources": {path.name: file_digest(path) for path in sorted(Path(__file__).parent.glob("*.py"))},
+        "execution": {"pid": os.getpid(), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")},
         "training_budget": {
             "stages": 0 if mode == "zero-shot" else settings.num_server_rounds,
             "epochs_per_stage": settings.local_epochs,
@@ -121,6 +137,10 @@ class RunTracker:
         self.client.log_batch(self.run_id, metrics=records)
 
     def __exit__(self, exc_type, exc_value, traceback):
+        logging.getLogger(__name__).info("Tracking finalize status=%s", "FAILED" if exc_type else "FINISHED")
+        if exc_type is not None:
+            logging.getLogger(__name__).error("Run failed: %s", exc_value, exc_info=(exc_type, exc_value, traceback))
+        flush_run_logs()
         resources = {
             "wall-seconds": time.perf_counter() - self.started,
             "coordinator-peak-process-rss-mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
@@ -133,7 +153,7 @@ class RunTracker:
             try:
                 self.log_metrics("runtime", resources, 0)
                 # Allowlist: never recursively log the project, data, NPZ or scalers.
-                for name in ("run.json", "round_metrics.csv", "station_metrics.csv", "test_metrics.json", "resource_metrics.json", "excluded_stations.csv"):
+                for name in ("run.json", "round_metrics.csv", "station_metrics.csv", "test_metrics.json", "resource_metrics.json", "excluded_stations.csv", "run.log"):
                     if (self.output / name).is_file():
                         self.client.log_artifact(self.run_id, str(self.output / name))
                 if self.settings.mlflow_log_models:

@@ -61,7 +61,7 @@ num-server-rounds = 10
 
 [benchmark]
 models = ["mlp", "autoencoder", "darts-nlinear"]
-modes = ["federated", "local", "centralized"]
+modes = ["local", "centralized", "federated"]
 workers = 1
 ```
 
@@ -147,6 +147,39 @@ congelada. Son **27 configuraciones de foundations**, más nueve controles clás
 los clásicos no se duplican por rango. FLoRA y LoRA-FAIR no tienen modalidades
 centralizadas nativas ni se cruzan automáticamente con FedProx.
 
+### Modos secuenciales y candidatos paralelos por GPU
+
+La matriz respeta el orden de `--modes` / `[benchmark].modes`; por defecto:
+**local → centralizado → federado → zero-shot**. Todos los casos de un modo deben
+terminar antes de comenzar el siguiente.
+
+- **Local, centralizado y zero-shot:** con `--device cuda`, se comprueba cada GPU
+  visible y se ejecuta como máximo un candidato completo por GPU utilizable, en
+  procesos independientes. Un candidato incluye modelo, adaptación, semilla y rango;
+  no se reparten las estaciones de un mismo candidato local entre GPUs.
+- **Federado:** un candidato cada vez. Flower/Ray reparte sus clientes entre las
+  GPUs de su runtime; no se lanzan federaciones de modelos distintos simultáneamente.
+- **CPU o CUDA no utilizable:** los candidatos se ejecutan secuencialmente; el
+  fallback y el dispositivo efectivo quedan registrados.
+
+`--max-parallel-models` limita los candidatos no federados simultáneos; si se omite,
+el límite es el número de GPUs utilizables. `--workers` sigue siendo el límite de
+clientes federados simultáneos y `--client-gpus`, su reserva individual en Ray.
+El límite de candidatos **no limita** los clientes de una federación.
+
+```bash
+# Dos candidatos como máximo en los modos no federados; en federado, Ray gestiona clientes:
+uv run fd-airquality benchmark --device cuda --max-parallel-models 2 \
+  --client-gpus 1.0 --workers 2
+```
+
+Para limitar las GPUs de los candidatos no federados se puede usar
+`CUDA_VISIBLE_DEVICES` antes de iniciar el comando; cada proceso hijo recibe una
+única GPU de ese conjunto. Esto no reconfigura un SuperLink que ya estuviese arrancado.
+Cada candidato debe caber por sí mismo en memoria. No se reducen automáticamente
+batch, contexto, estaciones ni precisión ante un OOM: el error detiene la matriz.
+Más concurrencia puede aumentar el uso de RAM/VRAM y no garantiza menor duración.
+
 La primera ejecución descarga los pesos. PatchTST tiene unos 385 millones de
 parámetros (1,54 GB de pesos). LoRA necesita backpropagation dentro del backbone;
 el benchmark completo en CPU puede ser costoso y no se lanza al instalar.
@@ -155,7 +188,7 @@ Puedes limitar la matriz, sin cambiar el soporte temporal:
 
 ```bash
 uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
-  --models mlp autoencoder darts-nlinear --modes federated local centralized
+  --models mlp autoencoder darts-nlinear --modes local centralized federated
 ```
 
 O ejecutar un caso individual:
@@ -264,6 +297,51 @@ El resultado y las rutas auditables están en `reports/final_adapter_validation.
 Estos resultados históricos no validan el nuevo periodo de referencia de MASE/RMSSE;
 para él se deben regenerar las preparaciones y volver a evaluar.
 
+## Logs y progreso en vivo
+
+No hace falta usar `tee`: los comandos largos escriben el log mientras trabajan,
+además de mostrarlo en el terminal. Los mensajes incluyen fecha, nivel, PID e
+identidad del candidato; entrenamiento y evaluación añaden estación, ronda/época
+y lotes cuando corresponde. El log informa también de carga de modelos, selección
+de checkpoints, descartes, fallback a CPU, errores con traceback e interrupciones.
+
+En una matriz bajo `reports/benchmarks/<benchmark>/`:
+
+- `benchmark.log`: eventos globales y progreso de candidatos, con escritura coordinada
+  mediante una cola; los procesos no escriben concurrentemente en ese mismo archivo.
+- `logs/case_0001.log`, etc.: detalle de cada candidato; los casos en subprocesos
+  incluyen su salida combinada de stdout/stderr. Sus TOML efectivos quedan al lado.
+- `runs/case_0001/<ejecucion>/run.log`, etc.: log propio del baseline o servidor.
+- `benchmark.json`: estado por caso (`pending`, `running`, `completed`, `failed`,
+  `cancelled`), GPU asignada, ruta del log y resultado. Se reemplaza atómicamente
+  para poder leerlo mientras se actualiza.
+
+```bash
+tail -F reports/benchmarks/<benchmark>/benchmark.log
+tail -F reports/benchmarks/<benchmark>/logs/case_0001.log
+```
+
+`--heartbeat-seconds 60` emite un resumen periódico con etapa, contadores, tiempo
+transcurrido y tiempo desde el último evento. **Es una señal de actividad del
+monitor, no una prueba de avance del entrenamiento ni una estimación de finalización.**
+El mismo intervalo limita los mensajes intermedios por lotes. Se puede reducir,
+por ejemplo con `--heartbeat-seconds 15`, o ajustar el nivel mediante
+`--log-level DEBUG|INFO|WARNING|ERROR` (predeterminado `INFO`). También son opciones
+de `[run]` en el TOML; para `prepare` pertenecen a `[prepare]`.
+
+Los baselines independientes guardan `run.log` en su directorio de resultados.
+`simulate` conserva el flujo real de Flower en `flower.log`, además del `run.log`
+del servidor y `clients/client_000.log`, etc., para el detalle de los clientes.
+Su auditoría y logs previos al lanzamiento quedan en `.flwr/launches/<lanzamiento>/`;
+el flujo se copia a los resultados al completar la simulación. La CLI de `prepare`
+escribe en `<output>/logs/prepare_<sello>/run.log` y, tras finalizar correctamente,
+lo copia a `prepare.log` junto al manifest generado.
+
+Un fallo cancela los casos activos y pendientes antes de iniciar otro modo; no
+genera una comparación parcial como si estuviese completa. Al interrumpir Flower,
+el launcher solicita detener su `run_id` con la CLI nativa, sin apagar SuperLink
+ni otras ejecuciones. Si esa solicitud falla, el error se conserva en el log.
+
 ## MLflow
 
 MLflow está instalado y **activo por defecto** en simulaciones y baselines.
@@ -299,6 +377,10 @@ directorio padre de esa ruta; fija `--mlflow-tracking-uri` para reunir resultado
 en un mismo almacenamiento. Usa `--mlflow-log-models 0` para no subir checkpoints
 o `--mlflow-tracking-uri disabled` para desactivar tracking explícitamente.
 Los errores de entrenamiento marcan la ejecución como `FAILED`.
+El coordinador inicializa el experimento antes de lanzar candidatos concurrentes;
+cada candidato mantiene su propio run. `run.log` se adjunta como artefacto al cerrar
+el bloque de tracking; no se sincroniza línea a línea. Para seguir el log en vivo,
+usa los archivos locales. Los logs detallados de actores Ray se conservan localmente.
 
 ## Resultados y auditoría
 
@@ -307,6 +389,7 @@ Cada preparación crea un directorio nuevo bajo `data/federated/`:
 - `manifest.json`: identidad, protocolo, hashes y metadatos de cada cliente; sin mediciones ni escaladores.
 - `clients/000/series.npz`, etc.: serie e índices de ventanas **locales** a cada estación.
 - `stations.csv`, `blocks.csv`, `excluded_stations.csv`: fragmentación, soporte y exclusiones.
+- `prepare.log`: log de la preparación cuando se ejecuta mediante la CLI.
 - `retention.json`: ventanas y horas únicas retenidas respecto al entrenamiento
   disponible antes del corte, antes de cualquier límite de prueba.
 
@@ -333,6 +416,8 @@ estimaciones hechas con el filtrado retrospectivo anterior.
 Cada simulación escribe un directorio nuevo bajo `reports/federated/`:
 
 - `run.json`: configuración, manifest y versiones efectivas del entorno de ejecución.
+- `run.log`: progreso, avisos, errores e interrupciones del servidor o baseline.
+- `flower.log`, `clients/client_000.log`, etc.: flujo de Flower y logs de clientes en simulaciones.
 - `excluded_stations.csv`: descartes en ejecución y sus motivos; vacío con cabecera si no hay ninguno.
 - `runtime_manifest.json`: panel efectivo cuando hay descartes, sin copiar ni modificar los NPZ.
 - `round_metrics.csv`, `station_metrics.csv`: métricas globales y por estación.
@@ -349,6 +434,9 @@ La raíz de la matriz conserva también `excluded_stations.csv` y, si hay descar
 `runtime_manifest.json`; el launcher deja su auditoría previa en `.flwr/launches/`.
 `benchmark.json` registra todos los casos y su estado. Un fallo detiene la matriz
 y queda marcado; no se omiten combinaciones silenciosamente.
+Cada caso usa `runs/case_<numero>/` para aislar sus resultados. El bloque `execution`
+de `run.json` registra PID y `CUDA_VISIBLE_DEVICES`; el dispositivo efectivo sigue
+en `settings.device`.
 
 Los artefactos locales son necesarios para aplicar la normalización del cliente;
 el checkpoint central no contiene sus medias ni desviaciones. Los pesos se pueden

@@ -15,6 +15,7 @@ from fd_airquality.models import (
     validate_run_mode,
 )
 from fd_airquality.panels import prepare_runtime_panel
+from fd_airquality.run_logging import RunLogging, report_progress, run_label
 from fd_airquality.settings import RunSettings
 from fd_airquality.strategy import AuditedStrategy
 from fd_airquality.task import configure_torch, make_model, validate_selection_coverage
@@ -29,9 +30,17 @@ def run_server(grid: Grid, settings: RunSettings) -> Path:
         f"{manifest['pollutant']}_{settings.model}_{effective_adaptation(settings)}_{settings.strategy}_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
     )
     output.mkdir(parents=True, exist_ok=False)
+    with RunLogging(output, run_label(settings, "federated"), level=settings.log_level,
+                    heartbeat_seconds=settings.heartbeat_seconds):
+        return _run_server(grid, settings, output)
+
+
+def _run_server(grid, settings, output):
+    report_progress("panel", f"manifest={settings.manifest}")
     settings, manifest = prepare_runtime_panel(settings, output)
     validate_selection_coverage(manifest, settings, "federated")
     settings = replace(settings, device=configure_torch(settings, settings.seed).type)
+    report_progress("loading-model", f"device={settings.device} stations={len(manifest['clients'])}")
     write_run(output, settings, manifest, "federated")
     with RunTracker(settings, output, "federated", manifest) as tracker:
         strategy = AuditedStrategy(settings, manifest, output, tracker)

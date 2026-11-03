@@ -16,6 +16,7 @@ from flwr.serverapp.strategy import FedAvg, FedProx, Strategy
 
 from fd_airquality.federated_adapters import aggregate_adapter_updates
 from fd_airquality.models import GRANITE, checkpoint_payload
+from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import selection_value
 from fd_airquality.tracking import RunTracker
@@ -109,34 +110,41 @@ class AuditedStrategy(Strategy):
     def configure_train(
         self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
+        report_progress("train", f"round={server_round}/{self.settings.num_server_rounds} "
+                        f"waiting_clients={len(self.manifest['clients'])}; clientes gestionados por Ray")
         return self._runtime_messages(self.delegate.configure_train(server_round, arrays, config, grid))
 
     def configure_evaluate(
         self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
         self.current_arrays = arrays
+        report_progress(str(config.get("split", "validation")), f"round={server_round} "
+                        f"waiting_clients={len(self.manifest['clients'])}")
         return self._runtime_messages(self.delegate.configure_evaluate(server_round, arrays, config, grid))
 
     def _runtime_messages(self, messages: Iterable[Message]) -> list[Message]:
         messages = list(messages)
-        if "runtime_selection" not in self.manifest:
-            return messages
-        available = {message.metadata.dst_node_id for message in messages}
-        if not self.runtime_nodes:
-            count = len(self.manifest["clients"])
-            if len(available) < count:
-                raise RuntimeError("No hay suficientes nodos para el panel efectivo.")
-            self.runtime_nodes = {node: partition for partition, node in enumerate(sorted(available)[:count])}
-        if not self.runtime_nodes.keys() <= available:
-            raise RuntimeError("Panel incompleto: falta un nodo del panel efectivo.")
+        filtered = "runtime_selection" in self.manifest
+        if filtered:
+            available = {message.metadata.dst_node_id for message in messages}
+            if not self.runtime_nodes:
+                count = len(self.manifest["clients"])
+                if len(available) < count:
+                    raise RuntimeError("No hay suficientes nodos para el panel efectivo.")
+                self.runtime_nodes = {node: partition for partition, node in enumerate(sorted(available)[:count])}
+            if not self.runtime_nodes.keys() <= available:
+                raise RuntimeError("Panel incompleto: falta un nodo del panel efectivo.")
         result = []
         for message in messages:
             node = message.metadata.dst_node_id
-            if node not in self.runtime_nodes:
+            if filtered and node not in self.runtime_nodes:
                 continue
-            config = ConfigRecord(dict(message.content["config"]) | {
+            extra = {"log-dir": str(self.output / "clients")}
+            if filtered:
+                extra.update({
                 "manifest": self.settings.manifest, "partition-id": self.runtime_nodes[node],
-            })
+                })
+            config = ConfigRecord(dict(message.content["config"]) | extra)
             result.append(Message(content=RecordDict(dict(message.content) | {"config": config}),
                                   dst_node_id=node, message_type=message.metadata.message_type))
         return result
@@ -180,6 +188,9 @@ class AuditedStrategy(Strategy):
                 "round": server_round, "split": split,
                 "station": self.manifest["clients"][partition]["station"], **local_metrics,
             }
+            report_progress(split, f"round={server_round} station={row['station']} "
+                            f"windows={row['num-examples']} mae={row.get('mae', '-')} "
+                            f"train_seconds={row.get('train-seconds', '-')}")
             if "mse" in row:
                 row["rmse"] = math.sqrt(row["mse"])
                 for name in ("mase", "rmsse"):
@@ -227,6 +238,8 @@ class AuditedStrategy(Strategy):
             self.best_score, self.best_round = score, server_round
             self.best_arrays = ArrayRecord(self.current_arrays.to_torch_state_dict())
             self._save(self.output / "best_model.pt", self.best_arrays, server_round)
+            report_progress("checkpoint", f"selected_round={server_round} "
+                            f"{self.settings.selection_metric}={score:.6g}")
         return metrics
 
     def evaluate_test(self, grid: Grid) -> MetricRecord:

@@ -14,10 +14,11 @@ def arguments(values):
     return parse_configured_args(parser, commands, values)
 
 
-def test_shipped_toml_preserves_all_internal_defaults():
+def test_shipped_toml_defaults_and_preparation_overrides_are_valid():
     data = arguments(["prepare"])
     for key, value in asdict(DataConfig()).items():
-        assert getattr(data, key) == value
+        assert getattr(data, key) == (6 if key == "train_stride" else value)
+    assert data.station == ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
     for command in ("simulate", "baseline", "benchmark"):
         args = arguments([command])
         for key, value in asdict(RunSettings()).items():
@@ -137,3 +138,15 @@ def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monk
     raw_root, _, pollutant, geometry, stations = received[0]
     assert (geometry.context, geometry.horizon, geometry.stride) == (16, 4, 2)
     assert (raw_root, pollutant, stations) == (Path("raw").resolve(), "CO", {"new"})
+
+
+def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "fd-airquality.toml").write_text(
+        '[run]\nheartbeat-seconds = 15\nlog-level = "DEBUG"\n'
+        '[benchmark]\nmax-parallel-models = 2\n'
+        'modes = ["local", "centralized", "federated", "zero-shot"]\n'
+    )
+    args = arguments(["benchmark", "--max-parallel-models", "1", "--heartbeat-seconds", "30"])
+    assert (args.max_parallel_models, args.heartbeat_seconds, args.log_level) == (1, 30.0, "DEBUG")
+    assert args.modes == ["local", "centralized", "federated", "zero-shot"]

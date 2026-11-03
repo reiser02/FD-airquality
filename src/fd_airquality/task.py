@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import random
 import resource
 import time
@@ -16,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset
 from fd_airquality.data import WindowDataset
 from fd_airquality.metrics import compute_mase, compute_rmsse
 from fd_airquality.models import ForecastAutoencoder, ForecastMLP, make_model, shared_state  # noqa: F401
+from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 
 
@@ -23,6 +25,7 @@ def resolve_device(requested: str) -> torch.device:
     if requested == "cuda":
         try:
             if not torch.cuda.is_available():
+                logging.getLogger(__name__).warning("CUDA no disponible; se usará CPU.")
                 warnings.warn("CUDA no disponible; se usará CPU.", stacklevel=2)
                 return torch.device("cpu")
             # Availability alone does not guarantee kernels for this GPU architecture.
@@ -32,6 +35,7 @@ def resolve_device(requested: str) -> torch.device:
             return torch.device("cuda")
         except (RuntimeError, AssertionError) as exc:
             reason = str(exc).splitlines()[0]
+            logging.getLogger(__name__).warning("CUDA no utilizable (%s); se usará CPU.", reason)
             warnings.warn(f"CUDA no utilizable ({reason}); se usará CPU.", stacklevel=2)
     return torch.device("cpu")
 
@@ -71,8 +75,10 @@ def train_local(
         parameters, lr=settings.learning_rate, weight_decay=settings.weight_decay
     )
     total_squared_error, targets = 0.0, 0
-    for _ in range(settings.local_epochs):
-        for inputs, actual in loader:
+    for epoch in range(1, settings.local_epochs + 1):
+        report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches=0/{len(loader)} device={device}")
+        last_report = time.monotonic()
+        for batch, (inputs, actual) in enumerate(loader, start=1):
             inputs, actual = inputs.to(device), actual.to(device)
             optimizer.zero_grad(set_to_none=True)
             mse = nn.functional.mse_loss(model(inputs), actual)
@@ -94,6 +100,11 @@ def train_local(
             optimizer.step()
             total_squared_error += float(mse.detach()) * actual.numel()
             targets += actual.numel()
+            if time.monotonic() - last_report >= settings.heartbeat_seconds:
+                report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={batch}/{len(loader)}")
+                last_report = time.monotonic()
+        report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={len(loader)}/{len(loader)} "
+                        f"mse_normalized={total_squared_error / targets:.6g}")
     if any(not torch.isfinite(value).all() for value in shared_state(model).values()):
         raise ValueError("El entrenamiento produjo pesos no finitos.")
     metrics = {
@@ -118,7 +129,9 @@ def evaluate_local(
 ) -> dict[str, float | int]:
     model.to(device).eval()
     predictions, actuals, baselines = [], [], []
-    for inputs, actual in DataLoader(dataset, batch_size=settings.batch_size, num_workers=0):
+    loader = DataLoader(dataset, batch_size=settings.batch_size, num_workers=0)
+    last_report = time.monotonic()
+    for batch, (inputs, actual) in enumerate(loader, start=1):
         forecast = model(inputs.to(device)).cpu().numpy().astype(np.float64)
         predictions.append(forecast * dataset.scale + dataset.mean)
         actuals.append(actual.numpy().astype(np.float64) * dataset.scale + dataset.mean)
@@ -126,6 +139,9 @@ def evaluate_local(
             inputs[:, -1:].numpy().astype(np.float64) * dataset.scale + dataset.mean,
             dataset.horizon, axis=1,
         ))
+        if time.monotonic() - last_report >= settings.heartbeat_seconds:
+            report_progress(dataset.split, f"batches={batch}/{len(loader)} device={device}")
+            last_report = time.monotonic()
     prediction, actual, baseline = map(np.concatenate, (predictions, actuals, baselines))
     if not np.isfinite(prediction).all():
         raise ValueError("Predicciones no finitas.")
