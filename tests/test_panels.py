@@ -119,7 +119,7 @@ def test_flower_launcher_uses_retained_station_count_and_saves_audit(selection_p
     project = Path("pyproject.toml").read_bytes()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_bytes(project)
-    launch_simulation(RunSettings(manifest=str(path)), workers=2, client_gpus=0, dry_run=True)
+    launch_simulation(RunSettings(manifest=str(path)), dry_run=True)
     assert "num-supernodes=1" in capsys.readouterr().out
     report, = (tmp_path / ".flwr" / "launches").glob("*/excluded_stations.csv")
     manifest = read_manifest(report.parent / "runtime_manifest.json")
@@ -139,8 +139,9 @@ def test_benchmark_filters_once_for_all_candidates(selection_prepared, tmp_path,
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", run)
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", run)
     monkeypatch.setattr("fd_airquality.comparison.compare_runs", lambda paths, output: output)
-    output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "benchmarks")),
-                           ["mlp"], ["federated", "local", "centralized"], workers=1, client_gpus=0)
+    output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "benchmarks"),
+                                      mlflow_tracking_uri="disabled"),
+                            ["mlp"], ["federated", "local", "centralized"])
     assert len(calls) == 3
     assert len({call.manifest for call in calls}) == 1
     assert pd.read_csv(output.parent / "excluded_stations.csv").station.to_list() == ["station-a"]

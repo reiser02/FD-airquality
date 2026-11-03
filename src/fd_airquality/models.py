@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from contextlib import nullcontext
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
@@ -124,6 +125,18 @@ def validate_model_geometry(geometry: dict, settings: RunSettings) -> None:
             )
 
 
+def _patchtst_autocast_context(device: torch.device):
+    """Keep upstream BF16 only where CUDA provides native hardware support."""
+    if device.type not in {"cuda", "mps"}:
+        return nullcontext()
+    enabled = True
+    if device.type == "cuda":
+        with torch.cuda.device(device):
+            # Tensor emulation is not enough for cuDNN's BF16 convolutions.
+            enabled = torch.cuda.is_bf16_supported(including_emulation=False)
+    return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled)
+
+
 @lru_cache(maxsize=1)
 def _load_granite(name: str, revision: str) -> nn.Module:
     import inspect
@@ -135,6 +148,12 @@ def _load_granite(name: str, revision: str) -> nn.Module:
         parameters = inspect.signature(tsfm_public.TinyTimeMixerConfig.__init__).parameters
         if "decompose" not in parameters:
             raise RuntimeError("Esta versión de granite-tsfm no implementa TTM-R3; ejecuta uv sync --locked.")
+    elif name == "patchtst-fm-r2":
+        from tsfm_public.models.patchtst_fm import modeling_patchtst_fm
+
+        # PatchTST opens its own nested autocast; an outer FP32 context cannot
+        # override it. Replace only this model's precision helper, not cuDNN.
+        modeling_patchtst_fm.get_autocast_context = _patchtst_autocast_context
     model_class = getattr(tsfm_public, class_name)
     backbone, info = model_class.from_pretrained(
         identifier, revision=revision, use_safetensors=True, output_loading_info=True,

@@ -157,3 +157,94 @@ def test_comparison_labels_adapter_and_relative_zero_shot_improvements(global_pr
     assert rows.loc[rows["adaptation"] == "lora", "macro_mase_improvement_vs_zero_shot_pct"].notna().all()
     stations = pd.read_csv(output / "station_comparison.csv")
     assert "mae_improvement_vs_zero_shot_pct" in stations
+
+
+def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints(
+    prepared, tmp_path, monkeypatch,
+):
+    path, _ = prepared
+    models, residents, calls = [], set(), []
+
+    class ResidentModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.index = len(models)
+            self.weight = torch.nn.Parameter(torch.tensor(float(self.index + 1)))
+            models.append(self)
+
+        def to(self, device):
+            if torch.device(device).type == "cuda":
+                residents.add(self.index)
+                assert len(residents) == 1, "Only the active station may reside in GPU"
+            else:
+                residents.discard(self.index)
+            return self
+
+    def train(model, dataset, *args):
+        assert residents == {model.index}
+        calls.append((model.index, "train"))
+        with torch.no_grad():
+            model.weight.add_(1)
+        return {"num-examples": len(dataset), "train-mse-normalized": 1.0}
+
+    def evaluate(model, dataset, *args):
+        assert residents == {model.index}
+        calls.append((model.index, dataset.split))
+        count = len(dataset)
+        targets = count * dataset.horizon
+        error = 1.0 / model.weight.item()
+        return {
+            "num-examples": count, "num-targets": targets,
+            "absolute-error-sum": targets * error, "squared-error-sum": targets * error**2,
+            "baseline-absolute-error-sum": targets, "baseline-squared-error-sum": targets,
+            "mae": error, "mse": error**2, "baseline-mae": 1.0,
+            "mase-sum": count * error, "mase-count": count,
+            "rmsse-sum": count * error, "rmsse-count": count,
+            "mase": error, "rmsse": error,
+        }
+
+    monkeypatch.setattr("fd_airquality.baselines.make_model", lambda *_: ResidentModel())
+    monkeypatch.setattr("fd_airquality.baselines.configure_torch", lambda *_: torch.device("cuda"))
+    monkeypatch.setattr("fd_airquality.baselines.train_local", train)
+    monkeypatch.setattr("fd_airquality.baselines.evaluate_local", evaluate)
+    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
+                           device="cuda", num_server_rounds=2, mlflow_tracking_uri="disabled")
+    output = run_baseline(settings, "local")
+    assert not residents
+    assert len(models) == 2
+    for index in range(2):
+        assert calls.count((index, "train")) == 2
+        assert calls.count((index, "validation")) == 3
+        assert calls.count((index, "test")) == 1
+        saved = torch.load(output / f"client_{index:03d}_best_model.pt", weights_only=True)
+        assert saved["model_state_dict"]["weight"].item() == index + 3
+        assert saved["round"] == 2
+
+
+@pytest.mark.parametrize("fails", [False, True])
+def test_local_model_is_offloaded_even_after_failure(fails):
+    from fd_airquality.baselines import _model_on_device
+
+    class Model:
+        def __init__(self):
+            self.moves = []
+
+        def to(self, device):
+            self.moves.append(str(device))
+            return self
+
+    model = Model()
+
+    def execute():
+        with _model_on_device(model, torch.device("cuda:1"), offload=True) as active:
+            assert active is model
+            assert model.moves == ["cuda:1"]
+            if fails:
+                raise RuntimeError("failed station")
+
+    if fails:
+        with pytest.raises(RuntimeError, match="failed station"):
+            execute()
+    else:
+        execute()
+    assert model.moves == ["cuda:1", "cpu"]

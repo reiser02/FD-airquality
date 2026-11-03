@@ -67,7 +67,7 @@ def _candidate_process(settings, mode: str, gpu: str, log_path: Path, runner: Pr
     return runs[0].parent
 
 
-def execute_plan(settings, plan: list[dict], root: Path, *, workers: int, client_gpus: float,
+def execute_plan(settings, plan: list[dict], root: Path, *,
                  max_parallel_models: int | None, baseline, launch, progress_log) -> list[Path]:
     if max_parallel_models is not None and (type(max_parallel_models) is not int or max_parallel_models < 1):
         raise ValueError("max-parallel-models debe ser un entero positivo.")
@@ -75,10 +75,6 @@ def execute_plan(settings, plan: list[dict], root: Path, *, workers: int, client
     if settings.device == "cuda" and not slots:
         LOGGER.warning("Ninguna GPU utilizable; benchmark secuencial en CPU.")
         settings = replace(settings, device="cpu")
-    if settings.device == "cpu":
-        client_gpus = 0.0
-    if settings.device == "cuda" and any(case["mode"] == "federated" for case in plan) and client_gpus <= 0:
-        raise ValueError("Con device=cuda reserva clientes federados mediante --client-gpus.")
     slots = slots[:max_parallel_models] if max_parallel_models else slots
     (root / "logs").mkdir()
     rows = [case | {"status": "pending", "gpu": None, "log": str(root / "logs" / f"case_{i + 1:04d}.log")}
@@ -128,7 +124,7 @@ def execute_plan(settings, plan: list[dict], root: Path, *, workers: int, client
                         with RunLogging(root / "logs", run_label(current, mode),
                                         filename=f"case_{index + 1:04d}.log", level=settings.log_level,
                                         heartbeat_seconds=settings.heartbeat_seconds):
-                            path = (launch(current, workers, client_gpus, dry_run=False)
+                            path = (launch(current, dry_run=False)
                                     if mode == "federated" else baseline(current, mode))
                     except Exception as exc:
                         failed(index, exc)

@@ -30,15 +30,18 @@ CSV, sin presumir que sea UTC. No se lee configuración de otro proyecto.
 `simulate` usa la preparación más reciente, calcula automáticamente cuántas
 estaciones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
 Ray y la API de mensajes de Flower 1.40. Por defecto ejecuta cinco rondas,
-una época local y hasta dos clientes simultáneos en CPU. No emplea la API
+una época local y un cliente simultáneo por GPU utilizable, hasta el número de
+estaciones; en CPU se ejecuta un cliente cada vez. No emplea la API
 obsoleta `start_simulation`. FedAvg/FedProx clásicos son oficiales; las variantes
 LoRA tienen su propia agregación de factores auditada.
 
 Con `--device cuda` se comprueba una operación real y su sincronización, no solo
 `torch.cuda.is_available()`. Si CUDA no está disponible o no puede ejecutar los
 kernels, se avisa y se continúa en CPU; el dispositivo efectivo queda en `run.json`.
-El launcher elimina además la reserva de GPU de Ray cuando hace este fallback.
-Si CUDA funciona, `simulate` requiere reservar recursos con `--client-gpus`.
+El launcher configura automáticamente Ray: una GPU completa por cliente y tantos
+clientes simultáneos como GPUs utilizables (sin superar las estaciones del panel).
+En CPU/fallback no se reservan GPUs y el entrenamiento de clientes es secuencial.
+No hay que configurar `workers` ni `client-gpus`; esas opciones ya no se admiten.
 
 ### Configuración por archivo
 
@@ -62,7 +65,6 @@ num-server-rounds = 10
 [benchmark]
 models = ["mlp", "autoencoder", "darts-nlinear"]
 modes = ["local", "centralized", "federated"]
-workers = 1
 ```
 
 ```bash
@@ -93,7 +95,7 @@ uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.j
 ```bash
 uv run fd-airquality prepare --pollutant NO2 --max-train-windows 128 \
   --station 'AQN1 - Puerto' --station 'AQN3 - Paseo Alfonso XIII'
-uv run fd-airquality simulate --num-server-rounds 2 --workers 2
+uv run fd-airquality simulate --num-server-rounds 2
 ```
 
 El límite de ventanas es **solo para pruebas rápidas**. Vuelve a ejecutar
@@ -137,7 +139,7 @@ No compares directamente con las preparaciones históricas de 72/512.
 ```bash
 uv run fd-airquality prepare --context 90
 # Ejecuta la matriz completa sobre la preparación más reciente:
-uv run fd-airquality benchmark --num-server-rounds 5 --workers 1
+uv run fd-airquality benchmark --num-server-rounds 5
 ```
 
 `benchmark` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
@@ -158,24 +160,27 @@ terminar antes de comenzar el siguiente.
   procesos independientes. Un candidato incluye modelo, adaptación, semilla y rango;
   no se reparten las estaciones de un mismo candidato local entre GPUs.
 - **Federado:** un candidato cada vez. Flower/Ray reparte sus clientes entre las
-  GPUs de su runtime; no se lanzan federaciones de modelos distintos simultáneamente.
+  GPUs utilizables, una GPU completa por cliente: dos GPUs permiten dos clientes
+  simultáneos, cuatro GPUs permiten cuatro, hasta el número de estaciones.
+  No se lanzan federaciones de modelos distintos simultáneamente.
 - **CPU o CUDA no utilizable:** los candidatos se ejecutan secuencialmente; el
   fallback y el dispositivo efectivo quedan registrados.
 
 `--max-parallel-models` limita los candidatos no federados simultáneos; si se omite,
-el límite es el número de GPUs utilizables. `--workers` sigue siendo el límite de
-clientes federados simultáneos y `--client-gpus`, su reserva individual en Ray.
+el límite es el número de GPUs utilizables. Los clientes federados se dimensionan
+automáticamente con una GPU por cliente, sin opciones de concurrencia manuales.
 El límite de candidatos **no limita** los clientes de una federación.
 
 ```bash
 # Dos candidatos como máximo en los modos no federados; en federado, Ray gestiona clientes:
-uv run fd-airquality benchmark --device cuda --max-parallel-models 2 \
-  --client-gpus 1.0 --workers 2
+uv run fd-airquality benchmark --device cuda --max-parallel-models 2
 ```
 
-Para limitar las GPUs de los candidatos no federados se puede usar
-`CUDA_VISIBLE_DEVICES` antes de iniciar el comando; cada proceso hijo recibe una
-única GPU de ese conjunto. Esto no reconfigura un SuperLink que ya estuviese arrancado.
+Para limitar las GPUs visibles se puede usar `CUDA_VISIBLE_DEVICES` antes de iniciar
+el comando; cada candidato no federado recibe una única GPU de ese conjunto y Ray
+reserva una GPU por cliente federado. Las GPUs se comprueban individualmente y se
+excluyen las no utilizables. Esto no reconfigura un SuperLink que ya estuviese
+arrancado: debe iniciarse con el mismo conjunto de GPUs visibles.
 Cada candidato debe caber por sí mismo en memoria. No se reducen automáticamente
 batch, contexto, estaciones ni precisión ante un OOM: el error detiene la matriz.
 Más concurrencia puede aumentar el uso de RAM/VRAM y no garantiza menor duración.
@@ -183,6 +188,21 @@ Más concurrencia puede aumentar el uso de RAM/VRAM y no garantiza menor duraci�
 La primera ejecución descarga los pesos. PatchTST tiene unos 385 millones de
 parámetros (1,54 GB de pesos). LoRA necesita backpropagation dentro del backbone;
 el benchmark completo en CPU puede ser costoso y no se lanza al instalar.
+
+PatchTST usa autocast BF16 en CUDA solo si la GPU tiene soporte **nativo**; en GPUs
+como la RTX 2080 Ti se ejecuta en FP32, también durante el entrenamiento de LoRA.
+La emulación de tensores BF16 no basta para sus convoluciones cuDNN. No se desactiva
+cuDNN ni se cambia la precisión de los otros modelos.
+
+En CUDA, PatchTST divide entrenamiento y evaluación en microbatches de hasta 8
+ventanas. El DataLoader de entrenamiento conserva los batches originales: se
+acumulan gradientes ponderados por el número de targets, con un único clipping y
+paso de AdamW por batch efectivo (incluido el último incompleto). FedProx se aplica
+una vez por batch efectivo. No se modifica el batch del TOML, el checkpoint ni la
+arquitectura; puede haber pequeñas diferencias por el orden de suma o por dropout.
+Los logs y las métricas registran batch efectivo, microbatch y pasos del optimizador.
+En modo local CUDA solo el modelo de la estación activa permanece en GPU; los
+demás conservan sus estados independientes en CPU, también durante evaluación.
 
 Puedes limitar la matriz, sin cambiar el soporte temporal:
 
@@ -260,7 +280,7 @@ entornos o presupuestos. No ejecuta tests estadísticos sobre targets solapados.
 uv run fd-airquality prepare --context 90 --max-train-windows 8 \
   --station 'AQN1 - Puerto' --station 'AQN2 - San Francisco' --output data/benchmark_smoke
 uv run fd-airquality benchmark --manifest data/benchmark_smoke/<preparacion>/manifest.json \
-  --num-server-rounds 1 --batch-size 8 --workers 1
+  --num-server-rounds 1 --batch-size 8
 ```
 
 Esta prueba valida la integración, **no estima el rendimiento del experimento
@@ -287,6 +307,12 @@ FD_AIRQUALITY_REAL_MODELS=1 uv run pytest -q
 
 Sin esa variable se omiten explícitamente las 12 pruebas reales; las unitarias e
 integraciones de Flower con transporte local sí se ejecutan.
+La suite usa CPU y oculta las GPU físicas; las comprobaciones de CUDA usan dobles
+de prueba. MLflow solo se activa en sus pruebas específicas, con una base SQLite
+aislada por prueba y el esquema migrado una vez por sesión. No se fuerza el modo
+determinista de PyTorch; se conservan las semillas del experimento.
+
+Para medir los casos más lentos: `uv run pytest -q --durations=20`.
 
 Validación histórica del protocolo anterior: **164 pruebas**, matriz smoke de **36/36 configuraciones**
 con Flower/Ray real, 36 runs MLflow finalizados y **60 checkpoints restaurados**.

@@ -17,6 +17,7 @@ from pathlib import Path
 
 from fd_airquality.configuration import parse_configured_args
 from fd_airquality.data import DataConfig, prepare, read_manifest
+from fd_airquality.execution import usable_gpu_slots
 from fd_airquality.models import (
     GRANITE,
     MODEL_NAMES,
@@ -28,7 +29,7 @@ from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
 from fd_airquality.settings import RunSettings, resolve_manifest
-from fd_airquality.task import resolve_device, validate_selection_coverage
+from fd_airquality.task import validate_selection_coverage
 from fd_airquality.tracking import initialize_tracking, tracking_uri
 
 
@@ -52,8 +53,6 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     simulation = commands.add_parser("simulate", help="Ejecutar flwr run en el simulador local oficial.")
     simulation.add_argument("--manifest", help="Por defecto: la preparación más reciente.")
     simulation.add_argument("--output-dir", default="reports/federated")
-    simulation.add_argument("--workers", type=int, default=2, help="Máximo de clientes federados simultáneos.")
-    simulation.add_argument("--client-gpus", type=float, default=0.0)
     simulation.add_argument("--print-command", action=argparse.BooleanOptionalAction, default=False,
                             help="Preparar el comando sin lanzarlo.")
     baseline = commands.add_parser("baseline", help="Control sin Flower, con las mismas ventanas y métricas.")
@@ -66,8 +65,6 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     benchmark.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
     benchmark.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
                            default=["local", "centralized", "federated", "zero-shot"])
-    benchmark.add_argument("--workers", type=int, default=2)
-    benchmark.add_argument("--client-gpus", type=float, default=0.0)
     benchmark.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
                            default=["lora", "ffa-lora", "flora", "lora-fair"])
     benchmark.add_argument("--seeds", nargs="+", type=int)
@@ -96,7 +93,7 @@ def _toml_scalar(value: str | float) -> str:
     return json.dumps(value, ensure_ascii=False)
 
 
-def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, dry_run: bool) -> Path | None:
+def launch_simulation(settings: RunSettings, dry_run: bool) -> Path | None:
     project = Path.cwd()
     with (project / "pyproject.toml").open("rb") as stream:
         config = tomllib.load(stream)
@@ -108,22 +105,15 @@ def launch_simulation(settings: RunSettings, workers: int, client_gpus: float, d
     overrides = launches / f"{datetime.now(UTC):%Y%m%d_%H%M%S_%f}.toml"
     with RunLogging(overrides.with_suffix(""), run_label(settings, "launcher"), level=settings.log_level,
                     heartbeat_seconds=settings.heartbeat_seconds):
-        return _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides)
+        return _launch_simulation(settings, dry_run, home, overrides)
 
 
-def _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides):
+def _launch_simulation(settings, dry_run, home, overrides):
     validate_run_mode(settings, "federated")
-    if workers < 1 or client_gpus < 0:
-        raise ValueError("workers debe ser positivo y client-gpus no negativo.")
-    if settings.device == "cuda":
-        device = resolve_device(settings.device)
-        if device.type == "cpu":
-            settings = replace(settings, device="cpu")
-            client_gpus = 0.0
-        elif client_gpus <= 0:
-            raise ValueError("Con device=cuda reserva recursos mediante --client-gpus.")
-    else:
-        client_gpus = 0.0
+    slots = usable_gpu_slots(settings.device)
+    if settings.device == "cuda" and not slots:
+        logging.getLogger(__name__).warning("Ninguna GPU utilizable; simulación secuencial en CPU.")
+        settings = replace(settings, device="cpu")
     manifest = read_manifest(settings.manifest)
     validate_model_geometry(manifest["geometry"], settings)
     settings, manifest = prepare_runtime_panel(settings, overrides.with_suffix(""))
@@ -132,16 +122,21 @@ def _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides)
         f"{key} = {_toml_scalar(value)}" for key, value in settings.flower_config().items()
     ) + "\n", encoding="utf-8")
     nodes = len(manifest["clients"])
+    parallel_clients = min(len(slots) if slots else 1, nodes)
+    client_gpus = 1.0 if slots else 0.0
     federation = (
         f"num-supernodes={nodes} client-resources-num-cpus=1 "
-        f"client-resources-num-gpus={client_gpus} init-args-num-cpus={min(workers, nodes)}"
+        f"client-resources-num-gpus={client_gpus} init-args-num-cpus={parallel_clients} "
+        f"init-args-num-gpus={len(slots)}"
     )
     command = [
         "uv", "run", "--frozen", "flwr", "run", ".", "local", "--stream",
         "--run-config", str(overrides), "--federation-config", federation,
     ]
-    print(f"{nodes} estaciones; hasta {min(workers, nodes)} clientes federados simultáneos.", flush=True)
-    print(shlex.join(command), flush=True)
+    print(f"{nodes} estaciones; {len(slots)} GPU utilizables; "
+          f"hasta {parallel_clients} clientes federados simultáneos.", flush=True)
+    display_command = ["env", f"CUDA_VISIBLE_DEVICES={','.join(slots)}", *command] if slots else command
+    print(shlex.join(display_command), flush=True)
     if not dry_run:
         results_root = Path(settings.output_dir)
         previous_runs = set(results_root.glob("*/run.json"))
@@ -152,6 +147,8 @@ def _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides)
             OMP_NUM_THREADS=str(settings.torch_threads),
             MKL_NUM_THREADS=str(settings.torch_threads),
         )
+        if slots:
+            env["CUDA_VISIBLE_DEVICES"] = ",".join(slots)
         Path(env["RAY_TMPDIR"]).mkdir(parents=True, exist_ok=True)
         env["PYTHONUNBUFFERED"] = "1"
         flower_log = overrides.with_suffix("") / "flower.log"
@@ -163,7 +160,7 @@ def _launch_simulation(settings, workers, client_gpus, dry_run, home, overrides)
             if run_id is None and match:
                 run_id = match.group(1)
 
-        report_progress("flower", f"workers={workers} client_gpus={client_gpus} log={flower_log}")
+        report_progress("flower", f"parallel_clients={parallel_clients} gpu_slots={slots} log={flower_log}")
         try:
             ProcessRunner().stream(command, env, flower_log, "flower", on_line=on_line)
             # A successful logstream alone does not prove the ServerApp succeeded.
@@ -224,7 +221,7 @@ def build_benchmark_matrix(models: list[str], modes: list[str], adaptations: lis
     return matrix
 
 
-def run_benchmark(settings: RunSettings, models: list[str], modes: list[str], workers: int, client_gpus: float,
+def run_benchmark(settings: RunSettings, models: list[str], modes: list[str],
                   adaptations: list[str] | None = None, seeds: list[int] | None = None,
                   lora_ranks: list[int] | None = None, strategies: list[str] | None = None,
                   max_parallel_models: int | None = None) -> Path:
@@ -234,8 +231,6 @@ def run_benchmark(settings: RunSettings, models: list[str], modes: list[str], wo
 
     if max_parallel_models is not None and (type(max_parallel_models) is not int or max_parallel_models < 1):
         raise ValueError("max-parallel-models debe ser un entero positivo.")
-    if workers < 1 or client_gpus < 0:
-        raise ValueError("workers debe ser positivo y client-gpus no negativo.")
     manifest = read_manifest(settings.manifest)
     matrix = build_benchmark_matrix(models, modes, adaptations or ["lora", "ffa-lora", "flora", "lora-fair"], strategies or [settings.strategy])
     seeds, ranks = seeds or [settings.seed], lora_ranks or [settings.lora_rank]
@@ -269,7 +264,7 @@ def run_benchmark(settings: RunSettings, models: list[str], modes: list[str], wo
         settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
         report_progress("tracking", "initializing MLflow before concurrent candidates")
         initialize_tracking(settings, root / "mlflow-artifacts")
-        paths = execute_plan(settings, plan, root, workers=workers, client_gpus=client_gpus,
+        paths = execute_plan(settings, plan, root,
                              max_parallel_models=max_parallel_models, baseline=run_baseline,
                              launch=launch_simulation, progress_log=progress_log)
         report_progress("comparison", f"completed_candidates={len(paths)}")
@@ -324,13 +319,13 @@ def main(argv: list[str] | None = None) -> None:
             })
             settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
             if args.command == "simulate":
-                launch_simulation(settings, args.workers, args.client_gpus, args.print_command)
+                launch_simulation(settings, args.print_command)
             elif args.command == "baseline":
                 from fd_airquality.baselines import run_baseline
 
                 run_baseline(settings, args.mode)
             else:
-                run_benchmark(settings, args.models, args.modes, args.workers, args.client_gpus,
+                run_benchmark(settings, args.models, args.modes,
                                args.adaptations, args.seeds, args.lora_ranks, args.strategies,
                                args.max_parallel_models)
     except (ValueError, FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:

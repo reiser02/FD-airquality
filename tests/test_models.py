@@ -160,3 +160,97 @@ def test_ttm_uses_decomposed_r3_class_and_rejects_partial_checkpoint(monkeypatch
     assert called[0][0].endswith("granite-timeseries-ttm-r3")
     assert called[0][1]["revision"] == GRANITE["ttm-r3"][1]
     assert called[0][1]["use_safetensors"] is True
+
+
+@pytest.mark.parametrize("device,native_bf16,enabled", [
+    ("cpu", False, None), ("mps", False, True),
+    ("cuda:0", False, False), ("cuda:1", True, True),
+])
+def test_patchtst_autocast_requires_native_bf16_on_the_requested_gpu(
+    device, native_bf16, enabled, monkeypatch,
+):
+    from contextlib import contextmanager, nullcontext
+
+    from fd_airquality.models import _patchtst_autocast_context
+
+    requested = torch.device(device)
+    active_devices, checks, contexts = [], [], []
+
+    @contextmanager
+    def cuda_device(value):
+        active_devices.append(value)
+        yield
+        active_devices.pop()
+
+    def supports_bf16(*, including_emulation):
+        assert active_devices == [requested]
+        checks.append(including_emulation)
+        return native_bf16
+
+    def autocast(**kwargs):
+        contexts.append(kwargs)
+        return nullcontext()
+
+    monkeypatch.setattr(torch.cuda, "device", cuda_device)
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", supports_bf16)
+    monkeypatch.setattr(torch, "autocast", autocast)
+    with _patchtst_autocast_context(requested):
+        pass
+    assert not active_devices
+    assert checks == ([False] if requested.type == "cuda" else [])
+    assert contexts == ([] if enabled is None else [{
+        "device_type": requested.type, "dtype": torch.bfloat16, "enabled": enabled,
+    }])
+
+
+def test_patchtst_fp32_fallback_overrides_outer_autocast_without_cutting_gradients(monkeypatch):
+    from contextlib import nullcontext
+
+    from fd_airquality.models import _patchtst_autocast_context
+
+    real_autocast = torch.autocast
+    monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
+    monkeypatch.setattr(torch.cuda, "is_bf16_supported", lambda **_: False)
+    # Exercise real nesting and autograd on CPU without initializing a GPU.
+    monkeypatch.setattr(torch, "autocast", lambda **kw: real_autocast(
+        device_type="cpu", dtype=kw["dtype"], enabled=kw["enabled"],
+    ))
+    layer = nn.Linear(4, 2)
+    inputs = torch.randn(3, 4, requires_grad=True)
+    with real_autocast("cpu", dtype=torch.bfloat16), _patchtst_autocast_context(torch.device("cuda:0")):
+        prediction = layer(inputs)
+    assert prediction.dtype == torch.float32
+    prediction.square().mean().backward()
+    assert inputs.grad is not None and torch.isfinite(inputs.grad).all()
+    assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
+
+
+def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(monkeypatch):
+    import tsfm_public
+    from tsfm_public.models.patchtst_fm import modeling_patchtst_fm
+
+    from fd_airquality.models import _load_granite, _patchtst_autocast_context
+
+    called = []
+
+    class Loader:
+        @classmethod
+        def from_pretrained(cls, identifier, **kwargs):
+            assert modeling_patchtst_fm.get_autocast_context is _patchtst_autocast_context
+            called.append((identifier, kwargs))
+            return DummyBackbone(), {}
+
+    monkeypatch.setattr(tsfm_public, "PatchTSTFMForPrediction", Loader)
+    # Restore the upstream module's helper after the loader assigns it.
+    monkeypatch.setattr(modeling_patchtst_fm, "get_autocast_context", lambda _: None)
+    _load_granite.cache_clear()
+    try:
+        model = _load_granite("patchtst-fm-r2", GRANITE["patchtst-fm-r2"][1])
+        assert not model.training
+        assert not any(parameter.requires_grad for parameter in model.parameters())
+    finally:
+        _load_granite.cache_clear()
+    assert called == [(GRANITE["patchtst-fm-r2"][0], {
+        "revision": GRANITE["patchtst-fm-r2"][1],
+        "use_safetensors": True, "output_loading_info": True,
+    })]

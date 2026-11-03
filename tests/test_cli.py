@@ -6,9 +6,8 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
-import torch
 
-from fd_airquality.cli import launch_simulation, main
+from fd_airquality.cli import _parser, launch_simulation, main
 from fd_airquality.settings import RunSettings
 
 
@@ -18,16 +17,29 @@ def test_flower_and_cli_defaults_are_identical():
     assert RunSettings.from_mapping(config["tool"]["flwr"]["app"]["config"]) == RunSettings()
 
 
+@pytest.mark.parametrize("command", ["simulate", "benchmark"])
+@pytest.mark.parametrize("option", ["--workers", "--client-gpus"])
+def test_manual_federated_resource_options_are_removed(command, option, capsys):
+    parser, _ = _parser()
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args([command, option, "1"])
+    assert exc.value.code == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
 def test_simulation_command_uses_manifest_station_count(prepared, capsys, tmp_path, monkeypatch):
     path, _ = prepared
     project_config = Path("pyproject.toml").read_bytes()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_bytes(project_config)
-    main(["simulate", "--manifest", str(path), "--workers", "1", "--print-command"])
+    main(["simulate", "--manifest", str(path), "--print-command"])
     output = capsys.readouterr().out
     assert "uv run --frozen flwr run . local --stream" in output
     assert "num-supernodes=2" in output
     assert "init-args-num-cpus=1" in output
+    assert "client-resources-num-gpus=0.0" in output
+    assert "init-args-num-gpus=0" in output
+    assert "hasta 1 clientes federados simultáneos" in output
 
 
 def test_inspect_uses_no_training(prepared, capsys):
@@ -93,28 +105,67 @@ def test_inspect_reports_zero_denominators_even_when_pairs_exist(global_prepared
     assert "MASE/RMSSE indefinidas en validation" in capsys.readouterr().out
 
 
-def test_usable_cuda_requires_explicit_ray_resources(prepared, monkeypatch):
-    monkeypatch.setattr("fd_airquality.cli.resolve_device", lambda _: torch.device("cuda"))
-    path, _ = prepared
-    with pytest.raises(SystemExit) as exc:
-        main(["simulate", "--manifest", str(path), "--device", "cuda", "--print-command"])
-    assert exc.value.code == 2
-
-
-@pytest.mark.parametrize("reserved_gpus", [0., 1.])
-def test_cuda_fallback_does_not_reserve_ray_gpu_resources(prepared, tmp_path, monkeypatch, capsys, reserved_gpus):
+@pytest.mark.parametrize("slots", [["GPU-B"], ["3", "7"], ["0", "1", "2"]])
+def test_simulation_automatically_reserves_one_gpu_per_client(prepared, tmp_path, monkeypatch, capsys, slots):
     path, _ = prepared
     project_config = Path("pyproject.toml").read_bytes()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_bytes(project_config)
-    monkeypatch.setattr("fd_airquality.cli.resolve_device", lambda _: torch.device("cpu"))
+    monkeypatch.setattr("fd_airquality.cli.usable_gpu_slots", lambda _: slots)
+    main(["simulate", "--manifest", str(path), "--device", "cuda", "--print-command"])
+    output = capsys.readouterr().out
+    assert "client-resources-num-gpus=1.0" in output
+    assert f"init-args-num-gpus={len(slots)}" in output
+    assert f"init-args-num-cpus={min(len(slots), 2)}" in output
+    assert f"hasta {min(len(slots), 2)} clientes federados simultáneos" in output
+    assert f"CUDA_VISIBLE_DEVICES={','.join(slots)}" in output
+    overrides, = (tmp_path / ".flwr" / "launches").glob("*.toml")
+    with overrides.open("rb") as stream:
+        assert tomllib.load(stream)["device"] == "cuda"
+
+
+def test_cuda_fallback_does_not_reserve_ray_gpu_resources(prepared, tmp_path, monkeypatch, capsys):
+    path, _ = prepared
+    project_config = Path("pyproject.toml").read_bytes()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_bytes(project_config)
+    monkeypatch.setattr("fd_airquality.cli.usable_gpu_slots", lambda _: [])
     settings = RunSettings(manifest=str(path), device="cuda")
-    launch_simulation(settings, workers=1, client_gpus=reserved_gpus, dry_run=True)
+    launch_simulation(settings, dry_run=True)
     output = capsys.readouterr().out
     assert "client-resources-num-gpus=0.0" in output
+    assert "init-args-num-gpus=0" in output
+    assert "init-args-num-cpus=1" in output
     overrides, = (tmp_path / ".flwr" / "launches").glob("*.toml")
     with overrides.open("rb") as stream:
         assert tomllib.load(stream)["device"] == "cpu"
+
+
+def test_benchmark_model_concurrency_cap_does_not_limit_federated_clients(prepared, tmp_path, monkeypatch, capsys):
+    from io import StringIO
+
+    from fd_airquality.execution import execute_plan
+    from fd_airquality.run_logging import RunLogging
+
+    path, _ = prepared
+    project_config = Path("pyproject.toml").read_bytes()
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "pyproject.toml").write_bytes(project_config)
+    monkeypatch.setattr("fd_airquality.cli.usable_gpu_slots", lambda _: ["3", "7"])
+    monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["3", "7"])
+
+    def launch(settings, dry_run):
+        launch_simulation(settings, dry_run=True)
+        return tmp_path / "federated-result"
+
+    plan = [{"model": "mlp", "mode": "federated"}]
+    with RunLogging(tmp_path, "test", stream=StringIO()) as log:
+        execute_plan(RunSettings(manifest=str(path), device="cuda"), plan, tmp_path,
+                     max_parallel_models=1, baseline=None, launch=launch, progress_log=log)
+    output = capsys.readouterr().out
+    assert "init-args-num-cpus=2" in output
+    assert "init-args-num-gpus=2" in output
+    assert "client-resources-num-gpus=1.0" in output
 
 
 def test_flower_bundle_never_uploads_datasets_reports_or_skills():
@@ -136,14 +187,19 @@ def test_flower_bundle_never_uploads_datasets_reports_or_skills():
 
 
 @pytest.mark.parametrize("completed", [False, True])
-def test_launch_requires_successful_server_results(prepared, tmp_path, monkeypatch, completed):
+@pytest.mark.parametrize("slots", [[], ["GPU-B", "GPU-C"]])
+def test_launch_requires_successful_server_results(prepared, tmp_path, monkeypatch, completed, slots):
     path, _ = prepared
     project_config = Path("pyproject.toml").read_bytes()
     monkeypatch.chdir(tmp_path)
     (tmp_path / "pyproject.toml").write_bytes(project_config)
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "reports"))
+    monkeypatch.setattr("fd_airquality.cli.usable_gpu_slots", lambda _: slots)
+    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "reports"),
+                           device="cuda" if slots else "cpu")
 
     def successful_submission(self, command, env, path, label, **kwargs):
+        if slots:
+            assert env["CUDA_VISIBLE_DEVICES"] == ",".join(slots)
         path.write_text("Flower output streamed dynamically\n")
         if completed:
             result = tmp_path / "reports" / "new_run"
@@ -153,11 +209,11 @@ def test_launch_requires_successful_server_results(prepared, tmp_path, monkeypat
 
     monkeypatch.setattr("fd_airquality.cli.ProcessRunner.stream", successful_submission)
     if completed:
-        result = launch_simulation(settings, workers=1, client_gpus=0.0, dry_run=False)
+        result = launch_simulation(settings, dry_run=False)
         assert "streamed dynamically" in (result / "flower.log").read_text()
     else:
         with pytest.raises(RuntimeError, match="sin resultados de test completos"):
-            launch_simulation(settings, workers=1, client_gpus=0.0, dry_run=False)
+            launch_simulation(settings, dry_run=False)
 
 
 def test_interrupted_launcher_requests_native_flower_stop_and_preserves_logs(prepared, tmp_path, monkeypatch):
@@ -183,7 +239,7 @@ def test_interrupted_launcher_requests_native_flower_stop_and_preserves_logs(pre
     monkeypatch.setattr("fd_airquality.cli.ProcessRunner.stream", stream)
     monkeypatch.setattr("fd_airquality.cli.subprocess.run", stop)
     with pytest.raises(KeyboardInterrupt):
-        launch_simulation(RunSettings(manifest=str(path)), workers=1, client_gpus=0, dry_run=False)
+        launch_simulation(RunSettings(manifest=str(path)), dry_run=False)
     assert stopped == [["uv", "run", "--frozen", "flwr", "stop", "123456", "local"]]
     log, = (tmp_path / ".flwr" / "launches").glob("*/run.log")
     assert "Run interrupted" in log.read_text()

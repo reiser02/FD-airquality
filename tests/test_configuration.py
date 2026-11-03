@@ -1,4 +1,5 @@
-from dataclasses import asdict
+import json
+from dataclasses import asdict, fields
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,16 @@ def arguments(values):
     return parse_configured_args(parser, commands, values)
 
 
-def test_shipped_toml_defaults_and_preparation_overrides_are_valid():
+def test_toml_defaults_and_preparation_overrides_are_valid(tmp_path, monkeypatch):
+    # The user's experiment file is editable; defaults must use a controlled TOML.
+    monkeypatch.chdir(tmp_path)
+    preparation = asdict(DataConfig()) | {"train_stride": 6}
+    (tmp_path / "fd-airquality.toml").write_text(
+        "[prepare]\n" + "\n".join(
+            f"{key.replace('_', '-')} = {json.dumps(value)}"
+            for key, value in preparation.items() if value is not None
+        ) + '\nstation = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]\n'
+    )
     data = arguments(["prepare"])
     for key, value in asdict(DataConfig()).items():
         assert getattr(data, key) == (6 if key == "train_stride" else value)
@@ -24,6 +34,16 @@ def test_shipped_toml_defaults_and_preparation_overrides_are_valid():
         for key, value in asdict(RunSettings()).items():
             if key not in {"manifest", "output_dir"}:
                 assert getattr(args, key) == value
+
+
+def test_project_toml_is_valid_without_requiring_builtin_defaults():
+    path = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
+    data = arguments(["prepare", "--config", str(path)])
+    DataConfig(**{field.name: getattr(data, field.name)
+                  for field in fields(DataConfig) if getattr(data, field.name) is not None})
+    for command in ("simulate", "baseline", "benchmark"):
+        args = arguments([command, "--config", str(path)])
+        RunSettings(**{field.name: getattr(args, field.name) for field in fields(RunSettings)})
 
 
 def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
@@ -68,6 +88,8 @@ def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypat
 
 @pytest.mark.parametrize("text", [
     '[unknown]\nseed = 1', '[run]\nsead = 1', '[run]\nworkers = 1',
+    '[simulate]\nworkers = 2', '[simulate]\nclient-gpus = 1.0',
+    '[benchmark]\nworkers = 2', '[benchmark]\nclient-gpus = 1.0',
     '[run]\nbatch-size = "32"', '[run]\nseed = true', '[run]\nbatch-size = 1.5',
     '[benchmark]\nmodels = "mlp"', '[benchmark]\nmodels = ["unknown"]',
     '[benchmark]\nseeds = []', '[simulate]\nprint-command = 1',
@@ -94,11 +116,11 @@ def test_config_paths_and_scalar_types_follow_cli_semantics(tmp_path, monkeypatc
     nested = tmp_path / "config"
     nested.mkdir()
     path = nested / "custom.toml"
-    path.write_text('[prepare]\nraw-root = "raw"\n[simulate]\nprint-command = true\nclient-gpus = 1\n')
+    path.write_text('[prepare]\nraw-root = "raw"\n[run]\nlearning-rate = 1\n[simulate]\nprint-command = true\n')
     assert arguments(["prepare", "--config", str(path)]).raw_root == Path("raw")
     args = arguments(["simulate", "--config", str(path)])
     assert args.print_command is True
-    assert args.client_gpus == 1.0
+    assert args.learning_rate == 1.0
     assert arguments(["simulate", "--config", str(path), "--no-print-command"]).print_command is False
 
 
@@ -113,13 +135,13 @@ def test_main_passes_merged_configuration_to_the_launcher(prepared, tmp_path, mo
     path, _ = prepared
     config = tmp_path / "experiment.toml"
     config.write_text('[run]\nseed = 17\nnum-server-rounds = 9\n'
-                      '[simulate]\nworkers = 3\nprint-command = true\n')
+                      '[simulate]\nprint-command = true\n')
     received = []
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *args: received.append(args))
     main(["simulate", "--config", str(config), "--manifest", str(path), "--num-server-rounds", "1"])
-    settings, workers, client_gpus, dry_run = received[0]
+    settings, dry_run = received[0]
     assert (settings.seed, settings.num_server_rounds, settings.manifest) == (17, 1, str(path))
-    assert (workers, client_gpus, dry_run) == (3, 0.0, True)
+    assert dry_run is True
 
 
 def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monkeypatch):

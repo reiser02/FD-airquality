@@ -60,6 +60,7 @@ def test_full_flower_strategy_selects_validation_then_tests_once(prepared, tmp_p
         manifest=str(path), output_dir=str(tmp_path / "reports"),
         num_server_rounds=2, hidden_size=8, strategy=strategy, batch_size=32, model=model,
         lora_targets="proj" if model == "flowstate-r1" else "auto",
+        mlflow_tracking_uri="disabled",
     )
     grid = LocalTestGrid(settings, len(manifest["clients"]))
     output = run_server(grid, settings)
@@ -85,6 +86,23 @@ def test_full_flower_strategy_selects_validation_then_tests_once(prepared, tmp_p
     per_station = pd.read_csv(output / "station_metrics.csv")
     assert len(per_station[per_station.split == "test"]) == 2
     assert (output / "last_model.pt").is_file()
+
+
+def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_path, mlflow_uri):
+    from mlflow import MlflowClient
+
+    path, manifest = prepared
+    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
+                           num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=mlflow_uri)
+    output = run_server(LocalTestGrid(settings, len(manifest["clients"])), settings)
+    metadata = json.loads((output / "mlflow.json").read_text())
+    client = MlflowClient(tracking_uri=mlflow_uri)
+    run, = client.search_runs([metadata["experiment_id"]])
+    assert run.info.run_id == metadata["run_id"]
+    assert run.info.status == "FINISHED"
+    assert run.data.params["num_clients"] == "2"
+    assert {"test/mae", "station_000/test/mae", "station_001/test/mae"} <= run.data.metrics.keys()
+    assert "run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)}
 
 
 def test_actual_flower_fedavg_weights_by_valid_window_count(tmp_path):

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -41,6 +42,16 @@ from fd_airquality.tracking import RunTracker, write_run
 
 def _copy_state(model):
     return {key: value.detach().cpu().clone() for key, value in shared_state(model).items()}
+
+
+@contextmanager
+def _model_on_device(model, device, *, offload: bool):
+    try:
+        model.to(device)
+        yield model
+    finally:
+        if offload:
+            model.to("cpu")
 
 
 class Recorder:
@@ -123,11 +134,14 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
     geometry = manifest["geometry"]
     count = len(datasets)
     independent = mode == "local"
+    offload = independent and settings.device == "cuda"
     models = []
     for index in range(count if independent else 1):
         report_progress("loading-model", f"instance={index + 1}/{count if independent else 1}")
         device = configure_torch(settings, settings.seed)
-        models.append(make_model(geometry, settings).to(device))
+        models.append(make_model(geometry, settings).to("cpu" if offload else device))
+    if offload:
+        report_progress("model-residency", "local_models=cpu active_gpu_models=1")
     recorder = Recorder(output, manifest, tracker)
     best_scores = [float("inf")] * len(models)
     best_rounds = [-1] * len(models)
@@ -137,10 +151,14 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
     def evaluate(split):
         records = []
         for partition, data in enumerate(datasets):
-            with progress_context(station=manifest["clients"][partition]["station"], partition=partition):
+            model = models[partition if independent else 0]
+            with (
+                progress_context(station=manifest["clients"][partition]["station"], partition=partition),
+                _model_on_device(model, device, offload=offload),
+            ):
                 report_progress(split, f"station={partition + 1}/{count}")
                 records.append(evaluate_local(
-                    models[partition if independent else 0], data[split], settings, device,
+                    model, data[split], settings, device,
                     artifacts[partition], geometry["seasonality"],
                 ))
         return records
@@ -153,8 +171,11 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 for partition, (model, data) in enumerate(zip(models, datasets, strict=True)):
                     seed = settings.seed + 100_003 * stage + partition
                     configure_torch(settings, seed)
-                    with progress_context(station=manifest["clients"][partition]["station"],
-                                          partition=partition, round=stage):
+                    with (
+                        progress_context(station=manifest["clients"][partition]["station"],
+                                         partition=partition, round=stage),
+                        _model_on_device(model, device, offload=offload),
+                    ):
                         records.append(train_local(model, data["train"], settings, device, seed))
                 recorder.record(stage, "train", records)
             else:

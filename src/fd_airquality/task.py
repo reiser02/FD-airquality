@@ -46,8 +46,14 @@ def configure_torch(settings: RunSettings, seed: int) -> torch.device:
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     torch.set_num_threads(settings.torch_threads)
-    torch.use_deterministic_algorithms(True)
     return device
+
+
+def _microbatch_size(settings: RunSettings, device: torch.device) -> int:
+    # Execution limit, not an optimizer batch-size change or an OOM retry policy.
+    if settings.model == "patchtst-fm-r2" and device.type == "cuda":
+        return min(settings.batch_size, 8)
+    return settings.batch_size
 
 
 def train_local(
@@ -74,32 +80,46 @@ def train_local(
     optimizer = torch.optim.AdamW(
         parameters, lr=settings.learning_rate, weight_decay=settings.weight_decay
     )
+    microbatch_size = _microbatch_size(settings, device)
+    optimizer_steps = 0
     total_squared_error, targets = 0.0, 0
     for epoch in range(1, settings.local_epochs + 1):
-        report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches=0/{len(loader)} device={device}")
+        report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches=0/{len(loader)} device={device} "
+                        f"effective_batch_size={settings.batch_size} microbatch_size={microbatch_size}")
         last_report = time.monotonic()
         for batch, (inputs, actual) in enumerate(loader, start=1):
-            inputs, actual = inputs.to(device), actual.to(device)
             optimizer.zero_grad(set_to_none=True)
-            mse = nn.functional.mse_loss(model(inputs), actual)
-            loss = mse
-            if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight:
-                loss = loss + settings.reconstruction_weight * model.reconstruction_loss(inputs)
+            for start in range(0, len(inputs), microbatch_size):
+                micro_inputs = inputs[start:start + microbatch_size].to(device)
+                micro_actual = actual[start:start + microbatch_size].to(device)
+                mse = nn.functional.mse_loss(model(micro_inputs), micro_actual)
+                loss = mse
+                if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight:
+                    loss = loss + settings.reconstruction_weight * model.reconstruction_loss(micro_inputs)
+                if not torch.isfinite(loss):
+                    raise ValueError("Pérdida local no finita; se aborta para no contaminar los pesos globales.")
+                if not loss.requires_grad:
+                    raise RuntimeError("El modelo cortó autograd: los adaptadores no reciben gradientes.")
+                # Weight by targets, including uneven microbatches and the final
+                # partial logical batch. Backward releases each activation graph.
+                (loss * (micro_actual.numel() / actual.numel())).backward()
+                total_squared_error += float(mse.detach()) * micro_actual.numel()
+                targets += micro_actual.numel()
+                del loss, mse
             if proximal_mu:
                 penalty = sum(
                     (parameter - initial).square().sum()
                     for parameter, initial in zip(parameters, reference, strict=True)
                 )
-                loss = loss + proximal_mu * penalty / 2
-            if not torch.isfinite(loss):
-                raise ValueError("Pérdida local no finita; se aborta para no contaminar los pesos globales.")
-            if not loss.requires_grad:
-                raise RuntimeError("El modelo cortó autograd: los adaptadores no reciben gradientes.")
-            loss.backward()
+                loss = proximal_mu * penalty / 2
+                if not torch.isfinite(loss):
+                    raise ValueError("Penalización proximal no finita; se aborta el entrenamiento.")
+                # FedProx is added once per logical batch, not per microbatch.
+                loss.backward()
+                del loss, penalty
             nn.utils.clip_grad_norm_(parameters, max_norm=1.0, error_if_nonfinite=True)
             optimizer.step()
-            total_squared_error += float(mse.detach()) * actual.numel()
-            targets += actual.numel()
+            optimizer_steps += 1
             if time.monotonic() - last_report >= settings.heartbeat_seconds:
                 report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={batch}/{len(loader)}")
                 last_report = time.monotonic()
@@ -112,6 +132,8 @@ def train_local(
         "train-seconds": time.perf_counter() - started,
         "trainable-parameters": sum(parameter.numel() for parameter in parameters),
         "peak-process-rss-mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
+        "effective-batch-size": settings.batch_size, "microbatch-size": microbatch_size,
+        "optimizer-steps": optimizer_steps,
     }
     if device.type == "cuda":
         metrics["peak-cuda-allocated-mib"] = torch.cuda.max_memory_allocated(device) / 1024**2
@@ -129,7 +151,7 @@ def evaluate_local(
 ) -> dict[str, float | int]:
     model.to(device).eval()
     predictions, actuals, baselines = [], [], []
-    loader = DataLoader(dataset, batch_size=settings.batch_size, num_workers=0)
+    loader = DataLoader(dataset, batch_size=_microbatch_size(settings, device), num_workers=0)
     last_report = time.monotonic()
     for batch, (inputs, actual) in enumerate(loader, start=1):
         forecast = model(inputs.to(device)).cpu().numpy().astype(np.float64)

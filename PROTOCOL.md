@@ -185,8 +185,17 @@ que ya pasaron `WindowDataset`.
 Cada ronda distribuye los pesos globales, entrena localmente con AdamW y devuelve
 pesos y métricas. El optimizador local se reinicia en cada ronda; no se agrega su
 estado. Hay semillas por ronda y estación, clipping de gradiente y orden estable
-de agregación. Las ejecuciones deterministas se validan en CPU; no se garantiza
-igualdad bit a bit entre hardware y versiones diferentes.
+de agregación. No se fuerzan algoritmos deterministas de PyTorch ni se garantiza
+igualdad bit a bit entre ejecuciones, hardware o versiones diferentes.
+
+PatchTST en CUDA usa microbatches de hasta 8 ventanas sin cambiar el batch efectivo
+configurado ni el orden de las ventanas. Cada pérdida se pondera por sus targets;
+se acumulan los gradientes antes de un único clipping y paso de AdamW por batch
+efectivo. El último batch incompleto usa su tamaño real y FedProx se añade una sola
+vez. No se recorta el contexto ni se cambia la arquitectura; el orden de suma y el
+dropout pueden introducir diferencias numéricas. En el control local CUDA los
+modelos siguen siendo independientes, pero solo la estación activa reside en GPU;
+las restantes se conservan en CPU.
 
 - **FedAvg:** implementación oficial de Flower, ponderada por el número de ventanas
   de entrenamiento realmente utilizadas, no por filas brutas, horas de calendario
@@ -368,8 +377,11 @@ no distribuye estaciones de un mismo candidato local ni implementa entrenamiento
 de un modelo entre varias GPUs. CPU/fallback se mantiene secuencial.
 
 En federado los candidatos permanecen secuenciales: Ray gestiona el paralelismo de
-clientes de una sola federación, con los recursos declarados por `workers` y
-`client-gpus`. No se presupone coordinación de GPUs entre runtimes Ray independientes.
+clientes de una sola federación automáticamente, reservando una GPU completa por
+cliente. La concurrencia es el mínimo entre las GPUs utilizables y las estaciones
+del panel efectivo; en CPU/fallback se ejecuta un cliente cada vez y no se reservan
+GPUs. No hay ajustes manuales `workers`/`client-gpus`. No se presupone coordinación
+de GPUs entre runtimes Ray independientes ni se reconfigura un SuperLink ya iniciado.
 Un fallo detiene/cancela los procesos del benchmark, marca los casos no finalizados
 y evita comparar un panel o una matriz incompletos. El orden de terminación de
 candidatos no cambia la identidad ni el orden de las filas de resultados.

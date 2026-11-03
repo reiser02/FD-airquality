@@ -9,11 +9,10 @@ from fd_airquality.tracking import tracking_uri
 
 
 @pytest.mark.parametrize("failure", [False, True])
-def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepared, tmp_path, monkeypatch, failure):
+def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepared, tmp_path, monkeypatch, failure, mlflow_uri):
     path, _ = prepared
-    uri = f"sqlite:///{tmp_path / 'mlflow.db'}"
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
-                           mlflow_tracking_uri=uri, mlflow_experiment="test-airquality")
+                           mlflow_tracking_uri=mlflow_uri, mlflow_experiment="test-airquality")
     if failure:
         def fail(*_):
             raise RuntimeError("training failed")
@@ -25,7 +24,7 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
         run_baseline(settings, "centralized")
     metadata_path, = list((tmp_path / "runs").glob("*/mlflow.json"))
     metadata = json.loads(metadata_path.read_text())
-    client = MlflowClient(tracking_uri=uri)
+    client = MlflowClient(tracking_uri=mlflow_uri)
     run = client.get_run(metadata["run_id"])
     assert run.info.status == ("FAILED" if failure else "FINISHED")
     assert run.data.params["model"] == "mlp"

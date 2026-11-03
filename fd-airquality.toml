@@ -3,83 +3,167 @@
 # Las rutas relativas se interpretan desde el directorio de ejecución, como en CLI.
 
 [prepare]
+# Carpeta con los CSV originales organizados por estación.
 raw-root = "data/raw/datos_estaciones_5m"
+# Raíz donde se guardan las preparaciones inmutables, inventarios y manifests.
 output = "data/federated"
+# Contaminante que se lee de los CSV; opciones admitidas: NO2, O3 o CO.
 pollutant = "NO2"
+# Horas históricas que recibe el modelo en cada ventana de entrada.
 context = 90
+# Horas futuras que predice cada ventana.
 horizon = 12
+# Separación en horas entre ventanas de validación/test; no debe superar horizon.
 stride = 6
+# Separación en horas entre ventanas de entrenamiento; un valor mayor reduce solapamiento.
 train-stride = 6
+# Mínimo de ventanas de entrenamiento para incluir una estación en el manifest.
 min-train-windows = 1
+# Mínimo de ventanas de validación para incluir una estación.
 min-validation-windows = 7
+# Mínimo de ventanas de test para incluir una estación.
 min-test-windows = 15
+# Límite opcional de ventanas de entrenamiento por estación; útil para pruebas rápidas.
+# Si se omite, se conservan todas las ventanas disponibles.
 # max-train-windows = 128  # Solo para pruebas; omitir para usar todas las ventanas.
+# Estaciones a preparar, por nombre exacto de su directorio; si se omite, se usan todas.
 station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+# Periodicidad estacional en horas (24 = ciclo diario), usada para MASE/RMSSE.
 seasonality = 24
+# Horas de referencia previas a cada periodo evaluado para calcular la escala de MASE/RMSSE.
+# No limita el entrenamiento ni cambia context.
 error-scale-hours = 672
+# Número de lecturas consecutivas e iguales de 5 minutos para marcar una racha no nula congelada.
+# En modo causal se conservan las primeras min-run - 1 lecturas.
 min-run = 6
+# Mínimo de lecturas de 5 minutos válidas y no congeladas necesarias para calcular la media horaria.
 min-useful = 1
+# Horas observadas con media cero acumuladas antes de marcarlas como congeladas.
+# Las horas ausentes pausan el contador; una hora no nula lo reinicia.
 zero-run-hours = 24
+# Política temporal: global usa los mismos cortes de calendario para todas las estaciones;
+# station construye holdouts al final de cada serie y usa validation-hours/test-hours.
 split-mode = "global"
+# Filtrado de calidad causal (sin eliminar datos pasados usando observaciones futuras).
+# El protocolo global requiere causal; retrospective solo se admite con split-mode = "station".
 quality-mode = "causal"
+# Inicio de los objetivos de validación en modo global; el intervalo termina en test-start.
 validation-start = "2026-03-01"
+# Inicio de los objetivos de test; también es el final exclusivo del periodo de validación.
 test-start = "2026-03-29"
+# Final exclusivo de los objetivos de test en modo global.
 test-end = "2026-04-26"
+# Duración horaria del holdout de validación; solo se usa con split-mode = "station".
 validation-hours = 48
+# Duración horaria del holdout de test; solo se usa con split-mode = "station".
 test-hours = 96
 
-# Opciones compartidas por simulate, baseline y benchmark.
+# Opciones compartidas por simulate, baseline y benchmark. Las opciones de la sección
+# específica del comando prevalecen sobre estas si se repite una clave.
 [run]
-# manifest = "data/federated/<preparacion>/manifest.json"  # Omitir: la más reciente.
+# Manifest de una preparación concreta; si se omite, se selecciona la preparación más reciente.
+# manifest = "data/federated/<preparacion>/manifest.json"
+# Número de rondas de comunicación federada; en benchmark se aplica a cada candidato federado.
 num-server-rounds = 5
+# Pasadas locales por los datos de cada cliente en cada ronda.
 local-epochs = 1
+# Ventanas procesadas por lote en cada actualización del optimizador.
 batch-size = 128
+# Tasa de aprendizaje de AdamW.
 learning-rate = 0.001
+# Penalización weight decay de AdamW; 0 la desactiva.
 weight-decay = 0.01
+# Ancho de las capas ocultas del MLP y del autoencoder.
 hidden-size = 64
+# Agregación federada: FedAvg o FedProx.
 strategy = "fedavg"
+# Intensidad de la penalización proximal; solo tiene efecto con strategy = "fedprox".
 proximal-mu = 0.01
+# Semilla para inicialización y aleatoriedad; benchmark puede sustituirla con [benchmark].seeds.
 seed = 42
-device = "cpu"
+# Dispositivo de entrenamiento; CUDA no utilizable se resuelve como CPU.
+# En federado se ejecuta un cliente simultáneo por GPU utilizable; en CPU, uno cada vez.
+device = "cuda"
+# Hilos internos de PyTorch (también limita OMP/MKL en los procesos lanzados).
 torch-threads = 1
+# Modelo predeterminado; opciones: mlp, autoencoder, darts-nlinear, ttm-r3,
+# patchtst-fm-r2 y flowstate-r1. benchmark usa su lista [benchmark].models.
 model = "mlp"
+# Dimensión del cuello de botella latente del autoencoder.
 latent-size = 16
+# Peso de la pérdida auxiliar de reconstrucción del autoencoder; no afecta a otros modelos.
 reconstruction-weight = 0.1
+# Revisión SHA opcional del modelo de Hugging Face; vacío conserva la revisión fijada por el proyecto.
 hf-revision = ""
+# Escala temporal de FlowState (patch base de 24 h); puede cambiar la geometría admisible.
 flowstate-scale-factor = 1.0
+# URI de MLflow; vacío crea/usa una base SQLite local junto a la carpeta de informes.
+# El valor "disabled" desactiva el tracking.
 mlflow-tracking-uri = ""
+# Nombre del experimento donde MLflow agrupa las ejecuciones.
 mlflow-experiment = "fd-airquality"
+# 1 registra los checkpoints .pt como artefactos de MLflow; 0 no los registra.
 mlflow-log-models = 1
+# Adaptación predeterminada: auto entrena completo los modelos clásicos y aplica LoRA a Granite.
+# También admite none (solo zero-shot) y lora, ffa-lora, flora o lora-fair.
 adaptation = "auto"
+# Rango (dimensión interna) de los adaptadores LoRA; un rango mayor añade parámetros entrenables.
 lora-rank = 4
+# Factor de escala LoRA: la actualización se escala por alpha/rank.
 lora-alpha = 8.0
+# Dropout aplicado a las entradas de LoRA durante entrenamiento; 0 lo desactiva.
 lora-dropout = 0.0
+# Capas lineales donde insertar LoRA; auto usa las capas seleccionadas para cada Granite.
+# También se puede indicar una lista separada por comas de nombres/rutas de capas.
 lora-targets = "auto"
+# Iteraciones de refinamiento en el agregador LoRA-FAIR; solo se usa con adaptation = "lora-fair".
 fair-iterations = 1000
+# Tasa de aprendizaje del refinamiento LoRA-FAIR.
 fair-learning-rate = 0.01
+# Peso de la regularización L2 del refinamiento LoRA-FAIR.
 fair-lambda = 1.0
+# Métrica de validación para elegir el mejor checkpoint; menor es mejor.
+# macro-mase/macro-rmsse ponderan por igual las estaciones; también se admite mae.
 selection-metric = "macro-mase"
+# Intervalo en segundos entre mensajes de progreso durante trabajos largos.
 heartbeat-seconds = 60.0
+# Nivel de detalle de los logs: DEBUG, INFO, WARNING o ERROR.
 log-level = "INFO"
 
 [simulate]
+# Directorio base para los resultados de las simulaciones Flower.
 output-dir = "reports/federated"
-workers = 2
-client-gpus = 0.0
+# Paralelismo automático: un cliente por GPU utilizable, hasta el número de estaciones.
+# true imprime/prepara el comando de Flower sin iniciar la simulación.
 print-command = false
 
 [baseline]
+# Directorio base de resultados para ejecuciones sin Flower.
 output-dir = "reports/non_federated"
+# Método de control: local entrena por estación; centralized junta entrenamiento;
+# zero-shot evalúa Granite sin adaptación ni entrenamiento.
 mode = "local"
 
 [benchmark]
+# Directorio base; cada matriz se guarda en una subcarpeta con fecha y hora.
 output-dir = "reports/benchmarks"
+# Modelos candidatos: MLP, autoencoder, NLinear de Darts y checkpoints Granite indicados.
 models = ["mlp", "autoencoder", "darts-nlinear", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
+# Métodos comparados: entrenamiento local por estación, centralizado, federado y zero-shot.
+# Zero-shot solo se genera para los modelos Granite.
 modes = ["local", "centralized", "federated", "zero-shot"]
+# Adaptaciones Granite: en federado compara LoRA, FFA-LoRA (A congelada), FLoRA
+# (acumulación por apilado) y LoRA-FAIR (refinamiento en servidor); local/centralizado
+# usan LoRA y FFA-LoRA como controles. Los modelos clásicos se entrenan completos.
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
-workers = 2
-client-gpus = 0.0
+# En federado se usa un cliente simultáneo por GPU utilizable; en CPU, secuencial.
+# Semillas a comparar; si se omite, se usa [run].seed. Zero-shot no se duplica por semilla.
 # seeds = [42, 43, 44]
+# Rangos LoRA a comparar en Granite; si se omite, se usa [run].lora-rank.
 # lora-ranks = [4, 8]
+# Estrategias federadas a comparar (FedAvg/FedProx); FLoRA y LoRA-FAIR requieren FedAvg.
+# Si se omite, se usa [run].strategy.
 # strategies = ["fedavg", "fedprox"]
-# max-parallel-models = 2  # Omitir: un candidato por GPU utilizable. CPU: secuencial.
+# Límite de candidatos simultáneos en modos no federados; si se omite, uno por GPU utilizable.
+# En CPU se ejecutan secuencialmente; no limita los clientes simultáneos de una federación.
+# max-parallel-models = 2

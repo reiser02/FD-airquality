@@ -57,27 +57,27 @@ def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path
 
     launches = []
 
-    def launch(settings, workers, client_gpus, dry_run):
+    def launch(settings, dry_run):
         assert not active
-        launches.append((workers, client_gpus, dry_run))
+        launches.append((settings.device, dry_run))
         seen.append(("federated", "Ray"))
         return result(tmp_path, f"federated-{settings.model}")
 
     monkeypatch.setattr("fd_airquality.execution._candidate_process", parallel)
     with RunLogging(tmp_path, "test", stream=StringIO()) as log:
-        paths = execute_plan(RunSettings(device="cuda"), plan, tmp_path, workers=2, client_gpus=1,
+        paths = execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                              max_parallel_models=None, baseline=lambda *_: pytest.fail("GPU case ran inline"),
                              launch=launch, progress_log=log)
     assert len(paths) == 8
     assert [mode for mode, _ in seen] == [mode for mode in modes for _ in range(2)]
-    assert launches == [(2, 1, False)] * 2
+    assert launches == [("cuda", False)] * 2
     assert os.environ.get("CUDA_VISIBLE_DEVICES") == original_visible
     rows = json.loads((tmp_path / "benchmark.json").read_text())
     assert all(row["status"] == "completed" for row in rows)
     assert {row["gpu"] for row in rows if row["mode"] != "federated"} == {"3", "7"}
 
 
-def test_concurrency_cap_limits_candidates_but_not_ray_clients(tmp_path, monkeypatch):
+def test_concurrency_cap_limits_non_federated_candidates(tmp_path, monkeypatch):
     monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["0", "1"])
     seen = []
 
@@ -88,12 +88,12 @@ def test_concurrency_cap_limits_candidates_but_not_ray_clients(tmp_path, monkeyp
     monkeypatch.setattr("fd_airquality.execution._candidate_process", parallel)
     plan = [candidate(name, "local") for name in ("mlp", "autoencoder", "darts-nlinear")]
     with RunLogging(tmp_path, "test", stream=StringIO()) as log:
-        execute_plan(RunSettings(device="cuda"), plan, tmp_path, workers=8, client_gpus=0,
+        execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                      max_parallel_models=1, baseline=None, launch=None, progress_log=log)
     assert seen == ["0", "0", "0"]
 
 
-def test_cuda_fallback_keeps_cpu_cases_sequential_and_releases_ray_gpu_reservations(tmp_path, monkeypatch):
+def test_cuda_fallback_keeps_cpu_cases_sequential(tmp_path, monkeypatch):
     monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: [])
     called = []
 
@@ -101,13 +101,13 @@ def test_cuda_fallback_keeps_cpu_cases_sequential_and_releases_ray_gpu_reservati
         called.append((settings.device, mode))
         return result(tmp_path, len(called), "cpu")
 
-    def launch(settings, workers, client_gpus, dry_run):
-        assert client_gpus == 0
+    def launch(settings, dry_run):
+        assert settings.device == "cpu"
         return baseline(settings, "federated")
 
     plan = [candidate("mlp", mode) for mode in ("local", "centralized", "federated")]
     with RunLogging(tmp_path, "test", stream=StringIO()) as log:
-        execute_plan(RunSettings(device="cuda"), plan, tmp_path, workers=2, client_gpus=1,
+        execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                      max_parallel_models=2, baseline=baseline, launch=launch, progress_log=log)
     assert called == [("cpu", mode) for mode in ("local", "centralized", "federated")]
 
@@ -134,7 +134,7 @@ def test_failure_cancels_running_and_future_candidates_and_stops_at_mode_barrier
     plan = [candidate("mlp", "local"), candidate("autoencoder", "local"), candidate("mlp", "centralized")]
     with (pytest.raises(RuntimeError, match="candidate failed"),
           RunLogging(tmp_path, "test", stream=StringIO()) as log):
-        execute_plan(RunSettings(device="cuda"), plan, tmp_path, workers=1, client_gpus=0,
+        execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                      max_parallel_models=None, baseline=None, launch=None, progress_log=log)
     rows = json.loads((tmp_path / "benchmark.json").read_text())
     assert [row["status"] for row in rows] == ["failed", "cancelled", "cancelled"]
@@ -156,13 +156,12 @@ def test_candidate_is_an_independent_process_with_explicit_configuration(prepare
     assert json.loads((output / "test_metrics.json").read_text())["test"]["num-clients"] == 2
 
 
-def test_cancellation_allows_child_to_flush_logs_and_close_mlflow_as_failed(prepared, tmp_path):
+def test_cancellation_allows_child_to_flush_logs_and_close_mlflow_as_failed(prepared, tmp_path, mlflow_uri):
     from mlflow import MlflowClient
 
     path, _ = prepared
-    uri = f"sqlite:///{tmp_path / 'cancelled.db'}"
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "cancelled-runs"),
-                           num_server_rounds=1, mlflow_tracking_uri=uri)
+                           num_server_rounds=1, mlflow_tracking_uri=mlflow_uri)
     script = (
         "import time\n"
         "import fd_airquality.baselines as baseline\n"
@@ -184,14 +183,14 @@ def test_cancellation_allows_child_to_flush_logs_and_close_mlflow_as_failed(prep
                       tmp_path / "cancelled.log", "cancel-test", on_line=on_line)
     run, = (tmp_path / "cancelled-runs").glob("*/mlflow.json")
     metadata = json.loads(run.read_text())
-    assert MlflowClient(tracking_uri=uri).get_run(metadata["run_id"]).info.status == "FAILED"
+    assert MlflowClient(tracking_uri=mlflow_uri).get_run(metadata["run_id"]).info.status == "FAILED"
     assert "Run interrupted" in run.with_name("run.log").read_text()
 
 
 @pytest.mark.parametrize("limit", [0, -1, True])
 def test_invalid_concurrency_is_rejected(tmp_path, limit):
     with pytest.raises(ValueError, match="max-parallel-models"):
-        execute_plan(RunSettings(), [], tmp_path, workers=1, client_gpus=0,
+        execute_plan(RunSettings(), [], tmp_path,
                      max_parallel_models=limit, baseline=None, launch=None, progress_log=None)
 
 
@@ -225,14 +224,14 @@ def test_gpu_slots_probe_each_visible_device_and_preserve_physical_mapping(monke
 
 
 @pytest.mark.parametrize("tracking", [False, True])
-def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, tracking):
+def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, tracking, request):
     path, _ = prepared
     # Logical slots exercise concurrent processes on CPU, without claiming a two-GPU hardware test.
     monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["", ""])
-    uri = f"sqlite:///{tmp_path / 'mlflow.db'}" if tracking else "disabled"
+    uri = request.getfixturevalue("mlflow_uri") if tracking else "disabled"
     output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "matrix"),
                            num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=uri),
-                           ["mlp", "autoencoder"], ["local", "centralized"], workers=1, client_gpus=0)
+                            ["mlp", "autoencoder"], ["local", "centralized"])
     assert (output / "comparison.csv").is_file()
     root = output.parent
     rows = json.loads((root / "benchmark.json").read_text())

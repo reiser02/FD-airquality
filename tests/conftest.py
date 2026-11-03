@@ -1,8 +1,40 @@
+import sqlite3
+from contextlib import closing
+
 import numpy as np
 import pandas as pd
 import pytest
 
 from fd_airquality.data import DataConfig, prepare, read_manifest
+
+
+@pytest.fixture(scope="session", autouse=True)
+def cpu_test_environment():
+    # CUDA behavior is mocked explicitly in unit tests. In particular, Darts must
+    # not initialize every physical GPU just to preserve RNG state on CPU.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("CUDA_VISIBLE_DEVICES", "")
+        patch.setenv("OMP_NUM_THREADS", "1")
+        patch.setenv("MKL_NUM_THREADS", "1")
+        yield
+
+
+@pytest.fixture(scope="session")
+def mlflow_schema(tmp_path_factory):
+    from mlflow import MlflowClient
+
+    path = tmp_path_factory.mktemp("mlflow-schema") / "mlflow.db"
+    # Run the real migrations once; each tracking test gets an isolated database.
+    MlflowClient(tracking_uri=f"sqlite:///{path}").search_experiments()
+    return path
+
+
+@pytest.fixture
+def mlflow_uri(mlflow_schema, tmp_path):
+    path = tmp_path / "mlflow.db"
+    with closing(sqlite3.connect(mlflow_schema)) as source, closing(sqlite3.connect(path)) as target:
+        source.backup(target)
+    return f"sqlite:///{path}"
 
 
 @pytest.fixture
