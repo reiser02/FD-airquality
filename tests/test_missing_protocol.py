@@ -127,7 +127,8 @@ def test_masked_microbatches_match_full_batch_gradients(monkeypatch, microbatch,
     original = (make_model({"context": 4, "horizon": 3}, RunSettings(hidden_size=8))
                 if model == "mlp" else ForecastAutoencoder(4, 3, 8, 2)).double()
     full, micro = deepcopy(original), deepcopy(original)
-    settings = RunSettings(model=model, batch_size=7, local_epochs=2)
+    settings = RunSettings(model=model, batch_size=7, local_epochs=2,
+                           early_stopping=0, lr_scheduler="none")
     monkeypatch.setattr("fd_airquality.task._microbatch_size", lambda *_: 7)
     reference = train_local(full, TensorDataset(inputs, actual), settings, torch.device("cpu"), 17, .1)
     monkeypatch.setattr("fd_airquality.task._microbatch_size", lambda *_: microbatch)

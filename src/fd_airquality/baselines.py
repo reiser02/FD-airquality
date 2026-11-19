@@ -39,6 +39,7 @@ from fd_airquality.task import (
     validate_selection_coverage,
 )
 from fd_airquality.tracking import RunTracker, write_run
+from fd_airquality.training_control import controls_enabled
 
 
 def _copy_state(model):
@@ -182,14 +183,19 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                                          partition=partition, round=stage),
                         _model_on_device(model, device, offload=offload),
                     ):
-                        records.append(train_local(model, data["train"], settings, device, seed))
+                        records.append(train_local(
+                            model, data["train"], settings, device, seed,
+                            **({"validation_data": data["validation"]} if controls_enabled(settings) else {}),
+                        ))
                 recorder.record(stage, "train", records)
             else:
                 # ConcatDataset concatenates window samples, NEVER raw series or timestamps.
                 seed = settings.seed + 100_003 * stage
                 configure_torch(settings, seed)
                 metrics = train_local(models[0], ConcatDataset([data["train"] for data in datasets]),
-                                      settings, device, seed)
+                                      settings, device, seed,
+                                      **({"validation_data": ConcatDataset([data["validation"] for data in datasets])}
+                                         if controls_enabled(settings) else {}))
                 recorder.rounds.append({"round": stage, "split": "train", **metrics})
                 tracker.log_metrics("train", metrics, stage)
         validation = evaluate("validation")

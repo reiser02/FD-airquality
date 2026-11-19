@@ -1,0 +1,43 @@
+[prepare]
+pollutant = "PM25"
+context = 90
+horizon = 12
+stride = 6
+train-stride = 6
+station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+max-train-windows = 16
+window-policy = "masked"
+min-useful = 9
+hourly-repeat-filter = 0
+
+[run]
+device = "cpu"
+num-server-rounds = 3
+local-epochs = 8
+batch-size = 8
+hidden-size = 8
+selection-metric = "macro-mae"
+mlflow-tracking-uri = "disabled"
+normalization = "window"
+probabilistic = 1
+arrival-period-hours = 24
+early-stopping = 1
+early-stopping-patience = 2
+# DELIBERADO: fuerza meseta para probar parada/restauración, no para comparar precisión.
+early-stopping-min-delta = 1000000.0
+lr-scheduler = "plateau"
+lr-scheduler-patience = 0
+lr-scheduler-factor = 0.5
+min-learning-rate = 0.000001
+round-validation-hours = 24
+
+[prepare-backtest]
+folds = 2
+step-hours = 672
+train-history = "expanding"
+
+[backtest]
+stage = "evaluation"
+models = ["mlp", "autoencoder", "nlinear", "nhits"]
+modes = ["local", "centralized", "federated"]
+seeds = [42]

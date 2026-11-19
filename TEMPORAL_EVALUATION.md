@@ -80,7 +80,8 @@ scaler-type = "standard"  # identity | standard | robust | minmax
 - **`fixed`:** media/desviación por estación, solo sobre el prefijo observado
   disponible en la primera ronda **de cada fold**, limitado a su histórico
   autorizado. Se ajusta de nuevo en cada fold, sin heredar estadísticas del
-  anterior. Se registra un hash local de su referencia y estadísticas.
+  anterior. Al activar el control de épocas se excluye también la reserva de
+  monitorización. Se registra un hash local de su referencia y estadísticas.
   `normalization-reference-end` permite fijar un extremo explícito, nunca
   posterior a la primera llegada ni fuera del historial de ajuste.
 - **`none`:** sin escalado externo ni temporal adicional.
@@ -267,6 +268,9 @@ exclusiones de disponibilidad y clientes inactivos por ronda. Los clientes
 inactivos no influyen en los pesos. La validación completa
 del fold no se consulta hasta terminar su flujo de entrenamiento; en este modo
 no se hace early stopping con validación futura durante las llegadas.
+El control de épocas locales utiliza una reserva causal del prefijo inicial,
+excluida de gradientes y del ajuste del scaler fijo. No cancela rondas posteriores.
+Consulta [los controles de entrenamiento](TRAINING_CONTROLS.md).
 
 `arrival-period-hours = 0` desactiva expresamente la simulación dentro del fold.
 Una sola ronda no permite observar una progresión: usa al menos dos para ese
@@ -371,7 +375,17 @@ cronología, agregación y restauración. No prueban superioridad predictiva, no
 convierten ventanas solapadas en réplicas independientes y no son una ejecución
 del experimento científico completo ni una certificación de CUDA.
 
-### Validación sin selector de histórico entre rondas
+### Validación de evaluación normal y controles de épocas
+
+En este worktree: **559 pruebas aprobadas, sin omisiones**, con checkpoints
+reales habilitados. JUnit: `reports/training_controls_tests.xml`.
+Se completaron 24 casos reales acotados de MLP/NLinear/NHITS/autoencoder, tres
+modos y dos folds, con Flower/Ray en las federaciones. El control de épocas
+aplica paciencia, reduce LR y restaura pesos sin omitir nuevas rondas.
+Los folds se evalúan sin búsqueda por defecto. Los detalles, límites y comandos
+están en [TRAINING_CONTROLS.md](TRAINING_CONTROLS.md).
+
+### Validación anterior: sin selector de histórico entre rondas
 
 Suite completa con modelos reales habilitados: **525 pruebas aprobadas, cero
 fallos y cero omisiones**. JUnit: `reports/round_blocks_only_tests.xml`.

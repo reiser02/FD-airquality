@@ -104,6 +104,20 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "epochs_per_stage": settings.local_epochs,
             "optimizer_reset_each_stage": True,
         },
+        "training_controls": {
+            "scope": "local_epochs_per_stage_or_round",
+            "monitor": "pooled_observed_mae_original_units",
+            "early_stopping": settings.early_stopping,
+            "patience": settings.early_stopping_patience,
+            "min_delta": settings.early_stopping_min_delta,
+            "scheduler": settings.lr_scheduler,
+            "scheduler_patience": settings.lr_scheduler_patience,
+            "scheduler_factor": settings.lr_scheduler_factor,
+            "min_lr": settings.min_learning_rate,
+            "federated_monitor": "fixed_reserve_before_round_one" if progressive else None,
+            "round_validation_hours": settings.round_validation_hours if progressive else None,
+            "single_epoch_budget": settings.local_epochs == 1,
+        },
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 

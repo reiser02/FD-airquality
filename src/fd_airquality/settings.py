@@ -52,6 +52,14 @@ class RunSettings:
     scaler_type: str = "standard"
     normalization_reference_end: str = ""
     arrival_period_hours: int = 24
+    early_stopping: int = 1
+    early_stopping_patience: int = 5
+    early_stopping_min_delta: float = 0.0
+    lr_scheduler: str = "plateau"
+    lr_scheduler_patience: int = 2
+    lr_scheduler_factor: float = 0.5
+    min_learning_rate: float = 0.000001
+    round_validation_hours: int = 24
 
     def __post_init__(self) -> None:
         for name in ("num_server_rounds", "local_epochs", "batch_size", "hidden_size", "torch_threads", "latent_size", "lora_rank", "fair_iterations"):
@@ -107,6 +115,21 @@ class RunSettings:
                 raise ValueError("normalization_reference_end debe ser una fecha horaria sin zona.")
         if type(self.arrival_period_hours) is not int or self.arrival_period_hours < 0:
             raise ValueError("arrival_period_hours debe ser un entero no negativo (0 desactiva llegada).")
+        if type(self.early_stopping) is not int or self.early_stopping not in {0, 1}:
+            raise ValueError("early_stopping debe ser 0/1.")
+        for name in ("early_stopping_patience", "round_validation_hours"):
+            if type(getattr(self, name)) is not int or getattr(self, name) < 1:
+                raise ValueError(f"{name} debe ser un entero positivo.")
+        if type(self.lr_scheduler_patience) is not int or self.lr_scheduler_patience < 0:
+            raise ValueError("lr_scheduler_patience debe ser un entero no negativo.")
+        if self.lr_scheduler not in {"plateau", "none"}:
+            raise ValueError("lr_scheduler debe ser plateau o none.")
+        if not isfinite(self.early_stopping_min_delta) or self.early_stopping_min_delta < 0:
+            raise ValueError("early_stopping_min_delta debe ser finito y no negativo.")
+        if not isfinite(self.lr_scheduler_factor) or not 0 < self.lr_scheduler_factor < 1:
+            raise ValueError("lr_scheduler_factor debe estar entre 0 y 1.")
+        if not isfinite(self.min_learning_rate) or not 0 < self.min_learning_rate <= self.learning_rate:
+            raise ValueError("min_learning_rate debe ser positivo y no superar learning_rate.")
         if type(self.deterministic) is not int or self.deterministic not in {0, 1}:
             raise ValueError("deterministic debe ser 0/1.")
         if type(self.probabilistic) is not int or self.probabilistic not in {0, 1}:

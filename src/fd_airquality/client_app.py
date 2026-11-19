@@ -11,6 +11,7 @@ from fd_airquality.arrival import (
     arrival_metrics,
     audit_normalization,
     normalization_artifact,
+    round_validation_view,
     training_view,
 )
 from fd_airquality.artifacts import source_fingerprints
@@ -20,6 +21,7 @@ from fd_airquality.models import load_shared_state, shared_state
 from fd_airquality.run_logging import RunLogging, progress_context, report_progress, run_label
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import configure_torch, evaluate_local, make_model, train_local
+from fd_airquality.training_control import controls_enabled
 
 
 def _local_task(message: Message, context: Context, training: bool) -> Message:
@@ -61,6 +63,8 @@ def _execute_task(message, settings, partition, training):
         metrics = train_local(
             model, dataset, settings, device, seed,
             proximal_mu=float(message.content["config"].get("proximal-mu", 0.0)),
+            **({"validation_data": round_validation_view(artifact, geometry, settings)}
+               if controls_enabled(settings) else {}),
         ) if len(dataset) else {
             "num-examples": 0, "num-targets": 0, "train-mse-normalized": 0.,
             "train-seconds": 0., "optimizer-steps": 0,

@@ -15,6 +15,7 @@ hourly-repeat-filter = 0
 [run]
 device = "cpu"
 num-server-rounds = 3
+local-epochs = 1
 arrival-period-hours = 24
 normalization = "window"
 scaler-type = "standard"

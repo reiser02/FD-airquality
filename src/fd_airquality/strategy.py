@@ -41,10 +41,10 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
             metrics["train-objective-normalized"] = sum(
                 record["train-objective-normalized"] * record["num-targets"] for record in records
             ) / total_targets
-    for key in ("candidate-windows", "availability-excluded-windows", "idle-client"):
+    for key in ("candidate-windows", "availability-excluded-windows", "idle-client", "monitoring-excluded-windows"):
         if all(key in record for record in records):
             metrics[key] = sum(record[key] for record in records)
-    for key in ("optimizer-steps",):
+    for key in ("optimizer-steps", "epochs-completed", "early-stopped", "learning-rate-reductions"):
         if all(key in record for record in records):
             metrics[key] = sum(record[key] for record in records)
     for key in ("train-seconds", "uplink-tensor-bytes", "downlink-tensor-bytes"):

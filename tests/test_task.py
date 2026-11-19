@@ -124,7 +124,7 @@ def test_microbatch_accumulation_matches_full_batch_with_uneven_tails(
     from fd_airquality.task import train_local
 
     settings = RunSettings(model="patchtst-fm-r2", batch_size=11, local_epochs=2,
-                           learning_rate=0.01, weight_decay=0.03)
+                           learning_rate=0.01, weight_decay=0.03, early_stopping=0, lr_scheduler="none")
     configure_torch(settings, 17)
     original = LoRALinear(nn.Linear(4, 2), LoRAFactors(
         4, 2, rank=2, alpha=4, freeze_a=freeze_a, seed=19,

@@ -167,7 +167,8 @@ def test_macro_scaled_errors_weight_stations_not_origins():
 def test_local_training_is_reproducible_and_proximal_penalty_changes_updates(prepared):
     path, manifest = prepared
     _, artifact = load_client_data(str(path), 0)
-    settings = RunSettings(hidden_size=8, local_epochs=2, batch_size=16)
+    settings = RunSettings(hidden_size=8, local_epochs=2, batch_size=16,
+                           early_stopping=0, lr_scheduler="none")
     dataset = WindowDataset(artifact, "train", 6, 2)
 
     def trained(mu):

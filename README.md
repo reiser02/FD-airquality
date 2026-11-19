@@ -274,6 +274,12 @@ AdamW se reinicia por etapa/ronda.
 Igualar rondas **no iguala ejemplos utilizados, optimización ni tiempo**.
 Todos evalúan el test una vez por fold después de seleccionar exclusivamente con validación.
 
+La configuración principal añade early stopping con paciencia y
+`ReduceLROnPlateau` en las épocas locales. En federado se monitoriza una reserva
+de pasado anterior a la primera ronda, sin consultar validación futura ni omitir
+las siguientes llegadas. Consulta [muestreo, padding, folds y controles de
+entrenamiento](TRAINING_CONTROLS.md) para las reglas y opciones.
+
 Se selecciona por **MASE macro de validación**. MASE/RMSSE usan diferencias a
 24 horas. El TOML raíz elige los **28 días anteriores al corte de entrenamiento**
 para ambos splits (`error-scale-reference = "training"`).

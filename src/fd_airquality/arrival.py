@@ -11,6 +11,7 @@ import pandas as pd
 
 from fd_airquality.availability import filter_training_windows
 from fd_airquality.data import WindowDataset
+from fd_airquality.training_control import controls_enabled
 
 
 def round_cutoff(geometry: dict, settings, round_number: int) -> pd.Timestamp | None:
@@ -32,6 +33,36 @@ def round_bounds(geometry: dict, settings, round_number: int):
     return lower, cutoff
 
 
+def round_validation_bounds(geometry: dict, settings):
+    """Fixed monitoring reserve, wholly available BEFORE round one."""
+    if not controls_enabled(settings):
+        return None
+    end = round_cutoff(geometry, settings, 1)
+    if end is None:
+        return None
+    start = end - pd.Timedelta(hours=max(settings.round_validation_hours, geometry["horizon"]))
+    if geometry.get("train_start") and start < pd.Timestamp(geometry["train_start"]):
+        raise ValueError("El histórico del fold no alcanza la reserva de monitorización de la primera ronda.")
+    return start, end
+
+
+def round_validation_view(artifact: dict, geometry: dict, settings):
+    bounds = round_validation_bounds(geometry, settings)
+    if bounds is None:
+        return WindowDataset(artifact, "validation", geometry["context"], geometry["horizon"])
+    lower, cutoff = bounds
+    times = artifact["timestamps"]
+    starts = artifact.get("train_candidates", artifact["train_starts"])
+    first, last = starts + geometry["context"], starts + geometry["context"] + geometry["horizon"] - 1
+    starts = starts[(times[first] >= lower.value) & (times[last] < cutoff.value)]
+    size = int(np.searchsorted(times, cutoff.value))
+    local = artifact | {"validation_starts": starts, "values": artifact["values"][:size],
+                        "timestamps": times[:size]}
+    if not len(starts):
+        raise ValueError("Sin ventanas observadas en la reserva de monitorización anterior a la primera ronda.")
+    return WindowDataset(local, "validation", geometry["context"], geometry["horizon"])
+
+
 def normalization_artifact(artifact: dict, geometry: dict, settings) -> dict:
     """Runtime copy only. Never fit a fixed scaler with an unreleased observation."""
     result = artifact.copy()
@@ -46,10 +77,16 @@ def normalization_artifact(artifact: dict, geometry: dict, settings) -> dict:
             reference_end = str(end - pd.Timedelta(
                 hours=max(0, settings.num_server_rounds - 1) * settings.arrival_period_hours,
             ))
+            bounds = round_validation_bounds(geometry, settings)
+            if bounds is not None:
+                reference_end = str(bounds[0])
         cutoff = pd.Timestamp(reference_end)
         first_arrival = round_cutoff(geometry, settings, 1)
         if cutoff > (first_arrival or pd.Timestamp(geometry["validation_start"])):
             raise ValueError("La normalización fija utiliza datos aún no disponibles en la primera ronda.")
+        bounds = round_validation_bounds(geometry, settings)
+        if bounds is not None and cutoff > bounds[0]:
+            raise ValueError("La normalización fija invade la reserva de monitorización.")
         mask = np.isfinite(artifact["values"]) & (artifact["timestamps"] < cutoff.value)
         if geometry.get("train_start"):
             mask &= artifact["timestamps"] >= pd.Timestamp(geometry["train_start"]).value
@@ -87,6 +124,7 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
     local = artifact.copy()
     lower, cutoff = round_bounds(geometry, settings, round_number) if round_number is not None else (None, None)
     starts = artifact.get("train_candidates", artifact["train_starts"])
+    monitoring_excluded = 0
     if cutoff is not None:
         # A whole horizon must have arrived, even when its last labels are absent.
         times = artifact["timestamps"]
@@ -95,6 +133,13 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
             # Only forecast targets must be new. Their context may precede the
             # block; horizons straddling its boundary are not training samples.
             starts = starts[times[starts + geometry["context"]] >= lower.value]
+        bounds = round_validation_bounds(geometry, settings)
+        if bounds is not None:
+            first = times[starts + geometry["context"]]
+            last = times[starts + geometry["context"] + geometry["horizon"] - 1]
+            keep = (last < bounds[0].value) | (first >= bounds[1].value)
+            monitoring_excluded = int((~keep).sum())
+            starts = starts[keep]
         size = int(np.searchsorted(times, cutoff.value))
         local["values"], local["timestamps"] = artifact["values"][:size], times[:size]
     local["train_starts"] = starts
@@ -108,6 +153,8 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
     dataset.available_through = cutoff
     dataset.arrival_lower = lower
     dataset.timestamps = local["timestamps"]
+    dataset.monitoring_excluded_windows = monitoring_excluded
+    dataset.monitoring_interval = round_validation_bounds(geometry, settings) if cutoff is not None else None
     return dataset
 
 
@@ -118,6 +165,7 @@ def arrival_metrics(dataset) -> dict:
         "minimum-context-observed": dataset.availability_minima[0],
         "minimum-target-observed": dataset.availability_minima[1],
         "windows-before-cap": dataset.windows_before_cap,
+        "monitoring-excluded-windows": dataset.monitoring_excluded_windows,
     }
     if dataset.available_through is not None:
         metrics["available-through-ns"] = dataset.available_through.value

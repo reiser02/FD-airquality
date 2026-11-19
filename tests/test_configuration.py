@@ -55,6 +55,8 @@ def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert arguments(["simulate"]).batch_size == RunSettings().batch_size
     assert arguments(["prepare"]).context is None
+    assert arguments(["backtest"]).stage == "evaluation"
+    assert arguments(["backtest", "--stage", "development"]).stage == "development"
 
 
 def test_new_blocks_are_default_without_changing_fold_history(tmp_path, monkeypatch):
