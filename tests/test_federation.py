@@ -102,6 +102,9 @@ def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_pat
     assert run.info.run_id == metadata["run_id"]
     assert run.info.status == "FINISHED"
     assert run.data.params["num_clients"] == "2"
+    assert run.data.tags["candidate"] == "MLP | federado | completo | FedAvg"
+    assert run.info.run_name.startswith("MLP | federado | completo | FedAvg | PM25 | ")
+    assert "benchmark" not in run.data.tags
     assert {"test/mae", "station_000/test/mae", "station_001/test/mae"} <= run.data.metrics.keys()
     assert "run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)}
 

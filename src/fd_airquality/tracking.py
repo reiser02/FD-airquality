@@ -7,10 +7,12 @@ import logging
 import math
 import os
 import platform
+import re
 import resource
 import sys
 import time
 from dataclasses import asdict
+from datetime import UTC, datetime
 from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
@@ -23,6 +25,16 @@ from fd_airquality.models import model_metadata
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
 
+MODEL_LABELS = {
+    "mlp": "MLP", "autoencoder": "Autoencoder", "nlinear": "NLinear", "nhits": "NHITS",
+    "ttm-r3": "TTM-R3", "patchtst-fm-r2": "PatchTST-FM-R2", "flowstate-r1": "FlowState-R1",
+}
+MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "federado", "zero-shot": "zero-shot"}
+ADAPTATION_LABELS = {
+    "full": "completo", "none": "sin adaptación", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
+    "flora": "FLoRA", "lora-fair": "LoRA-FAIR",
+}
+
 
 def tracking_uri(settings: RunSettings) -> str:
     if settings.mlflow_tracking_uri:
@@ -32,6 +44,33 @@ def tracking_uri(settings: RunSettings) -> str:
         return uri
     database = Path(settings.output_dir).resolve().parent / "mlflow.db"
     return f"sqlite:///{database}"
+
+
+def benchmark_tags(output_dir: str | Path, pollutant: str) -> dict[str, str]:
+    """Find the matrix launch time from the case layout without changing its paths."""
+    case = Path(output_dir)
+    stamp = re.fullmatch(r"benchmark_([0-9]{8}_[0-9]{6})(?:_[0-9]{6})?", case.parent.parent.name)
+    if case.parent.name != "runs" or not re.fullmatch(r"case_[0-9]{4,}", case.name) or stamp is None:
+        return {}
+    try:
+        started = datetime.strptime(stamp[1], "%Y%m%d_%H%M%S")
+    except ValueError:
+        return {}
+    return {"benchmark": f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC"}
+
+
+def run_labels(settings: RunSettings, mode: str, pollutant: str, adaptation: str,
+               *, started_at: datetime | None = None) -> dict[str, str]:
+    """Use the effective method in the display name; seed and rank stay in params."""
+    parts = [MODEL_LABELS.get(settings.model, settings.model), MODE_LABELS.get(mode, mode),
+             ADAPTATION_LABELS.get(adaptation, adaptation)]
+    if mode == "federated":
+        parts.append("FedProx" if settings.strategy == "fedprox" else "FedAvg")
+    candidate = " | ".join(parts)
+    tags = benchmark_tags(settings.output_dir, pollutant)
+    started = (started_at or datetime.now(UTC)).astimezone(UTC)
+    origin = tags.get("benchmark", f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC")
+    return tags | {"candidate": candidate, "mlflow.runName": f"{candidate} | {origin}"}
 
 
 def initialize_tracking(settings: RunSettings, artifacts: Path) -> None:
@@ -156,12 +195,13 @@ class RunTracker:
             )
         else:
             experiment_id = experiment.experiment_id
+        adaptation = model_metadata(self.manifest["geometry"], self.settings).get("adaptation", "full")
         run = self.client.create_run(experiment_id, tags={
-            "mlflow.runName": f"{self.settings.model}-{self.mode}-{self.output.name}",
             "model": self.settings.model, "mode": self.mode,
             "pollutant": self.manifest["pollutant"], "protocol": self.manifest["protocol"],
             "manifest_sha256": file_digest(Path(self.settings.manifest)),
-            "adaptation": model_metadata(self.manifest["geometry"], self.settings).get("adaptation", "full"),
+            "adaptation": adaptation,
+            **run_labels(self.settings, self.mode, self.manifest["pollutant"], adaptation),
         })
         self.run_id = run.info.run_id
         try:

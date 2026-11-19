@@ -212,6 +212,8 @@ def test_gpu_slots_probe_each_visible_device_and_preserve_physical_mapping(monke
 def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, mlflow_uri):
     from mlflow import MlflowClient
 
+    from fd_airquality.tracking import benchmark_tags
+
     path, manifest = prepared
     count = len(manifest["clients"])
     monkeypatch.chdir(tmp_path)
@@ -251,4 +253,10 @@ def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared,
     runs = client.search_runs([experiment.experiment_id])
     assert len(runs) == len(rows)
     assert all(run.info.status == "FINISHED" for run in runs)
+    label = benchmark_tags(root / "runs" / "case_0001", manifest["pollutant"])["benchmark"]
+    assert {run.data.tags["benchmark"] for run in runs} == {label}
+    assert len({run.data.tags["candidate"] for run in runs}) == len(rows)
+    assert all("case_" not in run.info.run_name and run.info.run_name.endswith(label) for run in runs)
+    filtered = client.search_runs([experiment.experiment_id], filter_string=f"tags.benchmark = '{label}'")
+    assert {run.info.run_id for run in filtered} == {run.info.run_id for run in runs}
     assert all("run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)} for run in runs)

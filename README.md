@@ -463,7 +463,18 @@ uv run mlflow ui --backend-store-uri sqlite:///reports/mlflow.db --host 127.0.0.
 ```
 
 Abre `http://127.0.0.1:5000` y el experimento `fd-airquality`; selecciona las
-ejecuciones de interés para compararlas. Se registran configuración, geometría,
+ejecuciones de interés para compararlas. Los runs nuevos tienen nombres legibles y
+la etiqueta `candidate` (modelo, modo, adaptación y estrategia federada). Los
+candidatos de una matriz añaden `benchmark` (contaminante y hora de inicio UTC). Por ejemplo:
+
+```text
+tags.benchmark = 'PM25 | 2026-11-04 09:18:36 UTC' AND tags.candidate = 'PatchTST-FM-R2 | federado | LoRA-FAIR | FedAvg'
+```
+
+Usa `params.seed` y `params.lora_rank` para distinguir variantes del mismo método.
+No se renombran directorios ni se reetiquetan ejecuciones históricas.
+
+Se registran configuración, geometría,
 hash del manifest, revisión del modelo, métricas por etapa/split y estación,
 selección del checkpoint, CSV/JSON y pesos. No hay autologging ni se suben NPZ,
 series, predicciones individuales o estadísticas de normalización.
