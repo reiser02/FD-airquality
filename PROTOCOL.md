@@ -213,6 +213,9 @@ vez por batch lógico. No se recorta el contexto ni se cambia la arquitectura; e
 dropout pueden introducir diferencias numéricas. En el control local CUDA los
 modelos siguen siendo independientes, pero solo la estación activa reside en GPU;
 las restantes se conservan en CPU.
+En federado, los actores persistentes descargan el modelo a CPU al finalizar cada
+tarea y recogen los ciclos de referencias antes de liberar la caché CUDA. Se hace
+después de construir la respuesta y no modifica los pesos enviados ni las métricas.
 
 - **FedAvg:** implementación oficial de Flower. Con ventanas `masked`, pondera
   por el promedio de targets observados en las selecciones de las épocas,
@@ -235,6 +238,11 @@ Referencias de los algoritmos: arXiv:2403.12313, 2409.05976 y 2411.14961v3.
 FLoRA es el algoritmo federado, no el optimizador homónimo. FAIR sigue el objetivo
 del código oficial ICCV-2025: SGD, corrección Xavier y semilla fijada, salvo
 actualización ideal nula, que permanece nula. No necesita datos de servidor.
+FAIR refina en el dispositivo efectivo del servidor, una capa cada vez. En CUDA
+usa la primera GPU visible después de recibir las respuestas; los factores
+agregados se serializan en CPU. Conserva la ponderación por soporte, la precisión
+de los factores, el generador CPU para Xavier y el presupuesto de SGD, sin
+autocast. La trayectoria numérica puede diferir entre CPU y CUDA.
 
 Se usan rangos homogéneos para aislar el algoritmo. FLoRA aumenta el rango efectivo
 global y la descarga; no se trunca ni aplica SVD. Su historia utiliza **alpha/r

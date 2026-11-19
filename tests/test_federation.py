@@ -1,4 +1,6 @@
+import gc
 import json
+import weakref
 from dataclasses import replace
 
 import numpy as np
@@ -253,6 +255,154 @@ def test_changed_preparation_code_requires_preparation(prepared, monkeypatch, fl
         }), dst_node_id=10, message_type="evaluate")])
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize(("training", "scenario"), [
+    (True, "active"), (False, "evaluation"), (True, "idle"), (True, "clock"),
+    (True, "construction-error"), (False, "state-error"), (True, "task-error"),
+])
+def test_cuda_client_cleanup_preserves_arrival_and_validation_paths(
+    monkeypatch, caplog, device, training, scenario, flower_identity,
+):
+    from fd_airquality import client_app
+
+    manifest = {"preparation_sources": {}, "geometry": {"context": 2, "horizon": 1, "seasonality": 1,
+                                                         "max_train_windows": 3}}
+    artifact = {"mean": np.array(0.)}
+    settings = RunSettings(device=device, local_epochs=2)
+    trace = []
+    validation = object()
+    training_data = [] if scenario == "idle" else [0, 1]
+
+    class Model:
+        def to(self, destination):
+            trace.append(f"model:{destination}")
+
+    def make(*_):
+        if scenario == "construction-error":
+            raise RuntimeError("client failure")
+        return Model()
+
+    def load(*_):
+        if scenario == "state-error":
+            raise RuntimeError("client failure")
+
+    def run(model, dataset, _, resolved, *args, **kwargs):
+        model.to(resolved)
+        if training:
+            assert kwargs == {"proximal_mu": .25, "max_train_windows": 3, "validation_data": validation}
+            assert args == (settings.seed + 100_003,)
+            assert dataset is training_data and dataset
+        if scenario == "task-error":
+            raise RuntimeError("client failure")
+        return {"num-examples": len(dataset)}
+
+    monkeypatch.setattr(client_app, "load_client_data", lambda *_: (manifest, artifact))
+    monkeypatch.setattr(client_app, "source_fingerprints", dict)
+    monkeypatch.setattr(client_app, "configure_torch", lambda *_: torch.device(device))
+    monkeypatch.setattr(client_app, "make_model", make)
+    monkeypatch.setattr(client_app, "load_shared_state", load)
+    monkeypatch.setattr(client_app, "training_view", lambda *_: training_data)
+    monkeypatch.setattr(client_app, "arrival_metrics", lambda _: {"available-through-ns": 20, "available-from-ns": 10})
+    monkeypatch.setattr(client_app, "round_validation_view", lambda *_: validation)
+    monkeypatch.setattr(client_app, "WindowDataset", lambda *_: [0])
+    monkeypatch.setattr(client_app, "train_local", run)
+    monkeypatch.setattr(client_app, "evaluate_local", run)
+    monkeypatch.setattr(client_app, "shared_state", lambda _: {"weight": torch.tensor(1.)})
+    monkeypatch.setattr(gc, "collect", lambda: trace.append("collect"))
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: trace.append("empty_cache"))
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _: 0)
+
+    message = Message(content=RecordDict({
+        "arrays": ArrayRecord({"weight": torch.tensor(1.)}),
+        "config": ConfigRecord({"server-round": 1, "proximal-mu": .25, "available-through-ns": 20,
+                                "available-from-ns": 0 if scenario == "clock" else 10}),
+    }), dst_node_id=10, message_type="train" if training else "evaluate")
+    with caplog.at_level("INFO", logger="fd_airquality"):
+        if scenario.endswith("-error"):
+            with pytest.raises(RuntimeError, match="client failure"):
+                client_app._execute_task(message, settings, 0, training)
+        elif scenario == "clock":
+            with pytest.raises(ValueError, match="bloque de llegada"):
+                client_app._execute_task(message, settings, 0, training)
+        else:
+            reply = client_app._execute_task(message, settings, 0, training)
+            assert reply.content["metrics"]["partition-id"] == 0
+            assert ("arrays" in reply.content) == training
+            if training:
+                assert reply.content["metrics"]["idle-client"] == int(scenario == "idle")
+                assert reply.content["metrics"]["available-from-ns"] == 10
+                assert reply.content["arrays"].to_torch_state_dict()["weight"].device.type == "cpu"
+
+    expected = [f"model:{device}"] if scenario in {"active", "evaluation", "clock", "task-error"} else []
+    if device == "cuda":
+        if scenario != "construction-error":
+            expected.append("model:cpu")
+        expected += ["collect", "empty_cache"]
+        assert "stage=cuda-cleanup" in caplog.text
+        assert "allocated_mib=0.0 reserved_mib=0.0" in caplog.text
+    else:
+        assert "stage=cuda-cleanup" not in caplog.text
+    assert trace == expected
+
+
+def test_cuda_client_collects_cyclic_models_before_clearing_cache(monkeypatch, flower_identity):
+    from fd_airquality import client_app
+
+    references, transfers = [], []
+
+    class CyclicModel(torch.nn.Linear):
+        def __init__(self):
+            super().__init__(2, 1)
+            self.decode_func = self.forward  # PatchTST's bound-method cycle.
+
+        def to(self, device):
+            transfers.append(str(device))
+            return super().to("cpu")
+
+    def make(*_):
+        model = CyclicModel()
+        references.append(weakref.ref(model))
+        return model
+
+    def train(model, dataset, _, device, *args, **kwargs):
+        model.to(device)(torch.ones(1, 2)).sum().backward()
+        return {"num-examples": len(dataset)}
+
+    def empty_cache():
+        assert all(reference() is None for reference in references)
+
+    manifest = {"preparation_sources": {}, "geometry": {"context": 2, "horizon": 1}}
+    monkeypatch.setattr(client_app, "load_client_data", lambda *_: (manifest, {"mean": np.array(0.)}))
+    monkeypatch.setattr(client_app, "source_fingerprints", dict)
+    monkeypatch.setattr(client_app, "configure_torch", lambda *_: torch.device("cuda"))
+    monkeypatch.setattr(client_app, "make_model", make)
+    monkeypatch.setattr(client_app, "training_view", lambda *_: [0, 1])
+    monkeypatch.setattr(client_app, "arrival_metrics", lambda _: {})
+    monkeypatch.setattr(client_app, "train_local", train)
+    monkeypatch.setattr(torch.cuda, "empty_cache", empty_cache)
+    monkeypatch.setattr(torch.cuda, "memory_allocated", lambda _: 0)
+    monkeypatch.setattr(torch.cuda, "memory_reserved", lambda _: 0)
+    state = {"weight": torch.ones(1, 2), "bias": torch.zeros(1)}
+    settings = RunSettings(device="cuda", local_epochs=1)
+    automatic_collection = gc.isenabled()
+    gc.disable()
+    try:
+        for stage in range(1, 4):
+            message = Message(content=RecordDict({"arrays": ArrayRecord(state),
+                                                  "config": ConfigRecord({"server-round": stage})}),
+                              dst_node_id=10, message_type="train")
+            reply = client_app._execute_task(message, settings, 0, True)
+            assert references[-1]() is None
+            state = reply.content["arrays"].to_torch_state_dict()
+            assert all(value.device.type == "cpu" for value in state.values())
+    finally:
+        if automatic_collection:
+            gc.enable()
+        gc.collect()
+    assert transfers == ["cuda", "cpu"] * 3
+
+
 @pytest.mark.parametrize(("model", "algorithm"), [
     ("ttm-r3", "lora"), ("patchtst-fm-r2", "ffa-lora"), ("flowstate-r1", "flora"), ("ttm-r3", "lora-fair"),
 ])
@@ -282,6 +432,8 @@ def test_foundation_algorithms_complete_flower_rounds_and_checkpoint_history(
     train = pd.read_csv(output / "round_metrics.csv").query("split == 'train'")
     assert train["round"].tolist() == [1, 2]
     assert (train[["uplink-tensor-bytes", "server-aggregation-seconds"]] > 0).all().all()
+    if algorithm == "lora-fair":
+        assert train["server-aggregation-cuda"].tolist() == [0, 0]
 
 
 def test_server_discards_unusable_stations_before_any_training(selection_prepared, tmp_path, caplog, flower_grid):

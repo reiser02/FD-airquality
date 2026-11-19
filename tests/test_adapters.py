@@ -3,8 +3,9 @@ import copy
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
-from fd_airquality.adapters import LoRAFactors, LoRALinear, target_linears
+from fd_airquality.adapters import LoRAFactors, LoRALinear, layer_seed, target_linears
 from fd_airquality.federated_adapters import aggregate_adapter_updates
 from fd_airquality.models import (
     checkpoint_payload,
@@ -126,6 +127,112 @@ def test_fair_does_not_create_an_update_for_zero_client_updates():
         x["adapter.proj.lora_B"].zero_()
     state, _ = aggregate_adapter_updates(local, [1, 3], settings("lora-fair", fair_iterations=5), previous=local[0], server_round=1)
     assert torch.count_nonzero(state["adapter.proj.lora_B"]) == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_fair_preserves_cpu_objective_and_sgd_with_fractional_weights(dtype):
+    local = [{key: value.to(dtype) for key, value in state.items()} for state in updates()]
+    config = settings("lora-fair", fair_iterations=7)
+    akey, bkey = "adapter.proj.lora_A", "adapter.proj.lora_B"
+    counts = [2.5, 3.5]
+    weights = [count / sum(counts) for count in counts]
+    a = sum(weight * state[akey] for weight, state in zip(weights, local, strict=True))
+    b = sum(weight * state[bkey] for weight, state in zip(weights, local, strict=True))
+    target = sum(weight * state[bkey] @ state[akey]
+                 for weight, state in zip(weights, local, strict=True))
+    # Independent reference, using the CPU implementation before the device change.
+    generator = torch.Generator(device="cpu").manual_seed(layer_seed(config.seed + 1, akey))
+    delta = torch.empty_like(b)
+    torch.nn.init.xavier_uniform_(delta, generator=generator)
+    delta.requires_grad_(True)
+    optimizer = torch.optim.SGD([delta], lr=config.fair_learning_rate)
+
+    def objective():
+        return (1 - F.cosine_similarity(target, (b + delta) @ a, dim=0, eps=1e-8).mean()
+                + config.fair_lambda * delta.square().sum())
+
+    initial = float(objective().detach())
+    for _ in range(config.fair_iterations):
+        optimizer.zero_grad(set_to_none=True)
+        objective().backward()
+        optimizer.step()
+    final = float(objective().detach())
+
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        state, metrics = aggregate_adapter_updates(local, counts, config, previous=local[0], server_round=1)
+    torch.testing.assert_close(state[akey], a, rtol=0, atol=0)
+    torch.testing.assert_close(state[bkey], (b + delta).detach(), rtol=0, atol=0)
+    assert metrics["refinement-objective-initial"] == initial
+    assert metrics["refinement-objective-final"] == final
+    assert metrics["server-aggregation-cuda"] == 0
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@pytest.mark.parametrize("zero", [False, True])
+def test_fair_refines_on_resolved_device_and_returns_detached_cpu_state(monkeypatch, caplog, device, zero):
+    local = updates()
+    if zero:
+        for state in local:
+            state["adapter.proj.lora_B"].zero_()
+    pristine = copy.deepcopy(local)
+    moves, cache_calls, steps = [], [], []
+    original_to, original_step = torch.Tensor.to, torch.optim.SGD.step
+
+    def to(tensor, *args, **kwargs):
+        if args and isinstance(args[0], torch.device) and args[0].type == "cuda":
+            moves.append(tuple(tensor.shape))
+            args = (torch.device("cpu"), *args[1:])
+        return original_to(tensor, *args, **kwargs)
+
+    def step(optimizer, *args, **kwargs):
+        steps.append(True)
+        return original_step(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    monkeypatch.setattr(torch.optim.SGD, "step", step)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: cache_calls.append(True))
+    config = settings("lora-fair", device=device, fair_iterations=7)
+    with caplog.at_level("INFO", logger="fd_airquality"):
+        state, metrics = aggregate_adapter_updates(local, [2.5, 3.5], config, previous=local[0], server_round=2)
+
+    assert all(value.device.type == "cpu" and not value.requires_grad for value in state.values())
+    assert metrics["server-aggregation-cuda"] == int(device == "cuda")
+    assert len(steps) == (0 if zero else config.fair_iterations)
+    assert cache_calls == ([True] if device == "cuda" else [])
+    # Mean A/B and two clients' factors move before forming dense products.
+    assert moves == ([(2, 3), (4, 2), (4, 2), (2, 3), (4, 2), (2, 3)] if device == "cuda" else [])
+    for original, untouched in zip(pristine, local, strict=True):
+        torch.testing.assert_close(original, untouched, rtol=0, atol=0)
+    assert "stage=aggregation" in caplog.text and f"algorithm=lora-fair device={device}" in caplog.text
+    assert "layers=0/1" in caplog.text and "layers=1/1" in caplog.text
+
+
+def test_fair_releases_cuda_cache_on_failure_without_cpu_retry(monkeypatch):
+    calls = []
+
+    def fail(*args):
+        calls.append(args[-1].type)
+        raise RuntimeError("simulated CUDA failure")
+
+    monkeypatch.setattr("fd_airquality.federated_adapters._fair_layer", fail)
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("cleanup"))
+    local = updates()
+    with pytest.raises(RuntimeError, match="simulated CUDA failure"):
+        aggregate_adapter_updates(local, [1, 3], settings("lora-fair", device="cuda"),
+                                  previous=local[0], server_round=1)
+    assert calls == ["cuda", "cleanup"]
+
+
+@pytest.mark.parametrize("algorithm", ["lora", "ffa-lora", "flora"])
+def test_other_aggregations_stay_on_cpu_with_cuda_training(monkeypatch, algorithm):
+    local = updates()
+    if algorithm == "ffa-lora":
+        local = [{key: value for key, value in state.items() if key.endswith("lora_B")} for state in local]
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: pytest.fail("Only FAIR uses CUDA aggregation"))
+    state, metrics = aggregate_adapter_updates(local, [1, 3], settings(algorithm, device="cuda"),
+                                              previous=local[0], server_round=1)
+    assert all(value.device.type == "cpu" for value in state.values())
+    assert "server-aggregation-cuda" not in metrics
 
 
 @pytest.mark.parametrize("kind", ["count", "nonfinite", "shape", "keys"])

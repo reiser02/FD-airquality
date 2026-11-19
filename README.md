@@ -242,6 +242,10 @@ arquitectura; puede haber pequeñas diferencias por el orden de suma o por dropo
 Los logs y las métricas registran batch efectivo, microbatch y pasos del optimizador.
 En modo local CUDA solo el modelo de la estación activa permanece en GPU; los
 demás conservan sus estados independientes en CPU, también durante evaluación.
+En federado, al acabar cada tarea de entrenamiento o evaluación, el actor de
+Flower descarga el modelo a CPU, recoge los ciclos de referencias (como el de
+PatchTST) y vacía la caché CUDA. Así no se acumulan modelos en VRAM entre rondas.
+El evento `stage=cuda-cleanup` registra los MiB asignados y reservados tras la limpieza.
 
 Puedes limitar la matriz, sin cambiar el soporte temporal:
 
@@ -355,6 +359,13 @@ Valores iniciales: `--lora-rank 4 --lora-alpha 8 --lora-dropout 0`.
 Un rango excesivo falla, no se recorta. FAIR añade refinamiento de servidor:
 `--fair-iterations 1000 --fair-learning-rate 0.01 --fair-lambda 1`.
 Reducir iteraciones para un smoke cambia el presupuesto, no es un benchmark completo.
+Con `--device cuda`, FAIR refina en la primera GPU visible del servidor una capa
+cada vez, después de recibir las actualizaciones de los clientes. Los factores y
+checkpoints vuelven a CPU. Se mantienen los pesos por soporte, la precisión de
+los factores sin autocast, Xavier con semilla de CPU y el mismo objetivo y SGD.
+Con `--device cpu` el refinamiento sigue en CPU. `stage=aggregation` muestra el
+progreso y `server-aggregation-cuda` indica el dispositivo usado. El cambio de
+dispositivo puede introducir diferencias de redondeo; no se promete igualdad bit a bit.
 
 Pruebas con los checkpoints reales, incluidos gradientes y restauración:
 

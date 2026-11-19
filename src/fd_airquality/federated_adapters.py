@@ -16,6 +16,7 @@ import torch
 from torch.nn import functional as F
 
 from fd_airquality.adapters import layer_seed
+from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 
 
@@ -56,10 +57,11 @@ def _validate(updates, counts, previous, algorithm):
 def _fair_b(a, b, target, settings, seed):
     if not torch.count_nonzero(target):
         return b.clone(), 0.0, 0.0
+    # Seed Xavier on CPU on either device, without advancing the global RNG.
     generator = torch.Generator(device="cpu").manual_seed(seed)
     delta = torch.empty_like(b, device="cpu")
     torch.nn.init.xavier_uniform_(delta, generator=generator)
-    delta.requires_grad_(True)
+    delta = delta.to(b.device).requires_grad_(True)
     optimizer = torch.optim.SGD([delta], lr=settings.fair_learning_rate)
 
     def objective():
@@ -78,6 +80,44 @@ def _fair_b(a, b, target, settings, seed):
     if not torch.isfinite(delta).all():
         raise ValueError("Refinamiento LoRA-FAIR produjo pesos no finitos.")
     return (b + delta).detach(), initial, final
+
+
+def _fair_layer(a, b, updates, weights, key, settings, seed, device):
+    """Keep only this layer's dense target and refinement intermediates on device."""
+    a, b = a.to(device), b.to(device)
+    bkey = key.removesuffix("lora_A") + "lora_B"
+    target = sum(weight * state[bkey].to(device) @ state[key].to(device)
+                 for weight, state in zip(weights, updates, strict=True))
+    refined, initial, final = _fair_b(a, b, target, settings, seed)
+    return refined.cpu(), initial, final
+
+
+def _aggregate_fair(updates, weights, averaged, settings, server_round):
+    # The server has already resolved the device and received the client replies.
+    device = torch.device(settings.device)
+    keys = [key for key in sorted(averaged) if key.endswith("lora_A")]
+    detail = (f"round={server_round} algorithm=lora-fair device={device} "
+              f"iterations={settings.fair_iterations}")
+    report_progress("aggregation", f"{detail} layers=0/{len(keys)}")
+    initial = final = 0.0
+    try:
+        with torch.autocast(device_type=device.type, enabled=False):
+            for index, key in enumerate(keys, start=1):
+                started = time.perf_counter()
+                bkey = key.removesuffix("lora_A") + "lora_B"
+                averaged[bkey], before, after = _fair_layer(
+                    averaged[key], averaged[bkey], updates, weights, key, settings,
+                    layer_seed(settings.seed + server_round, key), device,
+                )
+                initial += before
+                final += after
+                report_progress("aggregation", f"{detail} layers={index}/{len(keys)} layer={key} "
+                                f"seconds={time.perf_counter() - started:.3f} objective={after:.6g}")
+    finally:
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+    return {"refinement-objective-initial": initial, "refinement-objective-final": final,
+            "server-aggregation-cuda": int(device.type == "cuda")}
 
 
 def aggregate_adapter_updates(updates: list[dict], counts: list[int | float], settings: RunSettings,
@@ -113,17 +153,7 @@ def aggregate_adapter_updates(updates: list[dict], counts: list[int | float], se
             averaged[bkey] = torch.zeros_like(averaged[bkey])
         averaged.update(history)
     elif algorithm == "lora-fair":
-        initial = final = 0.0
-        for key in sorted(averaged):
-            if not key.endswith("lora_A"):
-                continue
-            bkey = key.removesuffix("lora_A") + "lora_B"
-            target = sum(weight * state[bkey] @ state[key] for weight, state in zip(weights, updates, strict=True))
-            averaged[bkey], before, after = _fair_b(averaged[key], averaged[bkey], target, settings,
-                                                  layer_seed(settings.seed + server_round, key))
-            initial += before
-            final += after
-        diagnostics.update({"refinement-objective-initial": initial, "refinement-objective-final": final})
+        diagnostics.update(_aggregate_fair(updates, weights, averaged, settings, server_round))
     diagnostics["server-aggregation-seconds"] = time.perf_counter() - started
     diagnostics["global-state-tensor-bytes"] = tensor_bytes(averaged)
     return averaged, diagnostics
