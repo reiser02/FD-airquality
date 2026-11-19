@@ -63,11 +63,17 @@ def _execute_task(message, settings, partition, training):
         metrics = train_local(
             model, dataset, settings, device, seed,
             proximal_mu=float(message.content["config"].get("proximal-mu", 0.0)),
+            max_train_windows=geometry.get("max_train_windows"),
             **({"validation_data": round_validation_view(artifact, geometry, settings)}
                if controls_enabled(settings) else {}),
         ) if len(dataset) else {
             "num-examples": 0, "num-targets": 0, "train-mse-normalized": 0.,
             "train-seconds": 0., "optimizer-steps": 0,
+            "admissible-windows": 0, "unique-training-windows": 0,
+            "selected-target-occurrences": 0, "padded-context-slots": 0, "padded-target-slots": 0,
+            "epochs-completed": 0, "early-stopped": 0, "learning-rate-reductions": 0,
+            "sampled-window-occurrences": 0, "sampled-target-occurrences": 0,
+            "replacement-window-occurrences": 0,
         }
         metrics.update(arrival_metrics(dataset), **{"idle-client": int(not len(dataset))})
         if message.content["config"].get("available-through-ns") != metrics.get("available-through-ns"):

@@ -51,6 +51,15 @@ def test_explicit_toml_is_valid_without_requiring_builtin_defaults(tmp_path):
         assert (settings.seed, settings.batch_size) == (17, 16)
 
 
+@pytest.mark.parametrize("command", ["prepare", "prepare-backtest"])
+def test_window_padding_can_be_enabled_or_disabled_by_toml_and_cli(tmp_path, command):
+    path = tmp_path / "padding.toml"
+    path.write_text('[prepare]\nwindow-policy = "masked"\nwindow-padding = "both"\n')
+    assert arguments([command, "--config", str(path)]).window_padding == "both"
+    for mode in ("none", "right"):
+        assert arguments([command, "--config", str(path), "--window-padding", mode]).window_padding == mode
+
+
 def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert arguments(["simulate"]).batch_size == RunSettings().batch_size

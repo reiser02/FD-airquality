@@ -54,12 +54,13 @@ def test_all_earlier_eligible_blocks_are_reused(fragmented_series, geometry):
     assert 67 in split["train_starts"]
 
 
-def test_capped_training_windows_are_deterministic(fragmented_series, geometry):
-    capped = replace(geometry, max_train_windows=5)
-    one = split_station(fragmented_series, capped)
-    two = split_station(fragmented_series, capped)
-    assert len(one["train_starts"]) == 5
-    np.testing.assert_array_equal(one["train_starts"], two["train_starts"])
+def test_epoch_budget_does_not_truncate_the_prepared_window_pool(fragmented_series, geometry):
+    geometry = replace(geometry, min_train_windows=5)
+    pool = split_station(fragmented_series, geometry)
+    with_budget = split_station(fragmented_series, replace(geometry, max_train_windows=2))
+    assert len(pool["train_starts"]) >= 5
+    for split in ("train", "validation", "test"):
+        np.testing.assert_array_equal(pool[f"{split}_starts"], with_budget[f"{split}_starts"])
 
 
 def test_preparation_keeps_data_local_and_reports_excluded_stations(prepared):
@@ -112,7 +113,7 @@ def test_dataset_rejects_nan_and_missing_hours(missing_timestamp):
 
 @pytest.mark.parametrize("kwargs", [
     {"context": 0}, {"stride": 13}, {"split_mode": "station", "validation_hours": 13},
-    {"max_train_windows": 0}, {"min_train_windows": 5, "max_train_windows": 3},
+    {"max_train_windows": 0}, {"max_train_windows": True}, {"max_train_windows": -1},
     {"context": 1.5}, {"context": True},
 ])
 def test_invalid_geometry_fails_closed(kwargs):

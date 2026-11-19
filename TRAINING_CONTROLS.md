@@ -12,12 +12,59 @@ muestrea sin reemplazo para ese paso; `None` conserva todas las admisibles. Una
 misma ventana puede volver a aparecer en pasos posteriores.
 
 Aquí no se utiliza esa ruta de muestreo: el protocolo externo decide las ventanas.
-`DataLoader(shuffle=True)` hace una permutación **sin reemplazo por época** y
-conserva el último minibatch incompleto. Varias épocas vuelven a visitar el mismo
-conjunto; eso no es muestreo con reemplazo dentro de una época. Las ventanas pueden
-solaparse y contener la misma hora: tampoco equivale a repetir una ventana.
-`max-train-windows`, cuando se activa, limita determinísticamente el conjunto de
-la ronda después de los cortes y filtros; no duplica ventanas para llenar lotes.
+`max-train-windows` es un **presupuesto por estación y época**, no un subconjunto
+fijo por ronda. La preparación conserva todas las ventanas. Si el presupuesto
+es 1000 y hay 10 000 ventanas admisibles en una estación, cada época sortea
+1000 de las 10 000, sin reemplazo. Dos épocas pueden coincidir en parte; no se
+obliga a agotar el conjunto antes de volver a sortear. Si se omite el presupuesto,
+cada época visita todas las ventanas admisibles. `min-train-windows` controla
+la elegibilidad de una estación y puede ser mayor que la cuota de cada época.
+
+En federado se sortea solo del bloque autorizado de la ronda; en local, del
+entrenamiento autorizado del fold. En centralizado se aplica la cuota por estación
+y luego se mezclan las selecciones en los lotes. El orden de operaciones es:
+
+1. Corte de llegada y exclusión de la reserva de monitorización.
+2. Mínimos de observaciones y umbrales de disponibilidad del modelo.
+3. Sorteo sin reemplazo de hasta `max-train-windows` distintas por estación.
+4. Formación de batches (`batch-size`), completando el último lote corto con
+   reemplazo **solo** de lo sorteado en esa época.
+
+Por ejemplo, con 11 ventanas sorteadas y `batch-size=8`, hay dos lotes de
+ocho: 11 originales y 5 repeticiones. Los microbatches físicos pueden ser menores.
+Validación y test no repiten ventanas ni cambian sus lotes. Un conjunto vacío no
+fabrica muestras: una ronda federada queda inactiva; un ajuste completo sin
+ventanas falla. El sorteo y el reemplazo son reproducibles con la semilla.
+
+El parámetro sigue en `[prepare]` o `--max-train-windows` en `prepare` y
+`prepare-backtest`. Queda registrado en el manifest y solo se aplica al entrenar.
+Para usar esta revisión con datos ya preparados, genera un manifest nuevo.
+
+```toml
+[prepare]
+max-train-windows = 1000
+
+[run]
+batch-size = 100
+```
+
+Con al menos 1000 ventanas admisibles, cada estación local o federada hace diez
+actualizaciones por época; la selección se renueva sin aumentar ese presupuesto.
+
+Las ventanas solapadas pueden supervisar la misma hora en distintos horizontes:
+eso no es una repetición del sampler. Los CSV de entrenamiento distinguen:
+
+- `admissible-windows`: conjunto completo tras cortes y filtros.
+- `num-examples`: ventanas distintas sorteadas **por época**.
+- `unique-training-windows`: distintas visitadas entre todas las épocas del ajuste.
+- `selected-target-occurrences`: targets observados de las selecciones, sumados
+  entre épocas y sin relleno. `num-targets` divide esa suma por las épocas
+  realizadas: puede ser fraccionario y es el peso federado con ventanas `masked`.
+  En formato estricto, ponderar por ventanas es equivalente porque los horizontes
+  son completos y de la misma longitud.
+- `sampled-window-occurrences`, `sampled-target-occurrences` y
+  `replacement-window-occurrences`: trabajo realizado y repeticiones por lote
+  corto, que **no** aumentan el peso de agregación.
 
 **Padding** añade posiciones artificiales para completar una ventana. En la ruta
 de entrenamiento de la versión examinada, NeuralForecast añade `H` posiciones a
@@ -27,16 +74,56 @@ Esto puede permitir ventanas tempranas sin suficiente historia real o targets
 parcialmente disponibles. No garantiza que los placeholders sean invisibles para
 la arquitectura ni que el resultado sea mejor.
 
-Nuestro protocolo exige las `L+H` posiciones reales de calendario: **90 horas de
-contexto y 12 de horizonte** en el experimento principal. No inventa horas antes
-del inicio o después del final de la serie. Las ausencias *dentro* de esas
-posiciones se conservan mediante máscaras. Rehacer la rejilla horaria, rellenar
-un contexto con información autorizada y añadir padding fuera del historial son
-operaciones diferentes.
+El padding externo del protocolo se configura al **preparar**:
 
-**No se han añadido ni muestreo con reemplazo ni padding de ventanas.** Esta
-decisión no sustituye las pérdidas, normalizadores ni modelos de NeuralForecast:
-seguimos llamando al paquete instalado mediante el puente externo.
+```toml
+[prepare]
+window-policy = "masked"
+window-padding = "both"  # none | right | both
+```
+
+- **`none`** lo desactiva: exige las `L+H` posiciones reales y un horizonte
+  completo dentro del intervalo autorizado, como antes.
+- **`right`** permite horizontes parcialmente disponibles al final del
+  entrenamiento o del bloque de la ronda. Sus posiciones posteriores se
+  representan como NaN, incluso si el NPZ original contiene observaciones futuras.
+- **`both`** añade lo anterior y hasta `L-1` posiciones virtuales de contexto a
+  la izquierda del inicio de la serie. Se conserva la rejilla de orígenes de
+  `train-stride`; no se desplazan las ventanas completas existentes.
+
+Siempre se requiere al menos una observación real en contexto y otra en targets;
+los mínimos configurados y umbrales por modelo pueden exigir más. El padding
+cuenta como **ausencia**, nunca como cero observado. Un umbral `[1.0, 1.0]`
+descarta todas las ventanas con padding. `missing-policy="strict"` tampoco
+acepta contextos incompletos: configura umbrales completos o desactiva padding.
+
+El TOML principal activa `both`; sin esa opción, el valor interno es `none`.
+También se puede desactivar desde CLI:
+
+```bash
+uv run --frozen fd-airquality prepare --window-padding none
+uv run --frozen fd-airquality prepare-backtest --window-padding none
+```
+
+Cambiar la política requiere **preparar de nuevo** y usar el nuevo manifest.
+Las preparaciones con padding usan esquema 6 y registran política y extremo de
+targets autorizado; los arrays originales de valores, timestamps y calidad no
+se alteran. Las preparaciones de esquemas anteriores no se reinterpretan con padding.
+
+El padding es **solo de entrenamiento**. Validación, test, sus máscaras y sus firmas
+de evaluación no cambian. En federado no se supervisan targets anteriores al
+bloque, posteriores al corte ni de la reserva de monitorización. La primera ronda
+puede completar un horizonte con posiciones enmascaradas antes de esa reserva;
+las siguientes hacen lo mismo en el extremo derecho de su bloque.
+
+`padded-context-slots` y `padded-target-slots` cuentan posiciones virtuales en
+las ventanas distintas visitadas, una sola vez aunque se repitan en otras épocas
+o al completar un lote. No se confunden con las
+ausencias originales. Rehacer la rejilla horaria, imputar un contexto autorizado
+y añadir padding fuera del historial siguen siendo operaciones diferentes.
+Los modelos, pérdidas y normalizadores de NeuralForecast continúan llamándose
+desde el paquete instalado; no se copian. Ninguna máscara permite ignorar una
+predicción no finita: se sigue rechazando.
 
 ## Folds: evaluación normal, búsqueda solo si se solicita
 
@@ -162,18 +249,74 @@ reinician entre folds.
 
 `station_metrics.csv`, `round_metrics.csv` y los logs registran épocas realizadas,
 paradas, mejor época, LR inicial/final, reducciones y MAE de monitorización.
-`num-targets` usado para agregar clientes cuenta el soporte de una pasada, no se
-multiplica por el número variable de épocas que cada cliente haya realizado.
+`num-targets` usado para agregar clientes mide el soporte medio por época; un
+cliente no gana peso por ejecutar más épocas o completar un lote corto.
 
-## Evidencia y reproducción
+## Verificación del presupuesto por época
 
-La suite de este worktree pasa **559 pruebas, cero omisiones**, con checkpoints
-reales habilitados: `reports/training_controls_tests.xml`. Se prueban la media
+En la revisión que introdujo esta cuota, **689 pruebas aprobadas, sin
+omisiones**, incluidos los checkpoints reales.
+La integración completó **48 ejecuciones acotadas en CPU** en los modos local,
+centralizado y federado, con Flower/Ray en las federaciones. Se reprodujeron los
+sorteos con sus semillas y se verificaron el soporte observado, los límites de
+cada ronda y la exclusión de la reserva de monitorización.
+
+Con una cuota de 13 y lotes de 8, la primera ronda seleccionó 13 ventanas por
+estación en cada época y visitó **25–26 distintas en dos épocas**. Los dos lotes
+por época se completaron con tres repeticiones, sin contarlas para agregar. Las
+firmas y las máscaras de evaluación siguieron siendo las mismas.
+Informe: `reports/epoch_window_sampling_validation.json`.
+
+## Evidencia anterior: primer muestreo con reemplazo y padding
+
+Antes del presupuesto por época, la revisión pasó **674 pruebas, sin omisiones**,
+con los checkpoints reales habilitados: `reports/window_sampling_padding_tests.xml`.
+Esa suite incluía:
+
+- Batches exactos y cortos, conjunto vacío, semillas y varias épocas.
+- Reemplazo sin inflar el soporte federado ni el límite de ventanas distintas.
+- Los tres modos de padding, ceros observados, ausencias originales, horizontes
+  parciales y validación/test sin padding ni reemplazo.
+- Exclusión de targets futuros y de monitorización, bloques disjuntos,
+  umbrales completos, protección de la reconstrucción e integridad del esquema 6.
+- Gradientes equivalentes con microbatches y checkpoints reales Granite con
+  contextos casi vacíos, targets parciales y batches completados.
+
+Ruff y `git diff --check` también pasan. Estas comprobaciones de mecanismos no
+demuestran superioridad predictiva ni certifican CUDA.
+
+En esa revisión se completaron además **48 casos reales acotados en CPU** con preparaciones
+nuevas: cuatro modelos clásicos × tres modos × dos folds × dos políticas
+(`both` y `none`). Son dieciséis ejecuciones federadas con Flower/Ray real,
+auditadas con SuperLink aislado y hashes de código/versiones comprobados.
+
+Con padding, los tres bloques por estación usaron `[16, 4, 4]` ventanas; sin padding,
+`[16, 2, 2]`. Tras dos épocas, las repeticiones son respectivamente `[0, 8, 8]`
+y `[0, 12, 12]`, sin inflar el soporte observado de agregación. El límite de
+dieciséis ventanas era aún fijo por ronda. El ajuste conservó las tres llegadas
+y el control de épocas termina en dos con dos reducciones de LR.
+
+Las firmas de evaluación y máscaras coinciden entre preparaciones: los folds
+tienen respectivamente **2251 y 2648 targets de test observados**, sin padding de
+evaluación. La auditoría reconstruye los targets realmente autorizados, comprueba
+que no invaden el futuro ni la reserva y que los bloques no comparten etiquetas.
+`right` está probado en la suite, no en una tercera matriz CLI independiente.
+
+Informe de esa revisión: `reports/window_sampling_padding_final_validation.json`.
+Auditorías: `reports/training_controls_validation/20261118_223641/validation.json`
+(`both`) y `reports/training_controls_validation/20261118_223849/validation.json`
+(`none`). El patch `reports/training_controls_fork.patch` es histórico.
+
+## Evidencia anterior y reproducción
+
+Antes de añadir padding y completado de batches, la revisión pasó **559 pruebas,
+cero omisiones**, con checkpoints reales habilitados:
+`reports/training_controls_tests.xml`. Se probaron la media
 simple frente a la agrupada, evaluación sin búsqueda, selección optativa, paciencia,
 scheduler, restauración de pesos, máscaras, escalas por estación, reserva causal
 y protección de la reconstrucción auxiliar.
 
-Se completaron **24 casos reales acotados en CPU**: cuatro modelos clásicos
+En esa revisión se completaron **24 casos reales acotados en CPU**: cuatro modelos clásicos
 por tres modos por dos folds. Flower/Ray es real en las ocho federaciones.
 Con un máximo de ocho épocas y una mejora mínima deliberadamente enorme para
 forzar meseta, cada ajuste termina en dos épocas y reduce el LR dos veces.
@@ -184,7 +327,9 @@ sin `selection.json`.
 ```bash
 FD_AIRQUALITY_REAL_MODELS=1 uv run --frozen pytest -q --tb=short
 uv run --frozen python experiments/validate_training_controls.py \
-  --raw-root <directorio_de_CSV_originales>
+  --raw-root <directorio_de_CSV_originales> --window-padding both
+uv run --frozen python experiments/validate_training_controls.py \
+  --raw-root <directorio_de_CSV_originales> --window-padding none
 ```
 
 El verificador arranca y cierra **su propio SuperLink en un puerto libre**, con
@@ -193,8 +338,8 @@ y versiones de Torch, NeuralForecast, Flower y Ray contra el entorno congelado.
 Esto evita reutilizar un servicio `:local:` arrancado desde otro worktree con
 módulos antiguos; no detiene ese servicio ajeno.
 
-Informe: `reports/training_controls_final_validation.json`.
-Auditoría: `reports/training_controls_validation/20261117_224747/validation.json`.
+Informe de la revisión anterior: `reports/training_controls_final_validation.json`.
+Auditoría anterior: `reports/training_controls_validation/20261117_224747/validation.json`.
 La primera tentativa, conservada bajo `20261117_224306`, detectó precisamente
 esa reutilización de un runtime antiguo y no se considera evidencia aprobada.
 La meseta forzada prueba mecanismos, no precisión ni superioridad predictiva.

@@ -16,7 +16,7 @@ def global_window_starts(
 
     Histories may overlap earlier splits; targets may not straddle a boundary.
     Evaluation origins use a global grid, not the beginning of each observed run.
-    The train mask counts unique observations before any optional window cap.
+    The train mask counts unique observations independently of epoch sampling.
     """
     index = series.index
     width = context + horizon
@@ -64,8 +64,10 @@ def masked_window_starts(series: pd.Series, *, context: int, horizon: int,
                          validation_start: str, test_start: str, test_end: str,
                          train_stride: int = 1, stride: int = 6,
                          min_context_observed: int = 1, min_target_observed: int = 1,
-                         train_start: str = "") -> dict[str, np.ndarray]:
-    """Keep the calendar and incomplete windows; model adapters handle histories."""
+                         train_start: str = "", window_padding: str = "none") -> dict[str, np.ndarray]:
+    """Keep calendar positions; padding affects training origins only."""
+    if window_padding not in {"none", "right", "both"}:
+        raise ValueError("window_padding debe ser none, right o both.")
     index = series.index
     width = context + horizon
     starts = np.arange(max(0, len(series) - width + 1), dtype=np.int64)
@@ -80,6 +82,25 @@ def masked_window_starts(series: pd.Series, *, context: int, horizon: int,
     if train_start:
         train &= first >= pd.Timestamp(train_start)
     result = {"train_starts": starts[train]}
+    if window_padding != "none":
+        end = int(index.searchsorted(pd.Timestamp(validation_start)))
+        # Keep the existing training-origin grid when adding virtual history.
+        left = ((1 - context + train_stride - 1) // train_stride) * train_stride if window_padding == "both" else 0
+        padded = np.arange(left, end - context + 1, train_stride, dtype=np.int64)
+        first_target = padded + context
+        valid = (first_target >= 1) & (first_target < min(end, len(series)))
+        padded = padded[valid]
+        observed_context, observed_targets = window_observation_counts(
+            series.to_numpy(), padded, context, horizon, end,
+        )
+        keep = (observed_context >= min_context_observed) & (observed_targets >= min_target_observed)
+        if train_start:
+            keep &= index[padded + context] >= pd.Timestamp(train_start)
+        # Check only real calendar positions; the rest is explicitly absent.
+        real_first = np.maximum(padded, 0)
+        real_last = np.minimum(padded + width - 1, min(end, len(series)) - 1)
+        keep &= breaks[real_last] == breaks[real_first]
+        result["train_starts"] = padded[keep]
     for name, lower, upper in (("validation", validation_start, test_start), ("test", test_start, test_end)):
         offset = (first.asi8 - pd.Timestamp(lower).value) // pd.Timedelta(hours=1).value
         result[f"{name}_starts"] = starts[usable & (first >= pd.Timestamp(lower))
@@ -88,6 +109,16 @@ def masked_window_starts(series: pd.Series, *, context: int, horizon: int,
     if train_start:
         train_mask &= index >= pd.Timestamp(train_start)
     return result | {"train_mask": np.asarray(train_mask)}
+
+
+def window_observation_counts(values, starts, context: int, horizon: int, target_end: int | None = None):
+    """Count original observations with virtual positions contributing zero."""
+    end = len(values) if target_end is None else min(max(0, target_end), len(values))
+    counts = np.r_[0, np.cumsum(np.isfinite(values))]
+    left = np.clip(starts, 0, end)
+    middle = np.clip(starts + context, 0, end)
+    right = np.clip(starts + context + horizon, 0, end)
+    return counts[middle] - counts[left], counts[right] - counts[middle]
 
 
 def select_holdout_window(

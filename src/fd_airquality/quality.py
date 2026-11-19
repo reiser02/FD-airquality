@@ -51,16 +51,18 @@ def coverage_rows(series: pd.Series, config, candidates: dict, station: str) -> 
         available = series.reindex(calendar)
         starts = candidates[f"{name}_starts"]
         hour_coverage = np.zeros(len(series) + 1, dtype=np.int64)
-        np.add.at(hour_coverage, starts + config.context, 1)
-        np.add.at(hour_coverage, starts + config.context + config.horizon, -1)
+        target_end = min(len(series), int(series.index.searchsorted(hi)))
+        np.add.at(hour_coverage, np.clip(starts + config.context, 0, target_end), 1)
+        np.add.at(hour_coverage, np.clip(starts + config.context + config.horizon, 0, target_end), -1)
         targets = (np.cumsum(hour_coverage[:-1]) > 0) & np.isfinite(series.to_numpy())
         scheduled = max(0, (len(calendar) - config.horizon) // config.stride + 1) if name != "train" else None
         rows.append({"station": station, "split": name, "calendar_hours": len(calendar),
                      "observed_hours": int(available.notna().sum()),
                      "observed_target_hours_used": int(targets.sum()), "windows": len(starts),
-                     "window_count_stage": "before_optional_training_cap",
-                     "windows_after_cap": (min(len(starts), config.max_train_windows)
-                                           if name == "train" and config.max_train_windows else len(starts)),
+                     "window_count_stage": "before_runtime_training_sampling" if name == "train" else "evaluation",
+                     "epoch_window_budget_upper_bound": ((min(len(starts), config.max_train_windows)
+                                                          if config.max_train_windows is not None else len(starts))
+                                                         if name == "train" else None),
                      "scheduled_origins": scheduled,
                      "origin_coverage": len(starts) / scheduled if scheduled else None})
     return rows

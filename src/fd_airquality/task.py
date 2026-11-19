@@ -14,6 +14,7 @@ import torch
 from torch import nn
 from torch.utils.data import ConcatDataset, DataLoader, Dataset
 
+from fd_airquality.batching import CompleteBatchSampler, training_padding_counts
 from fd_airquality.data import WindowDataset
 from fd_airquality.metrics import compute_mase, compute_rmsse
 from fd_airquality.missing import (
@@ -78,6 +79,7 @@ def train_local(
     seed: int,
     proximal_mu: float = 0.0,
     *,
+    max_train_windows: int | None = None,
     validation_data: Dataset | None = None,
 ) -> dict[str, float | int]:
     started = time.perf_counter()
@@ -93,10 +95,14 @@ def train_local(
     loader_dataset = (ContextSupervisionDataset(dataset)
                       if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight
                       and getattr(dataset, "monitoring_interval", None) is not None else dataset)
-    loader = DataLoader(
-        loader_dataset, batch_size=settings.batch_size, shuffle=True, num_workers=0,
-        generator=torch.Generator().manual_seed(seed),
+    group_sizes = [len(child) for child in dataset.datasets] if isinstance(dataset, ConcatDataset) else None
+    sampler = CompleteBatchSampler(
+        len(dataset), settings.batch_size, torch.Generator().manual_seed(seed),
+        max_windows=max_train_windows, group_sizes=group_sizes,
     )
+    loader = DataLoader(loader_dataset, batch_sampler=sampler, num_workers=0,
+                        generator=torch.Generator().manual_seed(seed))
+    visited = np.zeros(len(dataset), dtype=bool) if sampler.epoch_size < len(dataset) else None
     # Local optimizer state is deliberately reset at each communication round.
     optimizer = torch.optim.AdamW(
         parameters, lr=settings.learning_rate, weight_decay=settings.weight_decay
@@ -109,6 +115,7 @@ def train_local(
         control.observe(0, training_validation_mae(model, validation_data, settings, device))
     microbatch_size = _microbatch_size(settings, device)
     optimizer_steps = 0
+    window_occurrences = selected_targets = 0
     total_squared_error, total_objective, targets = 0.0, 0.0, 0
     for epoch in range(1, settings.local_epochs + 1):
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches=0/{len(loader)} device={device} "
@@ -116,8 +123,13 @@ def train_local(
         last_report = time.monotonic()
         for batch, values in enumerate(loader, start=1):
             inputs, actual = values[:2]
+            window_occurrences += len(inputs)
             context_allowed = values[2] if len(values) == 3 else torch.ones_like(inputs, dtype=torch.bool)
-            observed_targets = int(torch.isfinite(actual).sum())
+            observed = torch.isfinite(actual)
+            observed_targets = int(observed.sum())
+            # Only the suffix of the final batch can contain replacement draws.
+            remaining = sampler.epoch_size - (batch - 1) * settings.batch_size
+            selected_targets += observed_targets if remaining >= len(actual) else int(observed[:remaining].sum())
             if not observed_targets:
                 continue
             optimizer.zero_grad(set_to_none=True)
@@ -151,8 +163,8 @@ def train_local(
                     raise ValueError("Pérdida local no finita; se aborta para no contaminar los pesos globales.")
                 if not loss.requires_grad:
                     raise RuntimeError("El modelo cortó autograd: los adaptadores no reciben gradientes.")
-                # Weight by targets, including uneven microbatches and the final
-                # partial logical batch. Backward releases each activation graph.
+                # Weight by observed targets, including uneven microbatches.
+                # Backward releases each activation graph.
                 loss.backward()
                 total_squared_error += float(squared.detach())
                 targets += int(mask.sum())
@@ -174,6 +186,8 @@ def train_local(
             if time.monotonic() - last_report >= settings.heartbeat_seconds:
                 report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={batch}/{len(loader)}")
                 last_report = time.monotonic()
+        if visited is not None:
+            visited[sampler.selected_indices.numpy()] = True
         if not targets:
             raise ValueError("No hay targets de entrenamiento observados; no se puede optimizar.")
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={len(loader)}/{len(loader)} "
@@ -191,14 +205,23 @@ def train_local(
         control.restore()
     if any(not torch.isfinite(value).all() for value in shared_state(model).values()):
         raise ValueError("El entrenamiento produjo pesos no finitos.")
+    padded_context, padded_targets = training_padding_counts(dataset, visited)
     metrics = {
-        "num-examples": len(dataset), "train-mse-normalized": total_squared_error / targets,
+        "num-examples": sampler.epoch_size, "train-mse-normalized": total_squared_error / targets,
+        "admissible-windows": len(dataset),
+        "unique-training-windows": len(dataset) if visited is None else int(visited.sum()),
         "train-seconds": time.perf_counter() - started,
         "trainable-parameters": sum(parameter.numel() for parameter in parameters),
         "peak-process-rss-mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
         "effective-batch-size": settings.batch_size, "microbatch-size": microbatch_size,
         "optimizer-steps": optimizer_steps,
-        "num-targets": targets // epochs_completed,
+        "num-targets": selected_targets / epochs_completed,
+        "selected-target-occurrences": selected_targets,
+        "sampled-window-occurrences": window_occurrences,
+        "sampled-target-occurrences": targets,
+        "replacement-window-occurrences": window_occurrences - sampler.epoch_size * epochs_completed,
+        "padded-context-slots": padded_context,
+        "padded-target-slots": padded_targets,
         "epochs-completed": epochs_completed,
         "early-stopped": int(epochs_completed < settings.local_epochs),
         "learning-rate-initial": settings.learning_rate,
@@ -212,8 +235,10 @@ def train_local(
     metrics["train-objective-normalized"] = total_objective / targets
     if hasattr(dataset, "candidate_windows"):
         metrics.update({"candidate-windows": dataset.candidate_windows,
-                        "availability-excluded-windows": dataset.availability_excluded_windows,
-                        "windows-before-cap": dataset.windows_before_cap})
+                        "availability-excluded-windows": dataset.availability_excluded_windows})
+    if isinstance(dataset, WindowDataset) and getattr(dataset, "available_through", None) is not None:
+        first, last = dataset.target_time_bounds(dataset.starts[visited] if visited is not None else None)
+        metrics.update({"train-first-target-ns": first, "train-last-target-ns": last})
     if device.type == "cuda":
         metrics["peak-cuda-allocated-mib"] = torch.cuda.max_memory_allocated(device) / 1024**2
     return metrics
@@ -247,8 +272,7 @@ def _training_validation_totals(model, dataset, settings, device):
             raise ValueError("Predicciones de monitorización incompatibles o no finitas.")
         if isinstance(dataset, WindowDataset):
             starts = dataset.starts[offset:offset + len(actual)]
-            positions = starts[:, None] + dataset.context + np.arange(dataset.horizon)
-            actual = torch.from_numpy(dataset.values[positions].astype(np.float64))
+            actual = torch.from_numpy(dataset.target_values(starts).astype(np.float64))
             prediction = prediction.double() * dataset.scale + dataset.mean
             scale = 1.
         else:

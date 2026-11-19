@@ -152,7 +152,7 @@ def test_microbatch_accumulation_matches_full_batch_with_uneven_tails(
     monkeypatch.setattr("fd_airquality.task._microbatch_size", lambda *_: 4)
     actual = train_local(accumulated, dataset, settings, torch.device("cpu"), 23, proximal_mu)
 
-    # 29 windows -> logical batches 11, 11, 7. Physical batches include tails
+    # 29 windows -> logical batches 11, 11, 11 (4 replacement draws). Physical batches include tails
     # of 3; weighting each microbatch equally would fail this comparison.
     assert reference["optimizer-steps"] == actual["optimizer-steps"] == 6
     assert len(steps) == len(norms) == 12

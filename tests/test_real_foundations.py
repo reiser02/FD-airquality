@@ -57,10 +57,11 @@ def test_real_checkpoint_gradients_aggregation_and_restore(name, algorithm, tmp_
 @pytest.mark.integration
 @pytest.mark.skipif(os.environ.get("FD_AIRQUALITY_REAL_MODELS") != "1", reason="Explicit opt-in: real native missing-data interfaces")
 @pytest.mark.parametrize("name", list(GRANITE))
-def test_real_native_missing_histories_and_masked_targets(name):
+@pytest.mark.parametrize("padded", [False, True])
+def test_real_native_missing_histories_and_masked_targets(name, padded):
     from fd_airquality.missing import forecast_distribution
 
-    settings = RunSettings(model=name, batch_size=2, local_epochs=1, probabilistic=1,
+    settings = RunSettings(model=name, batch_size=4 if padded else 2, local_epochs=1, probabilistic=1,
                             mlflow_tracking_uri="disabled")
     configure_torch(settings, 42)
     model = make_model({"context": 90, "horizon": 12}, settings)
@@ -69,8 +70,14 @@ def test_real_native_missing_histories_and_masked_targets(name):
     inputs[1, [23, 24]] = float("nan")
     actual = torch.cos(torch.arange(12, dtype=torch.float32) / 5).repeat(2, 1)
     actual[0, [1, 4]] = float("nan")
+    if padded:
+        inputs[0, :89] = float("nan")
+        inputs[0, 89] = .25
+        inputs[1, :7] = float("nan")
+        actual[:, 1:] = float("nan")
     metrics = train_local(model, TensorDataset(inputs, actual), settings, torch.device("cpu"), 42)
-    assert metrics["num-targets"] == 22
+    assert metrics["num-targets"] == (2 if padded else 22)
+    assert metrics["replacement-window-occurrences"] == (2 if padded else 0)
     model.eval()
     with torch.no_grad():
         prediction, quantiles, levels = forecast_distribution(model, inputs, settings)

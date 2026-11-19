@@ -88,9 +88,9 @@ Los pesos no se actualizan durante test. No se impone un embargo artificial de
 90 horas: la separación corresponde a objetivos, no a historia observable.
 
 El escalador cuenta cada observación de los bloques de entrenamiento una vez.
-`max_train_windows` limita ejemplos, no vuelve a ajustar el escalador ni las
-escalas estacionales. `retention.json` distingue entrenamiento potencial antes
-del corte, retenido tras elegir el panel y usado tras el límite. Informa horas
+`max_train_windows` limita ejemplos por época, no vuelve a ajustar el escalador
+ni las escalas estacionales. `retention.json` distingue el entrenamiento potencial,
+el retenido tras elegir el panel y la cuota configurada. Informa horas
 únicas y ventanas solapadas; estas no son tamaño muestral efectivo. Las exclusiones
 conservan CSV y preparaciones históricas; se registra la última fecha raw y útil.
 
@@ -191,6 +191,13 @@ pertenece a la implementación del modelo, no añade observaciones al dataset ni
 permite cruzar un hueco. Los adaptadores reciben únicamente ventanas continuas
 que ya pasaron `WindowDataset`.
 
+El padding externo, distinto del padding interno de patches, se decide en
+`[prepare].window-padding = "none" | "right" | "both"`, solo para entrenamiento
+global `masked`. El TOML principal habilita `both`. Conserva arrays originales y
+enmascara posiciones virtuales o todavía no autorizadas, nunca crea etiquetas.
+Validación/test permanecen sin padding. Cambiarlo requiere preparar de nuevo.
+Consulta [TRAINING_CONTROLS.md](TRAINING_CONTROLS.md).
+
 Cada ronda distribuye los pesos globales, entrena localmente con AdamW y devuelve
 pesos y métricas. El optimizador local se reinicia en cada ronda; no se agrega su
 estado. Hay semillas por ronda y estación, clipping de gradiente y orden estable
@@ -200,15 +207,17 @@ igualdad bit a bit entre ejecuciones, hardware o versiones diferentes.
 PatchTST en CUDA usa microbatches de hasta 8 ventanas sin cambiar el batch efectivo
 configurado ni el orden de las ventanas. Cada pérdida se pondera por sus targets;
 se acumulan los gradientes antes de un único clipping y paso de AdamW por batch
-efectivo. El último batch incompleto usa su tamaño real y FedProx se añade una sola
-vez. No se recorta el contexto ni se cambia la arquitectura; el orden de suma y el
+efectivo. El último batch corto de entrenamiento se completa con reemplazo del
+subconjunto sorteado en esa época; evaluación conserva su tamaño real. FedProx se añade una sola
+vez por batch lógico. No se recorta el contexto ni se cambia la arquitectura; el orden de suma y el
 dropout pueden introducir diferencias numéricas. En el control local CUDA los
 modelos siguen siendo independientes, pero solo la estación activa reside en GPU;
 las restantes se conservan en CPU.
 
-- **FedAvg:** implementación oficial de Flower, ponderada por el número de ventanas
-  de entrenamiento realmente utilizadas, no por filas brutas, horas de calendario
-  ni número de épocas.
+- **FedAvg:** implementación oficial de Flower. Con ventanas `masked`, pondera
+  por el promedio de targets observados en las selecciones de las épocas,
+  sin el relleno con reemplazo. En formato estricto se pondera por ventanas
+  por época, equivalente porque todos los horizontes tienen el mismo soporte.
 - **FedProx:** estrategia oficial de Flower, con el término local
   `mu / 2 * sum((w - w_global)^2)`; la referencia es una copia de los pesos recibidos.
 
@@ -321,9 +330,11 @@ No se cambian automáticamente métricas ni ventanas de referencia.
 parte del MSE agrupado, no del promedio de raíces de sus orígenes. Los targets
 rolling se solapan; los pares origen-target no son observaciones independientes.
 
-`--max-train-windows` toma un subconjunto determinista repartido sobre las ventanas
-elegibles. Modifica tanto el entrenamiento como sus pesos de agregación y debe
-reservarse para pruebas de funcionamiento, no confundirse con el experimento completo.
+`--max-train-windows` fija una cuota por estación y época. Cada época toma una
+muestra aleatoria sin reemplazo del conjunto que queda tras cortes, máscaras y
+umbrales. Las ventanas no sorteadas siguen disponibles para las épocas siguientes.
+En centralizado se sortea por estación y se mezclan las muestras antes de formar
+lotes. Los sorteos son reproducibles con la semilla de la ejecución.
 
 ## Alcance y privacidad
 

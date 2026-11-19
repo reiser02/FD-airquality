@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 
 import numpy as np
 import pandas as pd
@@ -129,6 +130,51 @@ def test_actual_flower_fedavg_weights_by_valid_window_count(tmp_path):
         strategy.aggregate_train(2, replies[:1])
     with pytest.raises(ValueError, match="repetida"):
         strategy.aggregate_train(2, [replies[0], replies[0]])
+
+
+@pytest.mark.parametrize("strategy_name", ["fedavg", "fedprox", "lora"])
+def test_federation_uses_fractional_sampled_target_support_before_replacement(
+    tmp_path, monkeypatch, strategy_name, flower_identity,
+):
+    settings = (RunSettings(model="flowstate-r1", adaptation="lora") if strategy_name == "lora"
+                else RunSettings(strategy=strategy_name))
+    settings = replace(settings, local_epochs=2, batch_size=3)
+    manifest = {
+        "schema_version": 6,
+        "geometry": {"context": 6, "horizon": 2, "max_train_windows": 2},
+        "clients": [{"station": station, "num_train_windows": 12, "num_train_targets": 20}
+                    for station in ("a", "b")],
+    }
+    strategy = AuditedStrategy(settings, manifest, tmp_path)
+    width = (settings.lora_rank, settings.lora_rank)
+    keys = (["adapter.proj.lora_A", "adapter.proj.lora_B"] if strategy_name == "lora" else ["weight"])
+
+    def arrays(value):
+        return ArrayRecord({key: torch.full(width, value) for key in keys})
+
+    strategy.current_arrays = arrays(0.)
+    # Aggregation only; no model-specific checkpoint metadata required here.
+    monkeypatch.setattr(strategy, "_save", lambda *_: None)
+    request = Message(content=RecordDict(), dst_node_id=10, message_type="train")
+    replies = []
+    for partition, selected, repeated, value in ((0, 5, 3, 2.), (1, 7, 4, 10.)):
+        replies.append(Message(content=RecordDict({
+            "arrays": arrays(value),
+            "metrics": MetricRecord({
+                "partition-id": partition, "num-examples": 2, "num-targets": selected / 2,
+                "admissible-windows": 12, "unique-training-windows": 3, "epochs-completed": 2,
+                "selected-target-occurrences": selected, "sampled-window-occurrences": 6,
+                "replacement-window-occurrences": 2, "sampled-target-occurrences": selected + repeated,
+                "train-mse-normalized": 1.,
+            }),
+        }), reply_to=request))
+    result, metrics = strategy.aggregate_train(1, replies)
+    assert metrics["num-targets"] == 6.
+    for tensor in result.to_numpy_ndarrays():
+        np.testing.assert_allclose(tensor, (2.5 * 2 + 3.5 * 10) / 6)
+    replies[0].content["metrics"]["num-targets"] = 3.0
+    with pytest.raises(ValueError, match="Soporte de entrenamiento"):
+        strategy.aggregate_train(2, replies)
 
 
 def test_global_rmse_is_pooled_not_mean_client_rmse():

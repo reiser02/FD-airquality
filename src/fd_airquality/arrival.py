@@ -11,6 +11,7 @@ import pandas as pd
 
 from fd_airquality.availability import filter_training_windows
 from fd_airquality.data import WindowDataset
+from fd_airquality.splitting import window_observation_counts
 from fd_airquality.training_control import controls_enabled
 
 
@@ -52,8 +53,10 @@ def round_validation_view(artifact: dict, geometry: dict, settings):
         return WindowDataset(artifact, "validation", geometry["context"], geometry["horizon"])
     lower, cutoff = bounds
     times = artifact["timestamps"]
-    starts = artifact.get("train_candidates", artifact["train_starts"])
+    starts = artifact["train_starts"]
     first, last = starts + geometry["context"], starts + geometry["context"] + geometry["horizon"] - 1
+    keep = (starts >= 0) & (last < len(times))
+    starts, first, last = starts[keep], first[keep], last[keep]
     starts = starts[(times[first] >= lower.value) & (times[last] < cutoff.value)]
     size = int(np.searchsorted(times, cutoff.value))
     local = artifact | {"validation_starts": starts, "values": artifact["values"][:size],
@@ -120,41 +123,57 @@ def audit_normalization(artifact: dict, settings, partition: int, output: Path |
 
 
 def training_view(artifact: dict, geometry: dict, settings, round_number: int | None = None):
-    """Select this round's target block; retain only released history as context."""
+    """Return the full admissible pool for this round, before epoch sampling."""
     local = artifact.copy()
     lower, cutoff = round_bounds(geometry, settings, round_number) if round_number is not None else (None, None)
-    starts = artifact.get("train_candidates", artifact["train_starts"])
+    starts = artifact["train_starts"]
+    padded = str(artifact.get("window_padding", "none")) != "none"
     monitoring_excluded = 0
+    arrival_unobserved = 0
+    target_end = int(artifact.get("train_target_end", len(artifact["values"])))
     if cutoff is not None:
-        # A whole horizon must have arrived, even when its last labels are absent.
         times = artifact["timestamps"]
-        starts = starts[times[starts + geometry["context"] + geometry["horizon"] - 1] < cutoff.value]
+        # Padding may extend the nominal horizon, never its supervised labels.
+        final = starts + geometry["context"] + (0 if padded else geometry["horizon"] - 1)
+        starts = starts[times[final] < cutoff.value]
         if lower is not None:
             # Only forecast targets must be new. Their context may precede the
-            # block; horizons straddling its boundary are not training samples.
+            # block; a padded horizon can extend right, never back into old labels.
             starts = starts[times[starts + geometry["context"]] >= lower.value]
         bounds = round_validation_bounds(geometry, settings)
         if bounds is not None:
             first = times[starts + geometry["context"]]
-            last = times[starts + geometry["context"] + geometry["horizon"] - 1]
-            keep = (last < bounds[0].value) | (first >= bounds[1].value)
+            if padded:
+                keep = (first < bounds[0].value) | (first >= bounds[1].value)
+            else:
+                last = times[starts + geometry["context"] + geometry["horizon"] - 1]
+                keep = (last < bounds[0].value) | (first >= bounds[1].value)
             monitoring_excluded = int((~keep).sum())
             starts = starts[keep]
+            if round_number == 1:
+                target_end = min(target_end, int(np.searchsorted(times, bounds[0].value)))
         size = int(np.searchsorted(times, cutoff.value))
         local["values"], local["timestamps"] = artifact["values"][:size], times[:size]
+        target_end = min(target_end, size)
+    if padded:
+        context_counts, target_counts = window_observation_counts(
+            local["values"], starts, geometry["context"], geometry["horizon"], target_end,
+        )
+        keep = ((context_counts >= geometry.get("min_context_observed", 1))
+                & (target_counts >= geometry.get("min_target_observed", 1)))
+        arrival_unobserved = int((~keep).sum())
+        starts = starts[keep]
+    local["train_target_end"] = np.array(target_end)
     local["train_starts"] = starts
     dataset = filter_training_windows(WindowDataset(
         local, "train", geometry["context"], geometry["horizon"], allow_empty=True,
     ), settings)
-    cap = geometry.get("max_train_windows")
-    dataset.windows_before_cap = len(dataset)
-    if cap and len(dataset) > cap:
-        dataset.starts = dataset.starts[np.linspace(0, len(dataset) - 1, cap, dtype=int)]
     dataset.available_through = cutoff
     dataset.arrival_lower = lower
     dataset.timestamps = local["timestamps"]
     dataset.monitoring_excluded_windows = monitoring_excluded
     dataset.monitoring_interval = round_validation_bounds(geometry, settings) if cutoff is not None else None
+    dataset.arrival_unobserved_windows = arrival_unobserved
     return dataset
 
 
@@ -164,16 +183,11 @@ def arrival_metrics(dataset) -> dict:
         "availability-excluded-windows": dataset.availability_excluded_windows,
         "minimum-context-observed": dataset.availability_minima[0],
         "minimum-target-observed": dataset.availability_minima[1],
-        "windows-before-cap": dataset.windows_before_cap,
         "monitoring-excluded-windows": dataset.monitoring_excluded_windows,
+        "arrival-unobserved-windows": dataset.arrival_unobserved_windows,
     }
     if dataset.available_through is not None:
         metrics["available-through-ns"] = dataset.available_through.value
         if dataset.arrival_lower is not None:
             metrics["available-from-ns"] = dataset.arrival_lower.value
-        if len(dataset):
-            metrics["train-first-target-ns"] = int(dataset.timestamps[
-                dataset.starts[0] + dataset.context])
-            metrics["train-last-target-ns"] = int(dataset.timestamps[
-                dataset.starts[-1] + dataset.context + dataset.horizon - 1])
     return metrics

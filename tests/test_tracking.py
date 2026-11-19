@@ -14,7 +14,7 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
                            mlflow_tracking_uri=mlflow_uri, mlflow_experiment="test-airquality")
     if failure:
-        def fail(*_):
+        def fail(*_, **__):
             raise RuntimeError("training failed")
 
         monkeypatch.setattr("fd_airquality.baselines.train_local", fail)

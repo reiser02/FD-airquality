@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Mapping
+from math import isfinite
 
 import torch
 from torch.nn import functional as F
@@ -24,7 +25,9 @@ def tensor_bytes(state: Mapping[str, torch.Tensor]) -> int:
 
 
 def _validate(updates, counts, previous, algorithm):
-    if not updates or len(updates) != len(counts) or any(not isinstance(n, int) or isinstance(n, bool) or n <= 0 for n in counts):
+    if not updates or len(updates) != len(counts) or any(
+        type(n) not in (int, float) or not isfinite(n) or n <= 0 for n in counts
+    ):
         raise ValueError("Recuentos de entrenamiento inválidos.")
     expected = {key for key in previous if key.startswith("adapter.")}
     if not expected:
@@ -77,7 +80,7 @@ def _fair_b(a, b, target, settings, seed):
     return (b + delta).detach(), initial, final
 
 
-def aggregate_adapter_updates(updates: list[dict], counts: list[int], settings: RunSettings,
+def aggregate_adapter_updates(updates: list[dict], counts: list[int | float], settings: RunSettings,
                               *, previous: dict, server_round: int) -> tuple[dict, dict]:
     """Aggregate current local factors; FLoRA history is server-owned and cumulative.
 

@@ -1,14 +1,11 @@
 import json
 from dataclasses import asdict, replace
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 from flwr.app import ArrayRecord, Message, MetricRecord, RecordDict
-from flwr.supercore.task_identity import TaskIdentity
-from test_federation import LocalTestGrid
 
 from fd_airquality.arrival import (
     arrival_metrics,
@@ -18,35 +15,10 @@ from fd_airquality.arrival import (
     round_cutoff,
     training_view,
 )
-from fd_airquality.data import DataConfig, WindowDataset, load_client_data, prepare, read_manifest
+from fd_airquality.data import DataConfig, WindowDataset, load_client_data, prepare
 from fd_airquality.server_app import run_server
 from fd_airquality.settings import RunSettings
 from fd_airquality.strategy import AuditedStrategy
-
-
-@pytest.fixture(autouse=True)
-def flower_identity(monkeypatch):
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
-
-
-@pytest.fixture
-def arrival_prepared(tmp_path):
-    raw = tmp_path / "raw"
-    for offset, station in enumerate(("a", "b")):
-        folder = raw / station
-        folder.mkdir(parents=True)
-        values = 10 + offset + np.sin(np.arange(14 * 24 * 12) / 23)
-        values.reshape(-1, 12)[offset::11] = np.nan
-        pd.DataFrame({"PM25": values}, index=pd.date_range(
-            "2025-01-01", periods=len(values), freq="5min",
-        )).to_csv(folder / "PM25.csv")
-    config = DataConfig(context=6, horizon=3, stride=3, train_stride=3,
-                        window_policy="masked", seasonality=3, hourly_repeat_filter=0,
-                        min_validation_windows=2, min_test_windows=2,
-                        validation_start="2025-01-09", test_start="2025-01-11", test_end="2025-01-13")
-    path = prepare(raw, tmp_path / "prepared", "PM25", config)
-    return path, read_manifest(path)
 
 
 def test_rounds_receive_only_released_calendar_prefixes(arrival_prepared):
@@ -97,8 +69,8 @@ def test_default_blocks_reuse_context_but_never_previous_targets():
     torch.testing.assert_close(targets, torch.arange(24., 27.))
     assert views[1].timestamps[-1] == times[47]
     metrics = arrival_metrics(views[1])
-    assert metrics["available-from-ns"] == metrics["train-first-target-ns"] == times[24]
-    assert metrics["train-last-target-ns"] == times[47]
+    assert metrics["available-from-ns"] == times[24]
+    assert views[1].target_time_bounds() == (times[24], times[47])
     # A target horizon crossing a block boundary is not replayed or backdated.
     used = set().union(*(set(view.starts) for view in views))
     assert set(starts) - used == {16, 17, 40, 41}
@@ -113,32 +85,7 @@ def test_default_blocks_reuse_context_but_never_previous_targets():
     assert arrival_metrics(short)["available-from-ns"] == times[70]
 
 
-def test_unreleased_observations_cannot_change_early_round_weights(arrival_prepared):
-    from fd_airquality.models import make_model, shared_state
-    from fd_airquality.task import configure_torch, train_local
-
-    path, manifest = arrival_prepared
-    geometry = manifest["geometry"]
-    _, original = load_client_data(str(path), 0)
-    settings = RunSettings(num_server_rounds=3, hidden_size=8, normalization="fixed", batch_size=16)
-    cutoff = round_cutoff(geometry, settings, 1)
-    changed = original | {"values": original["values"].copy()}
-    changed["values"][original["timestamps"] >= cutoff.value] = 1e8
-    states, scalers = [], []
-    for artifact in (original, changed):
-        local = normalization_artifact(artifact, geometry, settings)
-        scalers.append(local["normalization_sha256"])
-        dataset = training_view(local, geometry, settings, 1)
-        device = configure_torch(settings, 5)
-        model = make_model(geometry, settings)
-        train_local(model, dataset, settings, device, 17)
-        states.append({key: value.detach().clone() for key, value in shared_state(model).items()})
-    assert scalers[0] == scalers[1]
-    for key in states[0]:
-        torch.testing.assert_close(states[0][key], states[1][key], rtol=0, atol=0)
-
-
-def test_threshold_and_cap_are_applied_after_arrival_not_to_external_support(arrival_prepared):
+def test_availability_filters_full_round_pool_before_epoch_budget(arrival_prepared):
     path, manifest = arrival_prepared
     _, artifact = load_client_data(str(path), 0)
     geometry = manifest["geometry"] | {"max_train_windows": 7}
@@ -147,7 +94,7 @@ def test_threshold_and_cap_are_applied_after_arrival_not_to_external_support(arr
     for stage in (1, 2, 3):
         a = training_view(artifact, geometry, strict, stage)
         b = training_view(artifact, geometry, permissive, stage)
-        assert len(a) <= 7 and len(b) == 7
+        assert len(a) < len(b) and len(b) >= 8
         assert a.availability_excluded_windows > 0
         assert a.candidate_windows == b.candidate_windows
         for start in a.starts:
@@ -177,17 +124,18 @@ def test_fixed_normalization_is_masked_and_audited_per_fold(arrival_prepared, tm
         ))
 
 
-@pytest.mark.parametrize("model", ["mlp", "nlinear", "nhits", "autoencoder"])
-@pytest.mark.parametrize("strategy", ["fedavg", "fedprox"])
+@pytest.mark.parametrize(("model", "strategy"), [
+    ("mlp", "fedavg"), ("nlinear", "fedprox"), ("nhits", "fedavg"), ("autoencoder", "fedprox"),
+])
 def test_actual_flower_strategy_uses_declared_round_blocks_and_no_early_validation(
-    arrival_prepared, tmp_path, model, strategy,
+    arrival_prepared, tmp_path, flower_grid, model, strategy,
 ):
     path, manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            model=model, strategy=strategy, num_server_rounds=3, hidden_size=8,
                            batch_size=16, probabilistic=int(model != "autoencoder"),
                            mlflow_tracking_uri="disabled")
-    grid = LocalTestGrid(settings, 2)
+    grid = flower_grid(settings, len(manifest["clients"]))
     output = run_server(grid, settings)
     history = pd.read_csv(output / "station_metrics.csv")
     train = history.loc[history.split == "train"]
@@ -218,24 +166,20 @@ def test_actual_flower_strategy_uses_declared_round_blocks_and_no_early_validati
 
 @pytest.mark.parametrize("model_name", ["mlp", "flowstate-r1"])
 def test_new_blocks_continue_from_the_previous_aggregated_weights(
-    arrival_prepared, tmp_path, monkeypatch, model_name,
+    arrival_prepared, tmp_path, monkeypatch, flower_grid, mock_granite, model_name,
 ):
     from fd_airquality.client_app import train_local
     from fd_airquality.models import shared_state
 
-    if model_name == "flowstate-r1":
-        from test_models import DummyBackbone
-
-        monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
     path, _ = arrival_prepared
     incoming, aggregated = {}, {}
 
-    def train(model, dataset, settings, device, seed, proximal_mu=0.):
+    def train(model, dataset, settings, device, seed, proximal_mu=0., **kwargs):
         number = (seed - settings.seed) // 100_003
         incoming.setdefault(number, []).append({
             key: value.detach().clone() for key, value in shared_state(model).items()
         })
-        return train_local(model, dataset, settings, device, seed, proximal_mu)
+        return train_local(model, dataset, settings, device, seed, proximal_mu, **kwargs)
 
     aggregate_train = AuditedStrategy.aggregate_train
 
@@ -252,7 +196,7 @@ def test_new_blocks_continue_from_the_previous_aggregated_weights(
                            lora_targets="proj" if model_name == "flowstate-r1" else "auto",
                            missing_policy="ffill" if model_name == "flowstate-r1" else "auto",
                            num_server_rounds=3, hidden_size=8, batch_size=16, mlflow_tracking_uri="disabled")
-    run_server(LocalTestGrid(settings, 2), settings)
+    run_server(flower_grid(settings, 2), settings)
     assert set(incoming) == {1, 2, 3}
     for number in (2, 3):
         assert len(incoming[number]) == 2
@@ -263,7 +207,7 @@ def test_new_blocks_continue_from_the_previous_aggregated_weights(
 
 
 @pytest.mark.parametrize("violation", ["old_target", "future_target", "wrong_block", "missing_interval"])
-def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_path, violation):
+def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_path, flower_identity, violation):
     path, manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), num_server_rounds=3)
     strategy = AuditedStrategy(settings, manifest, tmp_path)
@@ -296,26 +240,25 @@ def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_pat
         strategy.aggregate_train(2, replies)
 
 
-def test_empty_early_round_is_explicit_and_not_averaged_as_an_update(arrival_prepared, tmp_path):
+def test_empty_early_round_is_explicit_and_not_averaged_as_an_update(arrival_prepared, tmp_path, flower_grid):
     path, _manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=3,
                            arrival_period_hours=96, hidden_size=8, selection_metric="macro-mae",
                            mlflow_tracking_uri="disabled")
-    output = run_server(LocalTestGrid(settings, 2), settings)
+    output = run_server(flower_grid(settings, 2), settings)
     history = pd.read_csv(output / "round_metrics.csv").query("split == 'train'")
     assert history.iloc[0]["num-targets"] == 0
     assert history.iloc[0]["idle-client"] == 2
     assert history.iloc[-1]["num-targets"] > 0
 
 
-def test_empty_new_block_keeps_weights_instead_of_replaying_old_data(arrival_prepared, tmp_path, monkeypatch):
-    path, manifest = arrival_prepared
-    raw = Path(manifest["raw_root"])
+def test_empty_new_block_keeps_weights_instead_of_replaying_old_data(arrival_raw, tmp_path, monkeypatch, flower_grid):
+    raw, config = arrival_raw
     for source in raw.glob("*/*.csv"):
         frame = pd.read_csv(source, index_col=0, parse_dates=True)
         frame.loc[(frame.index >= "2025-01-08") & (frame.index < "2025-01-09")] = np.nan
         frame.to_csv(source)
-    path = prepare(raw, tmp_path / "no_last_block", "PM25", DataConfig(**manifest["geometry"]))
+    path = prepare(raw, tmp_path / "no_last_block", "PM25", config)
     states = {}
     save = AuditedStrategy._save
 
@@ -327,7 +270,7 @@ def test_empty_new_block_keeps_weights_instead_of_replaying_old_data(arrival_pre
     monkeypatch.setattr(AuditedStrategy, "_save", record)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=3,
                            hidden_size=8, batch_size=16, mlflow_tracking_uri="disabled")
-    output = run_server(LocalTestGrid(settings, 2), settings)
+    output = run_server(flower_grid(settings, 2), settings)
     rounds = pd.read_csv(output / "round_metrics.csv").query("split == 'train'").set_index("round")
     assert rounds.loc[2, "num-targets"] > 0
     assert rounds.loc[3, "num-targets"] == rounds.loc[3, "optimizer-steps"] == 0

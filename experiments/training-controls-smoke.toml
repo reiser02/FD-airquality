@@ -5,8 +5,11 @@ horizon = 12
 stride = 6
 train-stride = 6
 station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
-max-train-windows = 16
+# Non-multiple of batch-size: exercise both the epoch budget and replacement.
+max-train-windows = 13
+min-train-windows = 16
 window-policy = "masked"
+window-padding = "both"
 min-useful = 9
 hourly-repeat-filter = 0
 

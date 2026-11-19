@@ -42,11 +42,9 @@ def filter_training_windows(dataset, settings):
     context_min, target_min = availability_minima(
         dataset.context, dataset.horizon, availability_threshold(settings),
     )
-    counts = np.r_[0, np.cumsum(np.isfinite(dataset.values))]
     starts = dataset.starts
-    middle = starts + dataset.context
-    keep = ((counts[middle] - counts[starts] >= context_min)
-            & (counts[middle + dataset.horizon] - counts[middle] >= target_min))
+    context_counts, target_counts = dataset.observation_counts()
+    keep = (context_counts >= context_min) & (target_counts >= target_min)
     result = copy(dataset)
     result.starts = starts[keep]
     result.candidate_windows = len(starts)

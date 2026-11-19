@@ -180,7 +180,7 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
                 residents.discard(self.index)
             return self
 
-    def train(model, dataset, *args):
+    def train(model, dataset, *args, **kwargs):
         assert residents == {model.index}
         calls.append((model.index, "train"))
         with torch.no_grad():

@@ -49,7 +49,13 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
         command.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
         for field in fields(DataConfig):
             value = getattr(DataConfig(), field.name)
-            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value) if value is not None else int)
+            options = {}
+            if field.name == "window_padding":
+                options = {"choices": ["none", "right", "both"],
+                           "help": "Padding solo de entrenamiento: none lo desactiva; right a la derecha; both también a la izquierda."}
+            elif field.name == "max_train_windows":
+                options = {"help": "Presupuesto de ventanas distintas por estación y época; se sortea del conjunto admisible."}
+            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value) if value is not None else int, **options)
         command.add_argument("--heartbeat-seconds", type=float, default=60.0)
         command.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     temporal_data.add_argument("--folds", type=int, default=3)

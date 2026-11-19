@@ -221,13 +221,18 @@ def test_missing_toml_mapping_and_macro_mae_are_configurable(tmp_path, monkeypat
     assert args.selection_metric == "macro-mae"
 
 
-def test_target_identity_does_not_depend_on_training_cap(masked_prepared, tmp_path, masked_geometry):
+def test_prepared_windows_and_evaluation_do_not_depend_on_epoch_budget(masked_prepared, tmp_path, masked_geometry):
     path, original = masked_prepared
     changed_path = prepare(Path(original["raw_root"]), tmp_path / "other", "PM25",
                             replace(masked_geometry, max_train_windows=4))
     changed = read_manifest(changed_path)
     assert original["evaluation_sha256"] == changed["evaluation_sha256"]
-    assert original["clients"][0]["sha256"] != changed["clients"][0]["sha256"]
+    for partition, client in enumerate(changed["clients"]):
+        _, full = load_client_data(str(path), partition)
+        _, budgeted = load_client_data(str(changed_path), partition)
+        assert len(full["train_starts"]) == client["num_train_windows"] > 4
+        for key in ("train_starts", "train_mask", "validation_starts", "test_starts", "values"):
+            np.testing.assert_array_equal(full[key], budgeted[key])
     assert (path.parent / "coverage.csv").is_file()
 
 

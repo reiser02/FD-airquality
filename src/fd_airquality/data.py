@@ -1,4 +1,4 @@
-"""Station-local preparation; no window crosses a missing hour or split target."""
+"""Station-local preparation; calendar gaps and target boundaries stay explicit."""
 
 from __future__ import annotations
 
@@ -29,6 +29,7 @@ from fd_airquality.splitting import (
     masked_window_starts,
     select_holdout_window,
     split_train_val_subseries,
+    window_observation_counts,
 )
 
 
@@ -65,6 +66,7 @@ class DataConfig:
     grid_tolerance_seconds: int = 30
     upct_valid_flags: str = ""
     train_start: str = ""
+    window_padding: str = "none"
 
     def __post_init__(self) -> None:
         if any(
@@ -72,7 +74,7 @@ class DataConfig:
             for key, value in asdict(self).items() if value is not None and key not in {
                 "split_mode", "quality_mode", "validation_start", "test_start", "test_end",
                 "window_policy", "error_scale_policy", "error_scale_epsilon", "hourly_repeat_filter",
-                "grid_tolerance_seconds", "upct_valid_flags", "train_start", "error_scale_reference",
+                "grid_tolerance_seconds", "upct_valid_flags", "train_start", "error_scale_reference", "window_padding",
             }
         ):
             raise ValueError("Todas las longitudes y mínimos deben ser enteros positivos.")
@@ -80,6 +82,10 @@ class DataConfig:
             raise ValueError("stride no puede superar horizon (dejaría targets sin evaluar).")
         if self.window_policy not in {"strict", "masked"} or (self.split_mode == "station" and self.window_policy != "strict"):
             raise ValueError("window_policy debe ser strict o masked; station requiere strict.")
+        if self.window_padding not in {"none", "right", "both"}:
+            raise ValueError("window_padding debe ser none, right o both.")
+        if self.window_padding != "none" and (self.window_policy != "masked" or self.split_mode != "global"):
+            raise ValueError("El padding de entrenamiento requiere window_policy=masked y split_mode=global.")
         if self.min_context_observed > self.context or self.min_target_observed > self.horizon:
             raise ValueError("Los mínimos observados no pueden superar contexto/horizonte.")
         effective_error_scales(1., 1., 1, policy=self.error_scale_policy, epsilon=self.error_scale_epsilon)
@@ -107,8 +113,6 @@ class DataConfig:
             raise ValueError("error_scale_hours debe superar seasonality para formar diferencias.")
         if self.min_scale_pairs > self.error_scale_hours - self.seasonality:
             raise ValueError("min_scale_pairs supera los pares posibles de la referencia.")
-        if self.max_train_windows is not None and self.max_train_windows < self.min_train_windows:
-            raise ValueError("max_train_windows debe alcanzar min_train_windows.")
         if self.split_mode not in {"global", "station"} or self.quality_mode not in {"causal", "retrospective"}:
             raise ValueError("Modo temporal o quality_mode desconocido.")
         if self.split_mode == "global":
@@ -176,9 +180,6 @@ def _station_split(series: pd.Series, config: DataConfig) -> dict[str, Any] | No
         starts.extend(range(start, start + len(block) - width + 1, config.train_stride))
         train_points.append(block.to_numpy())
     starts = np.asarray(starts, dtype=np.int64)
-    if config.max_train_windows is not None and len(starts) > config.max_train_windows:
-        # Deterministic coverage of all retained blocks, rather than only the last one.
-        starts = starts[np.linspace(0, len(starts) - 1, config.max_train_windows, dtype=int)]
     if len(starts) < config.min_train_windows:
         return None
     train_values = np.concatenate(train_points)
@@ -224,7 +225,8 @@ def _global_candidates(series: pd.Series, config: DataConfig) -> dict:
         validation_start=config.validation_start, test_start=config.test_start, test_end=config.test_end,
         train_stride=config.train_stride, stride=config.stride,
         **({"min_context_observed": config.min_context_observed,
-            "min_target_observed": config.min_target_observed, "train_start": config.train_start}
+             "min_target_observed": config.min_target_observed, "train_start": config.train_start,
+             "window_padding": config.window_padding}
            if config.window_policy == "masked" else {}),
     )
     if config.train_start and config.window_policy == "strict":
@@ -242,8 +244,6 @@ def _global_split(series: pd.Series, config: DataConfig) -> dict | None:
         ("train", config.min_train_windows), ("validation", config.min_validation_windows), ("test", config.min_test_windows),
     )):
         return None
-    if config.max_train_windows is not None and len(split["train_starts"]) > config.max_train_windows:
-        split["train_starts"] = split["train_starts"][np.linspace(0, len(split["train_starts"]) - 1, config.max_train_windows, dtype=int)]
     normalization_mask = split["train_mask"]
     values = series.to_numpy()[normalization_mask]
     if not len(values):
@@ -272,9 +272,9 @@ def _source_files(root: Path, pollutant: str, stations: set[str] | None) -> list
     ]
 
 
-def window_target_count(values: np.ndarray, starts: np.ndarray, context: int, horizon: int) -> int:
-    counts = np.r_[0, np.cumsum(np.isfinite(values))]
-    return int((counts[starts + context + horizon] - counts[starts + context]).sum())
+def window_target_count(values: np.ndarray, starts: np.ndarray, context: int, horizon: int,
+                        target_end: int | None = None) -> int:
+    return int(window_observation_counts(values, starts, context, horizon, target_end)[1].sum())
 
 
 def prepare(
@@ -348,7 +348,9 @@ def prepare(
             counts = {
                 f"num_{name}_windows": int(np.sum(
                     (split[f"{name}_starts"] >= first)
-                    & (split[f"{name}_starts"] + config.context + config.horizon - 1 <= last)
+                    & (split[f"{name}_starts"] + config.context + config.horizon - 1 <= (
+                        min(last, int(series.index.searchsorted(pd.Timestamp(config.validation_start))) - 1)
+                        if name == "train" and config.window_padding != "none" else last))
                 )) if split is not None else 0
                 for name in ("train", "validation", "test")
             }
@@ -359,7 +361,8 @@ def prepare(
                          for name in ("train", "validation", "test")}
             block_rows.append({
                 "station": station, "start": series.index[0], "end": series.index[-1],
-                "hours": int(series.isna().sum()), "kind": "windows_crossing_missing_values",
+                "hours": int(series.isna().sum()), "kind": ("windows_with_missing_or_padding"
+                         if config.window_padding != "none" else "windows_crossing_missing_values"),
                 **{f"num_{name}_windows": len(split[f"{name}_starts"]) - contained[name]
                    for name in ("train", "validation", "test")},
             })
@@ -386,11 +389,13 @@ def prepare(
             values=series.to_numpy(dtype=np.float32),
             timestamps=series.index.asi8,
             allow_missing=np.array(config.window_policy == "masked"),
+            window_padding=np.array(config.window_padding),
+            train_target_end=np.array(int(series.index.searchsorted(pd.Timestamp(config.validation_start)))
+                                      if config.split_mode == "global" else len(series)),
             useful_readings=hourly.attrs["useful_readings"],
             quality_flags=hourly.attrs["quality_flags"],
-            # Runtime availability filtering and caps are applied AFTER the
-            # arrival cutoff. Selecting a cap using future missingness is unsafe.
-            train_candidates=(candidates["train_starts"] if candidates is not None else split["train_starts"]),
+            # Keep all origins here. The epoch sampler runs after the arrival
+            # cutoff and the model-specific availability filters.
             **{key: split[key] for key in (
                 "train_starts", "validation_starts", "test_starts", "mean", "scale",
                 "train_mask",
@@ -409,7 +414,9 @@ def prepare(
             "num_train_candidate_windows": len(candidates["train_starts"]) if candidates is not None else len(split["train_starts"]),
             "num_validation_windows": len(split["validation_starts"]),
             "num_test_windows": len(split["test_starts"]),
-            **{f"num_{name}_targets": window_target_count(series.to_numpy(), split[f"{name}_starts"], config.context, config.horizon)
+            **{f"num_{name}_targets": window_target_count(series.to_numpy(), split[f"{name}_starts"], config.context, config.horizon,
+                                                        int(series.index.searchsorted(pd.Timestamp(config.validation_start)))
+                                                        if name == "train" and config.split_mode == "global" else None)
                for name in ("train", "validation", "test")},
             **{f"{name}_signature": target_signature(series, split[f"{name}_starts"], config.context, config.horizon,
                                                      split[f"{name}_scale_start"], split[f"{name}_scale_end"])
@@ -435,8 +442,8 @@ def prepare(
     (run / "retention.json").write_text(json.dumps({
         "candidate_stations": len(files), "loaded_stations": len(inventory), "eligible_stations": len(clients),
         "candidate_pre_cutoff_train_windows": candidate_train_windows,
-        "retained_pre_cap_train_windows": retained_train_windows,
-        "used_train_windows": sum(client["num_train_windows"] for client in clients),
+        "retained_pre_cutoff_train_windows": retained_train_windows,
+        "train_window_budget_per_station_per_epoch": config.max_train_windows,
         "candidate_pre_cutoff_training_hours": candidate_training_hours,
         "retained_training_hours": sum(row.get("training_hours", 0) for row in inventory),
         "train_window_retention_pct": 100 * retained_train_windows / candidate_train_windows if candidate_train_windows else 0.0,
@@ -448,7 +455,7 @@ def prepare(
         raise ValueError(f"Ninguna estación es elegible. Consulta {run / 'excluded_stations.csv'}")
     manifest = run / "manifest.json"
     document = {
-        "schema_version": 5 if config.window_policy == "masked" else 4,
+        "schema_version": 6 if config.window_padding != "none" else 5 if config.window_policy == "masked" else 4,
         "protocol": ("global_masked_forecasting_v1" if config.window_policy == "masked" else "global_temporal_forecasting_v3") if config.split_mode == "global" else "station_local_retrospective_forecasting_v2",
         "pollutant": pollutant,
         "raw_root": str(raw_root.resolve()),
@@ -464,7 +471,7 @@ def prepare(
 
 def read_manifest(path: str | Path) -> dict[str, Any]:
     manifest = json.loads(Path(path).read_text(encoding="utf-8"))
-    if manifest.get("schema_version") not in {2, 3, 4, 5} or not manifest.get("clients"):
+    if manifest.get("schema_version") not in {2, 3, 4, 5, 6} or not manifest.get("clients"):
         raise ValueError("Manifest federado vacío o incompatible; vuelve a ejecutar prepare.")
     normalize_pollutant(manifest.get("pollutant", ""))
     clients = manifest["clients"]
@@ -475,6 +482,8 @@ def read_manifest(path: str | Path) -> dict[str, Any]:
     config = DataConfig(**(geometry if manifest["schema_version"] >= 3 else geometry | {
         "split_mode": "station", "quality_mode": "retrospective",
     }))
+    if (manifest["schema_version"] == 6) != (config.window_padding != "none"):
+        raise ValueError("Esquema de padding incompatible; vuelve a ejecutar prepare.")
     if config.split_mode == "global":
         for client in clients:
             if not (pd.Timestamp(client["train_end"]) < pd.Timestamp(config.validation_start)
@@ -506,25 +515,35 @@ class WindowDataset(Dataset):
         self.context, self.horizon = context, horizon
         self.split = split
         self.allow_missing = bool(artifact.get("allow_missing", False))
+        self.padding_mode = str(artifact.get("window_padding", "none")) if split == "train" else "none"
+        self.target_end = (min(int(artifact.get("train_target_end", len(self.values))), len(self.values))
+                           if split == "train" else len(self.values))
+        if self.padding_mode not in {"none", "right", "both"} or self.target_end < 0:
+            raise ValueError("Padding o extremo autorizado de entrenamiento inválido.")
         if not len(self.starts) and not allow_empty:
             raise ValueError(f"No hay ventanas de {split}.")
         width = context + horizon
-        if np.any(self.starts < 0) or np.any(self.starts + width > len(self.values)):
-            raise ValueError("Ventana fuera de la serie.")
+        minimum_start = 1 - context if self.padding_mode == "both" else 0
+        if (np.any(self.starts < minimum_start)
+                or np.any(self.starts + context >= self.target_end)
+                or (self.padding_mode == "none" and np.any(self.starts + width > self.target_end))):
+            raise ValueError("Ventana fuera de la serie o del intervalo temporal autorizado.")
         # Prefix sums validate all windows in O(series length + window count).
         missing = np.r_[0, np.cumsum(~np.isfinite(self.values))]
-        if not self.allow_missing and np.any(missing[self.starts + width] - missing[self.starts]):
+        left = np.clip(self.starts, 0, self.target_end)
+        right = np.clip(self.starts + width, 0, self.target_end)
+        if not self.allow_missing and (self.padding_mode != "none" or np.any(missing[right] - missing[left])):
             raise ValueError("Una ventana cruza un hueco o contiene valores no finitos.")
         if self.allow_missing:
             if np.isinf(self.values).any():
                 raise ValueError("Los infinitos no son una ausencia válida.")
-            observed = np.r_[0, np.cumsum(np.isfinite(self.values))]
-            if (np.any(observed[self.starts + context] == observed[self.starts])
-                    or np.any(observed[self.starts + width] == observed[self.starts + context])):
+            context_counts, target_counts = self.observation_counts()
+            if np.any(context_counts == 0) or np.any(target_counts == 0):
                 raise ValueError("Una ventana no contiene contexto o targets observados.")
         times = artifact["timestamps"]
+        self.timestamps = times
         breaks = np.r_[0, np.cumsum(np.diff(times) != pd.Timedelta(hours=1).value)]
-        if np.any(breaks[self.starts + width - 1] - breaks[self.starts]):
+        if np.any(breaks[np.maximum(right - 1, 0)] - breaks[left]):
             raise ValueError("Una ventana cruza horas ausentes.")
         if not np.isfinite(self.mean) or not np.isfinite(self.scale) or self.scale <= 0:
             raise ValueError("Normalización local inválida.")
@@ -534,10 +553,48 @@ class WindowDataset(Dataset):
 
     def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
         start = int(self.starts[index])
-        values = (self.values[start : start + self.context + self.horizon] - self.mean) / self.scale
+        width = self.context + self.horizon
+        if self.padding_mode == "none":
+            values = self.values[start:start + width].copy()
+        else:
+            values = np.full(width, np.nan, dtype=np.result_type(self.values.dtype, np.float32))
+            left, right = max(0, start), min(start + width, self.target_end)
+            values[left - start:right - start] = self.values[left:right]
+        values = (values - self.mean) / self.scale
         return torch.from_numpy(values[: self.context].copy()), torch.from_numpy(
             values[self.context :].copy()
         )
+
+    def observation_counts(self):
+        return window_observation_counts(self.values, self.starts, self.context, self.horizon, self.target_end)
+
+    def target_values(self, starts: np.ndarray | None = None) -> np.ndarray:
+        """Original labels, with unauthorized/virtual positions left missing."""
+        starts = self.starts if starts is None else starts
+        positions = starts[:, None] + self.context + np.arange(self.horizon)
+        actual = np.full(positions.shape, np.nan, dtype=np.result_type(self.values.dtype, np.float32))
+        real = (positions >= 0) & (positions < self.target_end)
+        actual[real] = self.values[positions[real]]
+        return actual
+
+    def padding_counts(self, starts: np.ndarray | None = None) -> tuple[int, int]:
+        starts = self.starts if starts is None else starts
+        return (int(np.maximum(-starts, 0).sum()),
+                int(np.maximum(starts + self.context + self.horizon - self.target_end, 0).sum()))
+
+    def target_time_bounds(self, starts: np.ndarray | None = None) -> tuple[int, int]:
+        """First and last real target slots, excluding the virtual horizon."""
+        starts = self.starts if starts is None else starts
+        first = int(starts.min()) + self.context
+        last = min(int(starts.max()) + self.context + self.horizon - 1, self.target_end - 1)
+        return int(self.timestamps[first]), int(self.timestamps[last])
+
+    def context_timestamps(self, index: int):
+        """Virtual context dates are metadata only; their input mask is zero."""
+        positions = int(self.starts[index]) + np.arange(self.context)
+        times = self.timestamps[np.maximum(positions, 0)].copy()
+        times[positions < 0] += positions[positions < 0] * pd.Timedelta(hours=1).value
+        return times
 
 
 def load_client_data(manifest_path: str, partition: int) -> tuple[dict, dict[str, np.ndarray]]:
@@ -552,6 +609,12 @@ def load_client_data(manifest_path: str, partition: int) -> tuple[dict, dict[str
         artifact = {key: archive[key] for key in archive.files}
     if manifest["schema_version"] >= 3:
         geometry = manifest["geometry"]
+        if str(artifact.get("window_padding", "none")) != geometry.get("window_padding", "none"):
+            raise ValueError("La política de padding del NPZ no coincide con el manifest.")
+        if manifest["schema_version"] == 6:
+            expected_end = int(np.searchsorted(artifact["timestamps"], pd.Timestamp(geometry["validation_start"]).value))
+            if int(artifact.get("train_target_end", -1)) != expected_end:
+                raise ValueError("El extremo de targets de entrenamiento no coincide con su corte.")
         for split in ("train", "validation", "test"):
             windows = WindowDataset(artifact, split, geometry["context"], geometry["horizon"])
             if windows.allow_missing != (geometry.get("window_policy", "strict") == "masked"):
@@ -559,17 +622,18 @@ def load_client_data(manifest_path: str, partition: int) -> tuple[dict, dict[str
             if len(windows) != client[f"num_{split}_windows"] or np.any(np.diff(windows.starts) <= 0):
                 raise ValueError("Número u orden de ventanas incompatible con el manifest.")
             if manifest["schema_version"] >= 5:
-                expected = window_target_count(artifact["values"], windows.starts, geometry["context"], geometry["horizon"])
+                expected = window_target_count(artifact["values"], windows.starts, geometry["context"],
+                                               geometry["horizon"], windows.target_end)
                 if not windows.allow_missing or expected != client[f"num_{split}_targets"]:
                     raise ValueError("Máscara o recuento de targets incompatible con el manifest.")
-                counts = np.r_[0, np.cumsum(np.isfinite(artifact["values"]))]
-                middle = windows.starts + geometry["context"]
-                if (np.any(counts[middle] - counts[windows.starts] < geometry["min_context_observed"])
-                        or np.any(counts[middle + geometry["horizon"]] - counts[middle] < geometry["min_target_observed"])):
+                context_counts, target_counts = windows.observation_counts()
+                if (np.any(context_counts < geometry["min_context_observed"])
+                        or np.any(target_counts < geometry["min_target_observed"])):
                     raise ValueError("Una ventana incumple los mínimos observados del manifest.")
             if geometry["split_mode"] == "global":
                 first = pd.to_datetime(artifact["timestamps"][windows.starts + geometry["context"]])
-                last = first + pd.Timedelta(hours=geometry["horizon"] - 1)
+                last = pd.to_datetime(artifact["timestamps"][np.minimum(
+                    windows.starts + geometry["context"] + geometry["horizon"] - 1, windows.target_end - 1)])
                 upper = geometry["validation_start"] if split == "train" else geometry["test_start"] if split == "validation" else geometry["test_end"]
                 lower = None if split == "train" else geometry["validation_start"] if split == "validation" else geometry["test_start"]
                 if (last >= pd.Timestamp(upper)).any() or (lower is not None and (first < pd.Timestamp(lower)).any()):

@@ -61,10 +61,33 @@ comunes adicionales. La configuración efectiva se valida también al construir
 el modelo de NeuralForecast.
 
 El filtro por modelo se aplica **solo al entrenamiento**, después del corte de
-llegada y antes del límite opcional de ventanas. No elimina fechas del calendario,
+llegada y antes de muestrear las ventanas de cada época. No elimina fechas del calendario,
 no modifica ventanas de validación/test y no permite ocultar predicciones inválidas.
 Si no queda entrenamiento en todo el fold se aborta; una ronda temprana sin datos
 se registra explícitamente como inactiva, con peso de agregación cero.
+
+### Padding y completado de batches
+
+`[prepare].window-padding = "none" | "right" | "both"` controla exclusivamente el
+entrenamiento. `none` conserva el requisito de posiciones reales; `right` permite
+un horizonte parcial al final del intervalo autorizado; `both` permite también
+contexto virtual a la izquierda. El TOML principal usa `both`; el valor interno
+sin configurar es `none`. Requiere ventanas globales `masked` y una nueva preparación.
+
+Los arrays originales no cambian. Cada posición virtual se presenta con máscara
+cero; no cuenta como observación, no ajusta el scaler y no se convierte en etiqueta.
+Los mínimos observados y umbrales siguen aplicándose. Las ventanas de evaluación
+no usan padding y sus firmas permanecen iguales si el panel no cambia.
+Esquema 6 registra política y límite autorizado de targets.
+
+Después de los filtros, cada época vuelve a sortear hasta `max-train-windows`
+ventanas distintas por estación desde el conjunto admisible completo. Sin cuota
+se recorren todas una vez. Solo se completa el último batch corto con reemplazo
+de la selección de esa época, sin introducir ventanas distintas adicionales.
+No se repiten ventanas al evaluar. Con `masked`, la agregación federada usa el
+promedio del soporte observado por época **antes del reemplazo**; las ocurrencias
+muestreadas y repetidas se informan aparte. Consulta
+[las reglas completas](TRAINING_CONTROLS.md).
 
 ## Normalización sin fuga
 
@@ -106,7 +129,9 @@ Los folds son walk-forward con cortes de calendario comunes entre estaciones:
 ```
 
 El contexto puede usar observaciones anteriores ya disponibles, pero los targets
-de una ventana no cruzan fronteras. El horizonte cuenta horas, no valores válidos.
+supervisados de una ventana no cruzan fronteras. Un horizonte de entrenamiento
+con padding puede prolongarse nominalmente, con sus posiciones no autorizadas
+enmascaradas. El horizonte cuenta horas, no valores válidos.
 Los contextos avanzan cada `stride`; los pesos permanecen fijos durante cada
 evaluación externa. Los horizontes solapados son predicciones distintas, no
 réplicas independientes.
@@ -237,12 +262,15 @@ pesos globales agregados de la ronda anterior, no una inicialización nueva. Ada
 sí se reinicia en cada ronda, como antes.
 
 El contexto puede reutilizar observaciones antiguas: no son targets de ajuste
-de esa ronda. El horizonte completo de targets debe quedar dentro de su bloque
-y haber llegado, incluso si su último target está ausente. Las ventanas cuyo
-horizonte cruza una frontera entre bloques no se admiten; no se borran timestamps
-ni se añaden etiquetas artificiales. Un bloque más corto que el horizonte puede
-quedar sin ventanas. El array entregado al optimizador se trunca físicamente al
-prefijo autorizado, aunque conserva el contexto anterior necesario.
+de esa ronda. Con `window-padding="none"`, el horizonte completo debe quedar
+dentro de su bloque y haber llegado, incluso si su último target está ausente.
+Con `right` o `both`, puede prolongarse a la derecha, pero solo se supervisan
+sus posiciones dentro del bloque y anteriores al corte; las demás quedan NaN.
+Nunca se retrocede a targets del bloque anterior. Un bloque más corto que el
+horizonte puede aportar una ventana parcial si alcanza los mínimos observados;
+si no los alcanza queda sin ventanas. No se borran timestamps ni se añaden
+etiquetas artificiales. El dataset se trunca físicamente al prefijo llegado y
+el extremo autorizado de targets puede ser aún anterior si hay monitorización.
 
 No existe un selector de histórico dentro del fold. Se han eliminado
 `arrival-history` y `arrival-history-hours` de Python, CLI, TOML y Flower.
@@ -254,16 +282,20 @@ autorizados **entre folds**.
 
 Se conservan los pesos entre rondas. No se exige que el número de
 ventanas crezca: normalmente baja tras el histórico inicial y luego depende de
-cada bloque. Un cap de pruebas se aplica por ronda, después del corte y el filtro
-de disponibilidad. Se registran candidatos antes del cap y ventanas utilizadas.
-Dentro de un bloque, las ventanas pueden solaparse y `local-epochs` puede hacer
-varias pasadas; lo que no se repite son los bloques de targets entre rondas.
+cada bloque. La cuota de cada época se aplica después del corte y el filtro
+de disponibilidad. Se registran ventanas admisibles, sorteadas por época y
+distintas visitadas entre todas las épocas de la ronda.
+Dentro de un bloque, las ventanas pueden solaparse, `local-epochs` puede hacer
+varias pasadas y el sampler puede repetirlas para completar un lote; lo que no
+se repite son los bloques de targets entre rondas.
 Las ausencias pueden hacer que lleguen horas sin nuevas ventanas admisibles.
 
 El servidor envía los extremos del bloque y comprueba el intervalo devuelto:
 `available-from-ns`, cuando hay límite inferior, `available-through-ns`,
 `train-first-target-ns` y `train-last-target-ns`. Rechaza targets anteriores al
-bloque o todavía no llegados. Se registran ventanas, targets observados,
+bloque o todavía no llegados. El último extremo describe la última posición
+real autorizada, no el final nominal del horizonte con padding.
+Se registran ventanas, targets observados,
 exclusiones de disponibilidad y clientes inactivos por ronda. Los clientes
 inactivos no influyen en los pesos. La validación completa
 del fold no se consulta hasta terminar su flujo de entrenamiento; en este modo
@@ -353,8 +385,9 @@ predicción no finita incluso cuando su etiqueta está ausente.
 Se corrigen los dos diagnósticos detectados en la revisión histórica:
 `blocks.csv` añade las ventanas que cruzan ausencias y sus sumas cuadran con el
 manifest; la inactividad previa al corte usa la última observación anterior a
-ese corte, no una reaparición futura. `coverage.csv` etiqueta recuentos pre-cap
-y post-cap. Los umbrales específicos se registran en cada ejecución.
+ese corte, no una reaparición futura. `coverage.csv` separa la cobertura de todo
+el conjunto antes de muestrear de la cota de ventanas por época. Los umbrales
+específicos y los recuentos realizados se registran en cada ejecución.
 
 Las preparaciones anteriores se conservan y no se sobrescriben. Los cambios en
 módulos fingerprinted requieren preparar de nuevo. Checkpoints anteriores de
@@ -375,9 +408,28 @@ cronología, agregación y restauración. No prueban superioridad predictiva, no
 convierten ventanas solapadas en réplicas independientes y no son una ejecución
 del experimento científico completo ni una certificación de CUDA.
 
-### Validación de evaluación normal y controles de épocas
+### Verificación del muestreo por época
 
-En este worktree: **559 pruebas aprobadas, sin omisiones**, con checkpoints
+Al introducir la cuota por época se pasaron **689 pruebas, sin omisiones** y **48
+ejecuciones acotadas en CPU**. Se verificó que las selecciones se renuevan sin
+exceder la cuota por época ni el bloque autorizado y que no cambia el soporte
+externo. Informe: `reports/epoch_window_sampling_validation.json`.
+
+### Validación anterior: primer muestreo con reemplazo y padding
+
+**674 pruebas aprobadas, cero fallos y cero omisiones**, con checkpoints reales
+habilitados. JUnit: `reports/window_sampling_padding_tests.xml`. Se comprueban
+reemplazo de lotes cortos, preservación del soporte federado, los tres modos de
+padding, límites de llegada/monitorización, esquema 6, evaluación sin padding y
+los tres backbones Granite con targets parciales. Los detalles y la reproducción
+están en [TRAINING_CONTROLS.md](TRAINING_CONTROLS.md).
+La integración CLI completó **48 casos reales acotados** con padding activado y
+desactivado, manteniendo idénticas firmas y máscaras externas. Informe de esa revisión:
+`reports/window_sampling_padding_final_validation.json`.
+
+### Validación anterior: evaluación normal y controles de épocas
+
+Antes del padding y completado de batches: **559 pruebas aprobadas, sin omisiones**, con checkpoints
 reales habilitados. JUnit: `reports/training_controls_tests.xml`.
 Se completaron 24 casos reales acotados de MLP/NLinear/NHITS/autoencoder, tres
 modos y dos folds, con Flower/Ray en las federaciones. El control de épocas

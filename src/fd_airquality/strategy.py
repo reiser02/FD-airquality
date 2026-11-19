@@ -41,10 +41,14 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
             metrics["train-objective-normalized"] = sum(
                 record["train-objective-normalized"] * record["num-targets"] for record in records
             ) / total_targets
-    for key in ("candidate-windows", "availability-excluded-windows", "idle-client", "monitoring-excluded-windows"):
+    for key in ("candidate-windows", "availability-excluded-windows", "idle-client", "monitoring-excluded-windows",
+                "arrival-unobserved-windows", "admissible-windows", "unique-training-windows",
+                "padded-context-slots", "padded-target-slots"):
         if all(key in record for record in records):
             metrics[key] = sum(record[key] for record in records)
-    for key in ("optimizer-steps", "epochs-completed", "early-stopped", "learning-rate-reductions"):
+    for key in ("optimizer-steps", "epochs-completed", "early-stopped", "learning-rate-reductions",
+                "selected-target-occurrences", "sampled-window-occurrences", "sampled-target-occurrences",
+                "replacement-window-occurrences"):
         if all(key in record for record in records):
             metrics[key] = sum(record[key] for record in records)
     for key in ("train-seconds", "uplink-tensor-bytes", "downlink-tensor-bytes"):
@@ -54,6 +58,29 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
         if all(key in record for record in records):
             metrics[key] = max(record[key] for record in records)
     return MetricRecord(metrics)
+
+
+def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: bool, settings, horizon: int) -> None:
+    admissible = metrics["admissible-windows"]
+    selected = metrics["num-examples"]
+    unique = metrics["unique-training-windows"]
+    epochs = metrics["epochs-completed"]
+    if not (0 <= admissible <= available and (dynamic or admissible == available)
+            and selected == (min(admissible, cap) if cap is not None else admissible)
+            and selected <= unique <= min(admissible, selected * epochs)
+            and int(selected > 0) <= epochs <= (settings.local_epochs if selected else 0)):
+        raise ValueError("Número de ventanas o épocas incompatible con el presupuesto de muestreo.")
+    sampled = metrics["sampled-window-occurrences"]
+    replacement = metrics["replacement-window-occurrences"]
+    originals = selected * epochs
+    targets = metrics["selected-target-occurrences"]
+    repeated_targets = metrics["sampled-target-occurrences"] - targets
+    if (replacement != (-selected) % settings.batch_size * epochs
+            or sampled != originals + replacement
+            or not originals <= targets <= originals * horizon
+            or not replacement <= repeated_targets <= replacement * horizon
+            or metrics["num-targets"] != (targets / epochs if epochs else 0)):
+        raise ValueError("Soporte de entrenamiento incompatible con el muestreo y el reemplazo.")
 
 
 def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> MetricRecord:
@@ -243,12 +270,16 @@ class AuditedStrategy(Strategy):
                 raise ValueError(f"Identidad de cliente incorrecta o repetida: {partition}")
             seen.add(partition)
             client = self.manifest["clients"][partition]
+            geometry = self.manifest["geometry"]
+            horizon = geometry["horizon"]
             dynamic = split == "train" and (
-                self.progressive or self.manifest["geometry"].get("max_train_windows")
+                self.progressive
                 or self.settings.training_data_availability_threshold != "0.0"
                 or self.settings.training_availability != "{}")
-            if (not 0 <= metrics["num-examples"] <= client[f"num_{split}_windows"]
-                    or (not dynamic and metrics["num-examples"] != client[f"num_{split}_windows"])):
+            available = client[f"num_{split}_windows"]
+            cap = geometry.get("max_train_windows") if split == "train" else None
+            limit = min(available, cap) if cap is not None else available
+            if (not 0 <= metrics["num-examples"] <= limit or (not dynamic and metrics["num-examples"] != limit)):
                 raise ValueError(f"Número de ventanas incoherente para {client['station']}.")
             if split == "train" and self.progressive:
                 lower, cutoff = round_bounds(self.manifest["geometry"], self.settings, server_round)
@@ -268,15 +299,18 @@ class AuditedStrategy(Strategy):
             if any(not np.isfinite(value) for value in metrics.values()):
                 raise ValueError("Una estación devolvió métricas no finitas.")
             if split == "train":
+                if "admissible-windows" in metrics:
+                    _check_training_sampling(metrics, available, cap, dynamic, self.settings, horizon)
                 arrays = reply.content["arrays"].to_numpy_ndarrays()
                 if any(not np.isfinite(array).all() for array in arrays):
                     raise ValueError("Una estación devolvió pesos no finitos.")
-            elif metrics["num-targets"] != client.get(f"num_{split}_targets", metrics["num-examples"] * self.manifest["geometry"]["horizon"]):
+            elif metrics["num-targets"] != client.get(f"num_{split}_targets", metrics["num-examples"] * horizon):
                 raise ValueError("Número de targets incoherente.")
-            if (split == "train" and self.manifest.get("schema_version", 4) >= 5
-                    and (not 0 <= metrics["num-targets"] <= metrics["num-examples"] * self.manifest["geometry"]["horizon"]
-                         or (not dynamic and metrics["num-targets"] != client["num_train_targets"]))):
-                raise ValueError("Número de targets de entrenamiento incoherente.")
+            if split == "train" and self.manifest.get("schema_version", 4) >= 5:
+                support = metrics["num-targets"]
+                if (not metrics["num-examples"] <= support <= min(limit * horizon, client["num_train_targets"])
+                        or (not dynamic and limit == available and support != client["num_train_targets"])):
+                    raise ValueError("Número de targets de entrenamiento incoherente.")
         if seen != expected:
             raise RuntimeError(f"Panel incompleto; faltan estaciones {sorted(expected - seen)}")
         # Ray completion order must not change floating-point aggregation order.
@@ -331,7 +365,7 @@ class AuditedStrategy(Strategy):
                 raise RuntimeError("Falta el estado global anterior para agregar adaptadores.")
             states = [reply.content["arrays"].to_torch_state_dict() for reply in active]
             weight_key = "num-targets" if self.manifest.get("schema_version", 4) >= 5 else "num-examples"
-            counts = [int(reply.content["metrics"][weight_key]) for reply in active]
+            counts = [reply.content["metrics"][weight_key] for reply in active]
             previous = self.current_arrays.to_torch_state_dict()
             previous_rounds = {int(key.split(".")[1]) for key in previous if key.startswith("history.")}
             cumulative_round = max(previous_rounds, default=0) + 1 if self.settings.adaptation == "flora" else server_round

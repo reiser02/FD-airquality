@@ -185,6 +185,7 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                     ):
                         records.append(train_local(
                             model, data["train"], settings, device, seed,
+                            max_train_windows=geometry.get("max_train_windows"),
                             **({"validation_data": data["validation"]} if controls_enabled(settings) else {}),
                         ))
                 recorder.record(stage, "train", records)
@@ -194,6 +195,7 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 configure_torch(settings, seed)
                 metrics = train_local(models[0], ConcatDataset([data["train"] for data in datasets]),
                                       settings, device, seed,
+                                      max_train_windows=geometry.get("max_train_windows"),
                                       **({"validation_data": ConcatDataset([data["validation"] for data in datasets])}
                                          if controls_enabled(settings) else {}))
                 recorder.rounds.append({"round": stage, "split": "train", **metrics})

@@ -122,8 +122,12 @@ uv run fd-airquality prepare --pollutant PM25 --max-train-windows 128 \
 uv run fd-airquality simulate --num-server-rounds 2
 ```
 
-El límite de ventanas es **solo para pruebas rápidas**. Vuelve a ejecutar
-`prepare` sin ese límite para preparar el experimento completo. También admite
+`max-train-windows` limita las ventanas distintas **por estación y época**, no el
+batch de cada actualización. Cada época vuelve a sortear del conjunto admisible
+completo; en federado, solo del bloque de la ronda. Omite el límite para recorrer
+todas las ventanas en cada época. La preparación registra la cuota en el manifest,
+pero conserva el conjunto completo. Vuelve a ejecutar `prepare` o `prepare-backtest`
+para aplicar el cambio a datos ya preparados. También admite
 `--raw-root`, `--context`, `--horizon`,
 `--validation-start`, `--test-start`, `--test-end`, `--train-stride` y mínimos
 `--min-train-windows`, `--min-validation-windows`, `--min-test-windows`
@@ -133,8 +137,12 @@ no recorta el entrenamiento ni cambia el contexto de entrada.
 `--zero-run-hours 24` controla el congelado de ceros: rachas cortas se conservan;
 al acumular 24 horas observadas a cero se marca el fallo. Los huecos pausan el
 contador, no lo reinician ni cuentan como ceros. Solo una hora válida no nula lo reinicia.
-No se exige una racha para todo el test: cada ventana abarca 90 + 12 horas de
-calendario y, con `masked`, puede contener valores ausentes.
+No se exige una racha para todo el test: cada ventana de evaluación abarca
+90 + 12 horas de calendario y, con `masked`, puede contener valores ausentes.
+En entrenamiento, `[prepare].window-padding = "none" | "right" | "both"` permite
+desactivar el padding, añadirlo a la derecha o a ambos extremos. El TOML principal
+activa `both`; para desactivarlo, usa `window-padding = "none"` y prepara de nuevo.
+No cambia las etiquetas ni las ventanas de evaluación.
 Consulta `uv run fd-airquality prepare --help` y `uv run fd-airquality simulate --help`.
 
 ## Comparar modelos con y sin federación
@@ -227,7 +235,8 @@ cuDNN ni se cambia la precisión de los otros modelos.
 En CUDA, PatchTST divide entrenamiento y evaluación en microbatches de hasta 8
 ventanas. El DataLoader de entrenamiento conserva los batches originales: se
 acumulan gradientes ponderados por el número de targets, con un único clipping y
-paso de AdamW por batch efectivo (incluido el último incompleto). FedProx se aplica
+paso de AdamW por batch efectivo. El último batch corto de entrenamiento se
+completa con reemplazo desde las ventanas sorteadas en esa época; evaluación no las repite. FedProx se aplica
 una vez por batch efectivo. No se modifica el batch del TOML, el checkpoint ni la
 arquitectura; puede haber pequeñas diferencias por el orden de suma o por dropout.
 Los logs y las métricas registran batch efectivo, microbatch y pasos del optimizador.
@@ -353,7 +362,7 @@ Pruebas con los checkpoints reales, incluidos gradientes y restauración:
 FD_AIRQUALITY_REAL_MODELS=1 uv run pytest -q
 ```
 
-Sin esa variable se omiten explícitamente las 15 pruebas reales; las unitarias e
+Sin esa variable se omiten explícitamente las 18 pruebas con checkpoints reales; las unitarias e
 integraciones de Flower con transporte local sí se ejecutan.
 La suite usa CPU y oculta las GPU físicas; las comprobaciones de CUDA usan dobles
 de prueba. MLflow solo se activa en sus pruebas específicas, con una base SQLite

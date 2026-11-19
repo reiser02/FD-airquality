@@ -16,19 +16,22 @@ horizon = 12
 stride = 6
 # Separación en horas entre ventanas de entrenamiento; un valor mayor reduce solapamiento.
 train-stride = 6
-# Mínimo de ventanas de entrenamiento para incluir una estación en el manifest.
+# Mínimo de ventanas admisibles para incluir una estación; independiente de la cuota por época.
 min-train-windows = 16
 # Mínimo de ventanas de validación para incluir una estación.
 min-validation-windows = 7
 # Mínimo de ventanas de test para incluir una estación.
 min-test-windows = 15
-# Límite opcional de ventanas de entrenamiento por estación; útil para pruebas rápidas.
-# Si se omite, se conservan todas las ventanas disponibles.
-# max-train-windows = 128  # Solo para pruebas; omitir para usar todas las ventanas.
+# Cuota opcional por estación y época: se vuelve a sortear del conjunto admisible.
+# Si se omite, se usan todas las ventanas admisibles en cada época.
+# max-train-windows = 128
 # Todas las estaciones. Para una prueba pequeña usa experiments/smoke.toml.
 # station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
 # Conserva las ausencias en calendario; cada modelo trata su propio contexto.
 window-policy = "masked"
+# Solo entrenamiento: both añade contexto izquierdo y targets derechos enmascarados.
+# none lo desactiva; right conserva únicamente el padding derecho.
+window-padding = "both"
 min-context-observed = 1
 min-target-observed = 1
 # Periodicidad estacional en horas (24 = ciclo diario), usada para MASE/RMSSE.
@@ -36,7 +39,7 @@ seasonality = 24
 # Horas de referencia previas a cada periodo evaluado para calcular la escala de MASE/RMSSE.
 # No limita el entrenamiento ni cambia context.
 error-scale-hours = 672
-# Diferencias estacionales en horas reales: sin suelo o con suelo epsilon.
+# Diferencias estacionales en horas reales: sin suelo o con suelo ε.
 error-scale-policy = "unfloored"
 error-scale-reference = "training"
 error-scale-epsilon = 0.01
@@ -92,7 +95,7 @@ lr-scheduler-factor = 0.5
 min-learning-rate = 0.000001
 # En federado: reserva dentro del prefijo anterior a la primera ronda.
 round-validation-hours = 24
-# Ventanas procesadas por lote en cada actualización del optimizador.
+# Ventanas por actualización; el último lote corto se completa repitiendo ventanas de esa época.
 batch-size = 128
 # Tasa de aprendizaje de AdamW.
 learning-rate = 0.001

@@ -110,6 +110,7 @@ def test_global_normalization_and_error_scales_ignore_future_values(global_geome
     capped = split_station(series, replace(global_geometry, max_train_windows=4))
     assert capped["mean"] == changed["mean"]
     assert capped["training_hours"] == changed["training_hours"]
+    np.testing.assert_array_equal(capped["train_starts"], original["train_starts"])
 
 
 def test_capped_training_end_still_reports_all_history_used_for_scaling(global_geometry):

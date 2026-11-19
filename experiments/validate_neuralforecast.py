@@ -16,9 +16,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
+from torch.utils.data import ConcatDataset
 
 from fd_airquality.arrival import normalization_artifact, training_view
 from fd_airquality.artifacts import create_run_dir, file_digest
+from fd_airquality.batching import CompleteBatchSampler, training_padding_counts
 from fd_airquality.data import WindowDataset, load_client_data
 from fd_airquality.missing import forecast
 from fd_airquality.models import restore_checkpoint
@@ -36,6 +38,41 @@ def run_cli(root: Path, label: str, *arguments: str) -> None:
                                 stderr=subprocess.STDOUT, timeout=3600)
     if result.returncode:
         raise RuntimeError(f"Falló {label}; consulta {root / f'{label}.log'}")
+
+
+def verify_window_sampling(dataset, row: dict, settings: RunSettings, cap: int | None, seed: int) -> np.ndarray:
+    """Replay the seeded epoch draws and check reported support against canonical masks."""
+    stations = dataset.datasets if isinstance(dataset, ConcatDataset) else [dataset]
+    groups = [len(station) for station in stations]
+    selected_per_epoch = sum(min(size, cap) if cap is not None else size for size in groups)
+    assert len(dataset) == row["admissible-windows"]
+    assert selected_per_epoch == row["num-examples"]
+    visited = np.zeros(len(dataset), dtype=bool)
+    if not len(dataset):
+        assert row["num-targets"] == row["unique-training-windows"] == 0
+        return visited
+    sampler = CompleteBatchSampler(len(dataset), settings.batch_size, torch.Generator().manual_seed(seed),
+                                   max_windows=cap, group_sizes=groups)
+    observed = np.concatenate([station.observation_counts()[1] for station in stations])
+    selected_targets = sampled_targets = replacement = 0
+    epochs = int(row["epochs-completed"])
+    for _ in range(epochs):
+        draws = np.asarray(list(sampler)).ravel()
+        selected = draws[:selected_per_epoch]
+        assert len(set(selected)) == selected_per_epoch
+        assert not set(draws[selected_per_epoch:]) - set(selected)
+        selected_targets += int(observed[selected].sum())
+        sampled_targets += int(observed[draws].sum())
+        replacement += len(draws) - selected_per_epoch
+        visited[selected] = True
+    assert int(visited.sum()) == row["unique-training-windows"]
+    assert selected_targets == row["selected-target-occurrences"]
+    assert np.isclose(selected_targets / epochs, row["num-targets"], rtol=1e-12)
+    assert sampled_targets == row["sampled-target-occurrences"]
+    assert replacement == row["replacement-window-occurrences"]
+    assert selected_per_epoch * epochs + replacement == row["sampled-window-occurrences"]
+    assert training_padding_counts(dataset, visited) == (row["padded-context-slots"], row["padded-target-slots"])
+    return visited
 
 
 def verify_backtest(output: Path, *, classical: bool) -> dict:
@@ -89,16 +126,18 @@ def verify_backtest(output: Path, *, classical: bool) -> dict:
                     for row in train.to_dict("records"):
                         number = int(row["round"])
                         dataset = training_view(artifact, manifest["geometry"], settings, number)
-                        assert len(dataset) == row["num-examples"]
+                        visited = verify_window_sampling(
+                            dataset, row, settings, manifest["geometry"]["max_train_windows"],
+                            settings.seed + 100_003 * number + partition,
+                        )
                         assert dataset.candidate_windows == row["candidate-windows"]
-                        assert dataset.windows_before_cap == row["windows-before-cap"]
-                        positions = dataset.starts[:, None] + dataset.context + np.arange(dataset.horizon)
-                        observed = np.isfinite(artifact["values"][positions])
-                        assert int(observed.sum()) == row["num-targets"]
-                        targets = set(artifact["timestamps"][positions][observed])
-                        assert not seen_windows.intersection(dataset.starts)
+                        starts = dataset.starts[visited]
+                        positions = starts[:, None] + dataset.context + np.arange(dataset.horizon)
+                        observed = np.isfinite(dataset.target_values(starts))
+                        targets = set(artifact["timestamps"][positions[observed]])
+                        assert not seen_windows.intersection(starts)
                         assert not seen_targets.intersection(targets)
-                        seen_windows.update(dataset.starts)
+                        seen_windows.update(starts)
                         seen_targets.update(targets)
                         if number > 1:
                             assert row["available-from-ns"] == dataset.arrival_lower.value
@@ -109,7 +148,8 @@ def verify_backtest(output: Path, *, classical: bool) -> dict:
                                      "cutoffs": [int(value) for value in cutoffs],
                                     "block_starts": [int(value) if pd.notna(value) else None
                                                      for value in train.get("available-from-ns", pd.Series([np.nan] * len(train)))],
-                                    "training_windows": train["num-examples"].astype(int).tolist(),
+                                     "training_windows": train["num-examples"].astype(int).tolist(),
+                                     "unique_training_windows": train["unique-training-windows"].astype(int).tolist(),
                                      "candidate_windows": train["candidate-windows"].astype(int).tolist()})
                 validation = local.loc[local.split == "validation"]
                 assert set(validation["round"]) == {settings.num_server_rounds}

@@ -87,7 +87,16 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                          "target_policy": "observed_only", "window_policy": manifest["geometry"].get("window_policy", "strict"),
                          "training_threshold": settings.training_data_availability_threshold,
                          "model_thresholds": json.loads(settings.training_availability),
-                         "normalization": settings.normalization, "scaler_type": settings.scaler_type},
+                          "normalization": settings.normalization, "scaler_type": settings.scaler_type},
+        "window_protocol": {
+            "training_padding": manifest["geometry"].get("window_padding", "none"),
+            "evaluation_padding": "none",
+            "training_window_sampling": "resample_without_replacement_each_epoch",
+            "max_train_windows_per_station_per_epoch": manifest["geometry"].get("max_train_windows"),
+            "short_training_batch": "fill_with_replacement_from_current_epoch_selection",
+            "federation_weight": ("mean_observed_targets_per_epoch_before_replacement"
+                                  if manifest.get("schema_version", 4) >= 5 else "windows_per_epoch"),
+        },
         "probabilistic_protocol": {"crps": "quantile_integral_trapezoid_constant_tails_approximation",
                                    "truth": "canonical_observed_original_units"},
         "arrival_protocol": {"period_hours": settings.arrival_period_hours if progressive else 0,

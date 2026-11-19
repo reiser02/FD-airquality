@@ -26,8 +26,7 @@ class ContextSupervisionDataset(Dataset):
 
     def __getitem__(self, index):
         inputs, actual = self.dataset[index]
-        start = int(self.dataset.starts[index])
-        times = self.dataset.timestamps[start:start + self.dataset.context]
+        times = self.dataset.context_timestamps(index)
         lower, upper = self.dataset.monitoring_interval
         allowed = (times < lower.value) | (times >= upper.value)
         return inputs, actual, torch.from_numpy(allowed.copy())
