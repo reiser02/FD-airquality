@@ -7,10 +7,11 @@ from contextlib import contextmanager
 from io import StringIO
 from pathlib import Path
 
+import pandas as pd
 import pytest
 
 from fd_airquality.cli import build_benchmark_matrix, run_benchmark
-from fd_airquality.execution import _candidate_process, execute_plan, usable_gpu_slots
+from fd_airquality.execution import execute_plan, usable_gpu_slots
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging
 from fd_airquality.settings import RunSettings
@@ -141,21 +142,6 @@ def test_failure_cancels_running_and_future_candidates_and_stops_at_mode_barrier
     assert "RuntimeError: candidate failed" in (tmp_path / "run.log").read_text()
 
 
-def test_candidate_is_an_independent_process_with_explicit_configuration(prepared, tmp_path):
-    path, _ = prepared
-    log = tmp_path / "worker.log"
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "child-runs"), hidden_size=8,
-                           num_server_rounds=1, mlflow_tracking_uri="disabled")
-    output = _candidate_process(settings, "local", "", log, ProcessRunner())
-    metadata = json.loads((output / "run.json").read_text())
-    assert metadata["execution"]["pid"] != os.getpid()
-    assert metadata["execution"]["cuda_visible_devices"] == ""
-    assert metadata["settings"]["hidden_size"] == 8
-    assert "epoch=1/1" in log.read_text()
-    assert "Run completed" in (output / "run.log").read_text()
-    assert json.loads((output / "test_metrics.json").read_text())["test"]["num-clients"] == 2
-
-
 def test_cancellation_allows_child_to_flush_logs_and_close_mlflow_as_failed(prepared, tmp_path, mlflow_uri):
     from mlflow import MlflowClient
 
@@ -223,29 +209,46 @@ def test_gpu_slots_probe_each_visible_device_and_preserve_physical_mapping(monke
     assert usable_gpu_slots("cuda") == ["GPU-B"]
 
 
-@pytest.mark.parametrize("tracking", [False, True])
-def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, tracking, request):
-    path, _ = prepared
-    # Logical slots exercise concurrent processes on CPU, without claiming a two-GPU hardware test.
-    monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["", ""])
-    uri = request.getfixturevalue("mlflow_uri") if tracking else "disabled"
+def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, mlflow_uri):
+    from mlflow import MlflowClient
+
+    path, manifest = prepared
+    count = len(manifest["clients"])
+    monkeypatch.chdir(tmp_path)
+    # Both logical slots hide CUDA but have distinct values; check propagation to the children.
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
+    monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["", "-1,-1"])
     output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "matrix"),
-                           num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=uri),
-                            ["mlp", "autoencoder"], ["local", "centralized"])
-    assert (output / "comparison.csv").is_file()
+                            num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=mlflow_uri),
+                             ["mlp", "autoencoder"], ["local", "centralized"])
     root = output.parent
     rows = json.loads((root / "benchmark.json").read_text())
     assert len(rows) == 4 and all(row["status"] == "completed" for row in rows)
+    assert {row["gpu"] for row in rows} == {"", "-1,-1"}
+    comparison = pd.read_csv(output / "comparison.csv")
+    assert len(comparison) == len(rows)
+    assert set(zip(comparison["model"], comparison["mode"], strict=True)) == {
+        (row["model"], row["mode"]) for row in rows
+    }
+    assert len(pd.read_csv(output / "station_comparison.csv")) == len(rows) * count
     for row in rows:
+        run = Path(row["output"])
+        metadata = json.loads((run / "run.json").read_text())
+        assert metadata["execution"]["pid"] != os.getpid()
+        assert metadata["execution"]["cuda_visible_devices"] == row["gpu"]
+        assert metadata["settings"]["hidden_size"] == 8
+        assert metadata["settings"]["device"] == "cpu"
+        assert metadata["settings"]["model"] == row["model"]
+        assert metadata["mode"] == row["mode"]
+        assert json.loads((run / "test_metrics.json").read_text())["test"]["num-clients"] == count
         assert "epoch=1/1" in Path(row["log"]).read_text()
-        assert (Path(row["output"]) / "run.log").is_file()
+        assert "Run completed" in (run / "run.log").read_text()
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == "-1"
     assert "mode-completed" in (root / "benchmark.log").read_text()
-    if tracking:
-        from mlflow import MlflowClient
 
-        client = MlflowClient(tracking_uri=uri)
-        experiment = client.get_experiment_by_name("fd-airquality")
-        runs = client.search_runs([experiment.experiment_id])
-        assert len(runs) == 4
-        assert all(run.info.status == "FINISHED" for run in runs)
-        assert all("run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)} for run in runs)
+    client = MlflowClient(tracking_uri=mlflow_uri)
+    experiment = client.get_experiment_by_name("fd-airquality")
+    runs = client.search_runs([experiment.experiment_id])
+    assert len(runs) == len(rows)
+    assert all(run.info.status == "FINISHED" for run in runs)
+    assert all("run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)} for run in runs)

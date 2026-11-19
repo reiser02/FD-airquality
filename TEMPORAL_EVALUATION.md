@@ -411,7 +411,8 @@ del experimento científico completo ni una certificación de CUDA.
 ### Verificación del muestreo por época
 
 Al introducir la cuota por época se pasaron **689 pruebas, sin omisiones** y **48
-ejecuciones acotadas en CPU**. Se verificó que las selecciones se renuevan sin
+ejecuciones acotadas en CPU**. La [revisión de la suite](TEST_REVIEW.md)
+posterior consolidó los casos redundantes. Se verificó que las selecciones se renuevan sin
 exceder la cuota por época ni el bloque autorizado y que no cambia el soporte
 externo. Informe: `reports/epoch_window_sampling_validation.json`.
 

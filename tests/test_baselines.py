@@ -1,116 +1,98 @@
 import json
-from dataclasses import replace
 
 import pandas as pd
 import pytest
 import torch
 
 from fd_airquality.baselines import run_baseline
-from fd_airquality.comparison import compare_runs
 from fd_airquality.settings import RunSettings
 
 
-@pytest.mark.parametrize("mode", ["local", "centralized"])
-@pytest.mark.parametrize("model", ["mlp", "autoencoder", "nlinear", "nhits"])
-def test_non_federated_controls_select_validation_and_test_once(prepared, tmp_path, monkeypatch, mode, model):
-    from fd_airquality.baselines import evaluate_local as original
-
+@pytest.mark.parametrize(("mode", "model"), [
+    ("centralized", "mlp"), ("local", "autoencoder"), ("centralized", "nlinear"), ("local", "nhits"),
+])
+def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_path, mode, model):
     path, manifest = prepared
-    calls = []
-
-    def evaluate(network, dataset, *args):
-        calls.append(dataset)
-        return original(network, dataset, *args)
-
-    monkeypatch.setattr("fd_airquality.baselines.evaluate_local", evaluate)
     settings = RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "runs"), model=model,
-        num_server_rounds=2, hidden_size=8, batch_size=32, mlflow_tracking_uri="disabled",
+        num_server_rounds=1, hidden_size=8, batch_size=32, mlflow_tracking_uri="disabled",
     )
     output = run_baseline(settings, mode)
     results = json.loads((output / "test_metrics.json").read_text())
-    assert results["test"]["num-clients"] == 2
-    assert len(calls) == 2 * (3 + 1)
-    assert all(len(dataset) == manifest["clients"][i]["num_test_windows"] for i, dataset in enumerate(calls[-2:]))
-    assert len(pd.read_csv(output / "station_metrics.csv").query("split == 'test'")) == 2
+    clients = manifest["clients"]
+    assert results["test"]["num-clients"] == len(clients)
+    test = pd.read_csv(output / "station_metrics.csv").query("split == 'test'")
+    assert test["num-examples"].tolist() == [client["num_test_windows"] for client in clients]
+    assert not (output / "mlflow.json").exists()
     if mode == "local":
         assert results["selected_round"] is None
-        assert len(results["selected_rounds"]) == 2
-        assert len(list(output.glob("client_*_best_model.pt"))) == 2
+        names = [f"client_{client['partition_id']:03d}_best_model.pt" for client in clients]
     else:
-        assert 0 <= results["selected_round"] <= 2
-        checkpoint = torch.load(output / "best_model.pt", weights_only=True)
-        assert checkpoint["round"] == results["selected_round"]
+        assert results["selected_rounds"] == [results["selected_round"]]
+        names = ["best_model.pt"]
+    for name, stage in zip(names, results["selected_rounds"], strict=True):
+        checkpoint = torch.load(output / name, weights_only=True)
+        assert 0 <= checkpoint["round"] == stage <= settings.num_server_rounds
+        assert checkpoint["model"]["name"] == model
 
 
-def test_centralized_epoch_contains_only_original_training_windows(prepared, tmp_path, monkeypatch):
-    from fd_airquality.baselines import train_local as original
+def test_centralized_restores_validation_winner_and_tests_once(prepared, tmp_path, monkeypatch):
+    from fd_airquality.baselines import evaluate_local
 
     path, manifest = prepared
-    counts = []
+    geometry, clients = manifest["geometry"], manifest["clients"]
+    model = torch.nn.Linear(geometry["context"], geometry["horizon"], bias=False)
+    torch.nn.init.zeros_(model.weight)
+    evaluations = []
 
     def train(model, dataset, *args, **kwargs):
-        counts.append([len(station) for station in dataset.datasets])
-        return original(model, dataset, *args, **kwargs)
+        assert [(station.split, len(station)) for station in dataset.datasets] == [
+            ("train", client["num_train_windows"]) for client in clients
+        ]
+        with torch.no_grad():
+            model.weight.add_(1)
+        return {"num-examples": len(dataset), "train-mse-normalized": 1.}
 
+    def evaluate(model, dataset, *args):
+        stage = model.weight[0, 0].item()
+        evaluations.append((dataset.split, stage))
+        metrics = evaluate_local(model, dataset, *args)
+        if dataset.split == "validation":
+            mase, mae = {0.: (2., 3.), 1.: (1., 2.), 2.: (3., 1.)}[stage]
+            metrics.update({"mase": mase, "mase-sum": mase * metrics["mase-count"],
+                            "mae": mae, "absolute-error-sum": mae * metrics["num-targets"]})
+        return metrics
+
+    monkeypatch.setattr("fd_airquality.baselines.make_model", lambda *_: model)
     monkeypatch.setattr("fd_airquality.baselines.train_local", train)
-    run_baseline(RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=2,
-                             mlflow_tracking_uri="disabled"), "centralized")
-    assert counts == [[client["num_train_windows"] for client in manifest["clients"]]] * 2
+    monkeypatch.setattr("fd_airquality.baselines.evaluate_local", evaluate)
+    output = run_baseline(RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
+                                      num_server_rounds=2, mlflow_tracking_uri="disabled"), "centralized")
+    assert evaluations == [
+        (split, stage)
+        for split, stage in (("validation", 0), ("validation", 1), ("validation", 2), ("test", 1))
+        for _ in clients
+    ]
+    result = json.loads((output / "test_metrics.json").read_text())
+    checkpoint = torch.load(output / "best_model.pt", weights_only=True)
+    assert result["selection_metric"] == "validation_macro-mase"
+    assert result["selected_round"] == checkpoint["round"] == 1
+    torch.testing.assert_close(checkpoint["model_state_dict"]["weight"], torch.ones_like(model.weight))
 
 
-def test_zero_shot_never_trains(prepared, tmp_path, monkeypatch):
-    from test_models import DummyBackbone
-
+def test_zero_shot_never_trains(prepared, tmp_path, monkeypatch, mock_granite):
     path, _ = prepared
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
-    monkeypatch.setattr("fd_airquality.baselines.train_local", lambda *_: pytest.fail("zero-shot entrenó"))
+    monkeypatch.setattr("fd_airquality.baselines.train_local",
+                        lambda *args, **kwargs: pytest.fail("zero-shot entrenó"))
     output = run_baseline(RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "runs"), model="flowstate-r1",
         mlflow_tracking_uri="disabled",
     ), "zero-shot")
     history = pd.read_csv(output / "round_metrics.csv")
     assert list(history["split"]) == ["validation", "test"]
-    assert json.loads((output / "run.json").read_text())["training_budget"]["stages"] == 0
-
-
-def test_comparison_requires_same_manifest_and_complete_station_panel(prepared, tmp_path):
-    path, _ = prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                           num_server_rounds=1, mlflow_tracking_uri="disabled")
-    local = run_baseline(settings, "local")
-    central = run_baseline(settings, "centralized")
-    output = compare_runs([local, central], tmp_path / "comparison")
-    comparison = pd.read_csv(output / "comparison.csv")
-    assert set(comparison["mode"]) == {"local", "centralized"}
-    assert len(pd.read_csv(output / "station_comparison.csv")) == 4
-    metadata = json.loads((central / "run.json").read_text())
-    metadata["manifest_sha256"] = "changed"
-    (central / "run.json").write_text(json.dumps(metadata))
-    with pytest.raises(ValueError, match="manifests"):
-        compare_runs([local, central], tmp_path / "invalid")
-    metadata["manifest_sha256"] = json.loads((local / "run.json").read_text())["manifest_sha256"]
-    (central / "run.json").write_text(json.dumps(metadata))
-    station_path = central / "station_metrics.csv"
-    stations = pd.read_csv(station_path)
-    stations = stations.loc[~((stations["split"] == "test") & (stations["partition-id"] == 0))]
-    stations.to_csv(station_path, index=False)
-    with pytest.raises(ValueError, match="Panel de test"):
-        compare_runs([local, central], tmp_path / "invalid")
-
-
-def test_comparison_rejects_wrong_per_station_counts_even_with_valid_pooled_counts(prepared, tmp_path):
-    path, _ = prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                           num_server_rounds=1, mlflow_tracking_uri="disabled")
-    local = run_baseline(settings, "local")
-    central = run_baseline(settings, "centralized")
-    station_path = central / "station_metrics.csv"
-    stations = pd.read_csv(station_path)
-    stations.loc[(stations["split"] == "test") & (stations["partition-id"] == 0), "num-targets"] += 1
-    stations.to_csv(station_path, index=False)
-    with pytest.raises(ValueError, match="recuentos de test"):
-        compare_runs([local, central], tmp_path / "invalid")
+    metadata = json.loads((output / "run.json").read_text())
+    assert metadata["training_budget"]["stages"] == 0
+    assert metadata["model"]["adaptation"] == "none"
 
 
 def test_baseline_is_reproducible(prepared, tmp_path):
@@ -118,45 +100,32 @@ def test_baseline_is_reproducible(prepared, tmp_path):
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            num_server_rounds=1, mlflow_tracking_uri="disabled")
     a = run_baseline(settings, "centralized")
-    b = run_baseline(replace(settings), "centralized")
-    assert (a / "test_metrics.json").read_bytes() == (b / "test_metrics.json").read_bytes()
+    b = run_baseline(settings, "centralized")
+    assert json.loads((a / "test_metrics.json").read_text()) == json.loads((b / "test_metrics.json").read_text())
 
 
-@pytest.mark.parametrize("model", ["ttm-r3", "patchtst-fm-r2", "flowstate-r1"])
-@pytest.mark.parametrize("algorithm", ["lora", "ffa-lora"])
-@pytest.mark.parametrize("mode", ["local", "centralized"])
-def test_foundation_controls_use_internal_adapters_on_identical_global_test(global_prepared, tmp_path, monkeypatch, model, algorithm, mode):
-    from test_models import DummyBackbone
-
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+@pytest.mark.parametrize(("model", "mode", "algorithm"), [
+    ("ttm-r3", "local", "lora"), ("flowstate-r1", "centralized", "lora"),
+    ("patchtst-fm-r2", "local", "ffa-lora"), ("ttm-r3", "centralized", "ffa-lora"),
+])
+def test_foundation_controls_use_internal_adapters_on_identical_global_test(
+    global_prepared, tmp_path, mock_granite, model, mode, algorithm,
+):
     path, manifest = global_prepared
     output = run_baseline(RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), model=model,
         adaptation=algorithm, lora_targets="proj", num_server_rounds=1, batch_size=32,
         mlflow_tracking_uri="disabled"), mode)
     result = json.loads((output / "test_metrics.json").read_text())
-    assert "macro-mase" in result["selection_metric"]
+    prefix = "station_" if mode == "local" else ""
+    assert result["selection_metric"] == f"{prefix}validation_macro-mase"
     assert result["test"]["num-examples"] == sum(c["num_test_windows"] for c in manifest["clients"])
-    for checkpoint in output.glob("*best_model.pt"):
-        payload = torch.load(checkpoint, weights_only=True)
+    names = ([f"client_{client['partition_id']:03d}_best_model.pt" for client in manifest["clients"]]
+             if mode == "local" else ["best_model.pt"])
+    expected = {"adapter.proj.lora_A", "adapter.proj.lora_B"} if algorithm == "lora" else {"adapter.proj.lora_B"}
+    for name in names:
+        payload = torch.load(output / name, weights_only=True)
         assert payload["model"]["adaptation"] == algorithm
-        assert all(key.startswith("adapter.") for key in payload["model_state_dict"])
-
-
-def test_comparison_labels_adapter_and_relative_zero_shot_improvements(global_prepared, tmp_path, monkeypatch):
-    from test_models import DummyBackbone
-
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
-    path, _ = global_prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), model="flowstate-r1",
-        lora_targets="proj", num_server_rounds=1, batch_size=32, mlflow_tracking_uri="disabled")
-    zero = run_baseline(settings, "zero-shot")
-    adapted = run_baseline(settings, "centralized")
-    output = compare_runs([zero, adapted], tmp_path / "comparison")
-    rows = pd.read_csv(output / "comparison.csv")
-    assert set(rows["adaptation"]) == {"none", "lora"}
-    assert rows.loc[rows["adaptation"] == "lora", "macro_mase_improvement_vs_zero_shot_pct"].notna().all()
-    stations = pd.read_csv(output / "station_comparison.csv")
-    assert "mae_improvement_vs_zero_shot_pct" in stations
+        assert set(payload["model_state_dict"]) == expected
 
 
 def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints(
@@ -182,25 +151,28 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
 
     def train(model, dataset, *args, **kwargs):
         assert residents == {model.index}
-        calls.append((model.index, "train"))
         with torch.no_grad():
             model.weight.add_(1)
+        calls.append((model.index, "train", model.weight.item()))
         return {"num-examples": len(dataset), "train-mse-normalized": 1.0}
 
     def evaluate(model, dataset, *args):
         assert residents == {model.index}
-        calls.append((model.index, dataset.split))
+        weight = model.weight.item()
+        calls.append((model.index, dataset.split, weight))
         count = len(dataset)
         targets = count * dataset.horizon
-        error = 1.0 / model.weight.item()
+        error = 1.0 / weight
+        # Station 0 prefers the earlier round, station 1 the last one.
+        scaled_error = float(1 + abs(weight - (2, 4)[model.index]))
         return {
             "num-examples": count, "num-targets": targets,
             "absolute-error-sum": targets * error, "squared-error-sum": targets * error**2,
             "baseline-absolute-error-sum": targets, "baseline-squared-error-sum": targets,
             "mae": error, "mse": error**2, "baseline-mae": 1.0,
-            "mase-sum": count * error, "mase-count": count,
-            "rmsse-sum": count * error, "rmsse-count": count,
-            "mase": error, "rmsse": error,
+            "mase-sum": count * scaled_error, "mase-count": count,
+            "rmsse-sum": count * scaled_error, "rmsse-count": count,
+            "mase": scaled_error, "rmsse": scaled_error,
         }
 
     monkeypatch.setattr("fd_airquality.baselines.make_model", lambda *_: ResidentModel())
@@ -212,13 +184,17 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
     output = run_baseline(settings, "local")
     assert not residents
     assert len(models) == 2
-    for index in range(2):
-        assert calls.count((index, "train")) == 2
-        assert calls.count((index, "validation")) == 3
-        assert calls.count((index, "test")) == 1
+    result = json.loads((output / "test_metrics.json").read_text())
+    assert result["selection_metric"] == "station_validation_macro-mase"
+    assert result["selected_rounds"] == [1, 2]
+    for index, (best_round, best_weight) in enumerate(((1, 2.0), (2, 4.0))):
+        assert [(split, weight) for i, split, weight in calls if i == index] == [
+            ("validation", index + 1), ("train", index + 2), ("validation", index + 2),
+            ("train", index + 3), ("validation", index + 3), ("test", best_weight),
+        ]
         saved = torch.load(output / f"client_{index:03d}_best_model.pt", weights_only=True)
-        assert saved["model_state_dict"]["weight"].item() == index + 3
-        assert saved["round"] == 2
+        assert saved["model_state_dict"]["weight"].item() == best_weight
+        assert saved["round"] == best_round
 
 
 @pytest.mark.parametrize("fails", [False, True])

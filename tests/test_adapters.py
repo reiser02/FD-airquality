@@ -145,12 +145,9 @@ def test_adapter_aggregation_rejects_invalid_updates(kind):
 
 
 @pytest.mark.parametrize("algorithm", ["lora", "ffa-lora", "flora", "lora-fair"])
-def test_models_restore_internal_adapters_and_never_mutate_cached_backbone(algorithm, monkeypatch):
-    from test_models import DummyBackbone
-
-    template = DummyBackbone()
+def test_models_restore_internal_adapters_and_never_mutate_cached_backbone(algorithm, mock_granite):
+    template = mock_granite
     pristine = copy.deepcopy(template.state_dict())
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: template)
     config = settings(algorithm, lora_targets="proj", fair_iterations=5)
     geometry = {"context": 90, "horizon": 12}
     server = make_model(geometry, config, pretrained=False)
@@ -179,19 +176,12 @@ def test_models_restore_internal_adapters_and_never_mutate_cached_backbone(algor
         torch.testing.assert_close(template.state_dict()[key], value, rtol=0, atol=0)
 
 
-def test_unknown_or_empty_target_selection_fails_without_silent_fallback(monkeypatch):
-    from test_models import DummyBackbone
-
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+def test_unknown_or_empty_target_selection_fails_without_silent_fallback(mock_granite):
     with pytest.raises(ValueError, match="capas|target"):
         make_model({"context": 90, "horizon": 12}, settings("lora", lora_targets="absent"))
 
 
-def test_clients_share_only_immutable_storage_not_parameter_or_module_objects(monkeypatch):
-    from test_models import DummyBackbone
-
-    template = DummyBackbone()
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: template)
+def test_clients_share_only_immutable_storage_not_parameter_or_module_objects(mock_granite):
     first = make_model({"context": 90, "horizon": 12}, settings("lora", lora_targets="proj"))
     second = make_model({"context": 90, "horizon": 12}, settings("lora", lora_targets="proj"))
     assert first.backbone is not second.backbone
@@ -199,4 +189,4 @@ def test_clients_share_only_immutable_storage_not_parameter_or_module_objects(mo
     assert first.backbone.proj.base.weight.data_ptr() == second.backbone.proj.base.weight.data_ptr()
     assert first.factors["0"].A.data_ptr() != second.factors["0"].A.data_ptr()
     first.to(dtype=torch.float64)
-    assert second.backbone.proj.base.weight.dtype == template.proj.weight.dtype == torch.float32
+    assert second.backbone.proj.base.weight.dtype == mock_granite.proj.weight.dtype == torch.float32

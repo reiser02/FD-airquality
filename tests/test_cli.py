@@ -70,10 +70,9 @@ def test_benchmark_validates_all_contexts_before_starting_any_run(prepared, tmp_
     assert not (tmp_path / "runs").exists()
 
 
-def test_benchmark_validates_adapter_ranks_before_training_classics(global_prepared, tmp_path, monkeypatch):
-    from test_models import DummyBackbone
-
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+def test_benchmark_validates_adapter_ranks_before_training_classics(
+    global_prepared, tmp_path, monkeypatch, mock_granite,
+):
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *_: pytest.fail("No debe entrenar"))
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
     path, _ = global_prepared

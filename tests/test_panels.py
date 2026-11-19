@@ -76,42 +76,36 @@ def test_effective_panel_is_deterministic_and_preserves_report_when_reused(selec
         prepare_runtime_panel(RunSettings(manifest=a.manifest, selection_metric="mae"), tmp_path / "other")
 
 
-@pytest.mark.parametrize("mode", ["local", "centralized", "zero-shot"])
-def test_all_baselines_use_the_same_runtime_panel(selection_prepared, tmp_path, monkeypatch, mode):
-    from test_models import DummyBackbone
-
+def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_unfiltered_runs(
+    selection_prepared, tmp_path, mock_granite,
+):
     path, _ = selection_prepared
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                           model="flowstate-r1" if mode == "zero-shot" else "mlp",
                            num_server_rounds=1, mlflow_tracking_uri="disabled")
-    output = run_baseline(settings, mode)
-    result = json.loads((output / "test_metrics.json").read_text())
-    assert result["test"]["num-clients"] == 1
-    assert result["test"]["macro-mase-stations"] == 1
-    stations = pd.read_csv(output / "station_metrics.csv")
-    assert set(stations.station) == {"station-b"}
-    assert pd.read_csv(output / "excluded_stations.csv").station.to_list() == ["station-a"]
-
-
-def test_separately_filtered_runs_remain_comparable(selection_prepared, tmp_path):
-    path, _ = selection_prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
-                           mlflow_tracking_uri="disabled")
+    foundation = replace(settings, model="flowstate-r1", lora_targets="proj")
+    original_hash = file_digest(path)
     local = run_baseline(settings, "local")
-    central = run_baseline(settings, "centralized")
-    output = compare_runs([local, central], tmp_path / "comparison")
-    assert len(pd.read_csv(output / "station_comparison.csv")) == 2
+    central = run_baseline(foundation, "centralized")
+    zero = run_baseline(foundation, "zero-shot")
+    for run in (local, central, zero):
+        test = json.loads((run / "test_metrics.json").read_text())["test"]
+        assert test["num-clients"] == test["macro-mase-stations"] == 1
+        metadata = json.loads((run / "run.json").read_text())
+        assert metadata["manifest_sha256"] == file_digest(run / "runtime_manifest.json")
+        assert metadata["manifest_sha256"] != original_hash
+        assert pd.read_csv(run / "excluded_stations.csv").station.tolist() == ["station-a"]
 
-
-def test_comparison_rejects_a_filtered_panel_against_the_unfiltered_panel(selection_prepared, tmp_path):
-    path, _ = selection_prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
-                           mlflow_tracking_uri="disabled")
-    filtered = run_baseline(settings, "local")
-    unfiltered = run_baseline(replace(settings, selection_metric="mae"), "local")
+    output = compare_runs([local, central, zero], tmp_path / "comparison")
+    comparison = pd.read_csv(output / "station_comparison.csv")
+    assert sorted(zip(comparison["mode"], comparison["station"], strict=True)) == [
+        ("centralized", "station-b"), ("local", "station-b"), ("zero-shot", "station-b"),
+    ]
+    assert comparison.loc[comparison["mode"] == "centralized",
+                          "mae_improvement_vs_zero_shot_pct"].notna().item()
+    unfiltered = run_baseline(replace(foundation, selection_metric="mae"), "zero-shot")
+    assert json.loads((unfiltered / "run.json").read_text())["manifest_sha256"] == original_hash
     with pytest.raises(ValueError, match="manifests/paneles"):
-        compare_runs([filtered, unfiltered], tmp_path / "invalid")
+        compare_runs([central, unfiltered], tmp_path / "invalid")
 
 
 def test_flower_launcher_uses_retained_station_count_and_saves_audit(selection_prepared, tmp_path, monkeypatch, capsys):

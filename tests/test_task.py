@@ -87,16 +87,21 @@ def test_baseline_completes_on_cpu_and_records_effective_device_after_cuda_failu
     assert (output / "test_metrics.json").is_file()
 
 
-@pytest.mark.parametrize("mode", ["local", "federated", "centralized", "zero-shot"])
-@pytest.mark.parametrize("coverage", [[True, False], [False, False], [True, True]])
-def test_effective_panel_requires_defined_selection_in_every_mode(mode, coverage):
-    manifest = {"schema_version": 4, "clients": [{"validation_mase_defined": value} for value in coverage]}
-    if not all(coverage):
-        with pytest.raises(ValueError, match="descartar estas estaciones"):
-            validate_selection_coverage(manifest, RunSettings(), mode)
+@pytest.mark.parametrize(("metric", "mase_defined", "rmsse_defined", "allowed"), [
+    ("macro-mase", False, True, False), ("macro-rmsse", False, True, True),
+    ("macro-rmsse", True, False, False), ("mae", False, False, True),
+])
+def test_effective_panel_checks_only_the_selected_metric(metric, mase_defined, rmsse_defined, allowed):
+    manifest = {"schema_version": 4, "clients": [
+        {"validation_mase_defined": True, "validation_rmsse_defined": True},
+        {"validation_mase_defined": mase_defined, "validation_rmsse_defined": rmsse_defined},
+    ]}
+    settings = RunSettings(selection_metric=metric)
+    if allowed:
+        validate_selection_coverage(manifest, settings, "local")
     else:
-        validate_selection_coverage(manifest, RunSettings(), mode)
-    validate_selection_coverage(manifest, RunSettings(selection_metric="mae"), mode)
+        with pytest.raises(ValueError, match=rf"{metric} indefinida en 1/2 estaciones"):
+            validate_selection_coverage(manifest, settings, "local")
 
 
 @pytest.mark.parametrize("model,device,batch,expected", [

@@ -371,6 +371,8 @@ fuerza el modo determinista de PyTorch; `--deterministic 1` permite activarlo
 explícitamente. Se conservan las semillas del experimento.
 
 Para medir los casos más lentos: `uv run pytest -q --durations=20`.
+Consulta [la revisión de la suite](TEST_REVIEW.md) para ver qué casos se
+consolidaron y los tiempos medidos.
 
 Validación histórica, anterior a la migración a NeuralForecast (03-11-2026):
 **374 pruebas aprobadas**, incluidas

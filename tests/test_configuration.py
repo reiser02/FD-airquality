@@ -138,23 +138,44 @@ def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypat
     assert (args.models, args.seeds) == (["nlinear"], [42])
 
 
-@pytest.mark.parametrize("text", [
-    '[unknown]\nseed = 1', '[run]\nsead = 1', '[run]\nworkers = 1',
-    '[simulate]\nworkers = 2', '[simulate]\nclient-gpus = 1.0',
-    '[benchmark]\nworkers = 2', '[benchmark]\nclient-gpus = 1.0',
-    '[run]\nbatch-size = "32"', '[run]\nseed = true', '[run]\nbatch-size = 1.5',
-    '[benchmark]\nmodels = "mlp"', '[benchmark]\nmodels = ["unknown"]',
-    '[benchmark]\nseeds = []', '[simulate]\nprint-command = 1',
-    '[run]\nlearning-rate = true', '[prepare]\nraw-root = 1',
-    '[run]\nlora-rank = 4\nlora_rank = 8', 'run = 1', '[run',
+@pytest.mark.parametrize("text, diagnostic", [
+    ('[unknown]\nseed = 1', r"Secciones desconocidas .*unknown"),
+    ('[run]\nsead = 1', r"Opción desconocida .*\[run\]\.sead"),
+    ('[run]\nworkers = 1', r"Opción desconocida .*\[run\]\.workers"),
+    ('[simulate]\nworkers = 2', r"Opción desconocida .*\[simulate\]\.workers"),
+    ('[simulate]\nclient-gpus = 1.0', r"Opción desconocida .*\[simulate\]\.client-gpus"),
+    ('[benchmark]\nworkers = 2', r"Opción desconocida .*\[benchmark\]\.workers"),
+    ('[benchmark]\nclient-gpus = 1.0', r"Opción desconocida .*\[benchmark\]\.client-gpus"),
+    ('[run]\nbatch-size = "32"', r"\[run\]\.batch-size: tipo inválido"),
+    ('[run]\nseed = true', r"\[run\]\.seed: tipo inválido"),
+    ('[run]\nbatch-size = 1.5', r"\[run\]\.batch-size: tipo inválido"),
+    ('[benchmark]\nmodels = "mlp"', r"\[benchmark\]\.models: se requiere una lista"),
+    ('[benchmark]\nmodels = ["unknown"]', r"\[benchmark\]\.models: 'unknown' no está entre"),
+    ('[benchmark]\nseeds = []', r"\[benchmark\]\.seeds: se requiere una lista no vacía"),
+    ('[simulate]\nprint-command = 1', r"\[simulate\]\.print-command: tipo inválido"),
+    ('[run]\nlearning-rate = true', r"\[run\]\.learning-rate: tipo inválido"),
+    ('[prepare]\nraw-root = 1', r"\[prepare\]\.raw-root: tipo inválido"),
+    ('[run]\nlora-rank = 4\nlora_rank = 8', r"Opción duplicada .*\[run\]\.lora_rank"),
+    ('run = 1', r"\[run\] debe ser una tabla TOML"),
+    ('[run', "TOML inválido"),
 ])
-def test_invalid_file_fails_with_clear_error(tmp_path, monkeypatch, capsys, text):
-    monkeypatch.chdir(tmp_path)
-    (tmp_path / "fd-airquality.toml").write_text(text)
+def test_invalid_toml_is_rejected_with_specific_diagnostic(tmp_path, text, diagnostic):
+    config = tmp_path / "invalid.toml"
+    config.write_text(text)
+    with pytest.raises(ValueError, match=diagnostic):
+        arguments(["simulate", "--config", str(config)])
+
+
+def test_main_reports_configuration_error_before_resolving_manifest(tmp_path, monkeypatch, capsys):
+    (tmp_path / "fd-airquality.toml").write_text("[run]\nsead = 1")
+    monkeypatch.setattr("fd_airquality.cli.resolve_manifest",
+                        lambda *args, **kwargs: pytest.fail("El TOML inválido debe abortar antes del manifest"))
     with pytest.raises(SystemExit) as exc:
         main(["simulate", "--print-command"])
     assert exc.value.code == 2
-    assert "Error:" in capsys.readouterr().err
+    error = capsys.readouterr().err
+    assert error.startswith("Error: Opción desconocida")
+    assert "[run].sead" in error
 
 
 def test_missing_explicit_file_is_not_silently_ignored(tmp_path, monkeypatch):
@@ -183,20 +204,23 @@ def test_compare_runs_can_come_from_file_or_cli(tmp_path, monkeypatch):
     assert arguments(["compare", "c", "d"]).runs == [Path("c"), Path("d")]
 
 
-def test_main_passes_merged_configuration_to_the_launcher(prepared, tmp_path, monkeypatch):
-    path, _ = prepared
+def test_main_passes_merged_configuration_to_the_launcher(tmp_path, monkeypatch):
+    path = tmp_path / "manifest.json"
+    path.write_text('{"pollutant": "PM25"}')  # Only manifest resolution is real.
     config = tmp_path / "experiment.toml"
     config.write_text('[run]\nseed = 17\nnum-server-rounds = 9\n'
                       '[simulate]\nprint-command = true\n')
     received = []
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *args: received.append(args))
     main(["simulate", "--config", str(config), "--manifest", str(path), "--num-server-rounds", "1"])
-    settings, dry_run = received[0]
+    (settings, dry_run), = received
     assert (settings.seed, settings.num_server_rounds, settings.manifest) == (17, 1, str(path))
     assert dry_run is True
 
 
 def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "prepared"
     config = tmp_path / "experiment.toml"
     config.write_text('[prepare]\ncontext = 16\nhorizon = 4\nstation = ["old"]\n'
                       'raw-root = "raw"\npollutant = "PM25"\n')
@@ -208,10 +232,10 @@ def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monk
 
     monkeypatch.setattr("fd_airquality.cli.prepare", prepare)
     monkeypatch.setattr("fd_airquality.cli._inspect", lambda *_: None)
-    main(["prepare", "--config", str(config), "--station", "new", "--stride", "2"])
-    raw_root, _, pollutant, geometry, stations = received[0]
+    main(["prepare", "--config", str(config), "--station", "new", "--stride", "2", "--output", str(output)])
+    (raw_root, prepared_output, pollutant, geometry, stations), = received
     assert (geometry.context, geometry.horizon, geometry.stride) == (16, 4, 2)
-    assert (raw_root, pollutant, stations) == (Path("raw").resolve(), "PM25", {"new"})
+    assert (raw_root, prepared_output, pollutant, stations) == (tmp_path / "raw", output, "PM25", {"new"})
 
 
 def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_path, monkeypatch):
@@ -219,8 +243,8 @@ def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_pat
     (tmp_path / "fd-airquality.toml").write_text(
         '[run]\nheartbeat-seconds = 15\nlog-level = "DEBUG"\n'
         '[benchmark]\nmax-parallel-models = 2\n'
-        'modes = ["local", "centralized", "federated", "zero-shot"]\n'
+        'modes = ["centralized", "local", "zero-shot", "federated"]\n'
     )
     args = arguments(["benchmark", "--max-parallel-models", "1", "--heartbeat-seconds", "30"])
     assert (args.max_parallel_models, args.heartbeat_seconds, args.log_level) == (1, 30.0, "DEBUG")
-    assert args.modes == ["local", "centralized", "federated", "zero-shot"]
+    assert args.modes == ["centralized", "local", "zero-shot", "federated"]

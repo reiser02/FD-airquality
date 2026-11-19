@@ -255,7 +255,8 @@ cliente no gana peso por ejecutar más épocas o completar un lote corto.
 ## Verificación del presupuesto por época
 
 En la revisión que introdujo esta cuota, **689 pruebas aprobadas, sin
-omisiones**, incluidos los checkpoints reales.
+omisiones**, incluidos los checkpoints reales. La
+[revisión de la suite](TEST_REVIEW.md) posterior consolidó casos redundantes.
 La integración completó **48 ejecuciones acotadas en CPU** en los modos local,
 centralizado y federado, con Flower/Ray en las federaciones. Se reprodujeron los
 sorteos con sus semillas y se verificaron el soporte observado, los límites de

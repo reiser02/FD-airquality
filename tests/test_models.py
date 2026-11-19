@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 import torch
 from torch import nn
@@ -47,29 +45,8 @@ def test_autoencoder_reconstruction_uses_context_only(prepared):
     assert model.encoder[-1].out_features == 3
 
 
-class DummyBackbone(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.frozen = nn.Parameter(torch.ones(1), requires_grad=False)
-        self.proj = nn.Linear(8, 8, bias=False)
-        nn.init.eye_(self.proj.weight)
-        self.calls = []
-        self.config = SimpleNamespace(context_length=90, prediction_length=30, decoder_patch_len=24,
-                                      quantile_levels=[.1, .5, .9])
-
-    def forward(self, past_values, **kwargs):
-        self.calls.append(kwargs)
-        horizon = kwargs.get("prediction_length", 30)
-        value = self.proj(past_values[:, -1:, :].repeat(1, 1, 8)).mean(dim=-1, keepdim=True)
-        prediction = value.repeat(1, horizon, 1)
-        quantiles = torch.stack([prediction - 1, prediction, prediction + 1], dim=1)
-        return SimpleNamespace(prediction_outputs=prediction.detach(), quantile_outputs=quantiles) if kwargs.get("prediction_type") is None and "prediction_length" in kwargs else SimpleNamespace(prediction_outputs=prediction, quantile_outputs=quantiles)
-
-
 @pytest.mark.parametrize("name", list(GRANITE))
-def test_granite_exchanges_only_adapter_and_never_trains_backbone(name, monkeypatch):
-    backbone = DummyBackbone()
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: backbone)
+def test_granite_exchanges_only_adapter_and_never_trains_backbone(name, mock_granite):
     settings = RunSettings(model=name, hidden_size=4, lora_targets="proj")
     context = 90
     configure_torch(settings, 7)
@@ -93,17 +70,19 @@ def test_granite_exchanges_only_adapter_and_never_trains_backbone(name, monkeypa
         assert client.backbone.calls[0]["scale_factor"] == 1.0
 
 
-def test_granite_does_not_change_initialization_when_loading_weights(monkeypatch):
+def test_granite_does_not_change_initialization_when_loading_weights(monkeypatch, granite_template):
     def load(*_):
         torch.randn(100)
-        return DummyBackbone()
+        return granite_template
 
     monkeypatch.setattr("fd_airquality.models._load_granite", load)
     settings = RunSettings(model="flowstate-r1", lora_targets="proj")
     configure_torch(settings, 7)
     server = make_model({"context": 72, "horizon": 12}, settings, pretrained=False)
     configure_torch(settings, 7)
+    rng_state = torch.get_rng_state()
     client = make_model({"context": 72, "horizon": 12}, settings)
+    assert torch.equal(torch.get_rng_state(), rng_state)
     for key in shared_state(server):
         torch.testing.assert_close(shared_state(server)[key], shared_state(client)[key], rtol=0, atol=0)
 
@@ -134,13 +113,12 @@ def test_flowstate_does_not_silently_shorten_scaled_context():
         validate_model_geometry({"context": 2048, "horizon": 48}, RunSettings(model="flowstate-r1"))
 
 
-def test_alternative_patchtst_revision_cannot_silently_crop_context(monkeypatch):
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+def test_alternative_patchtst_revision_cannot_silently_crop_context(mock_granite):
     with pytest.raises(ValueError, match="recortaría"):
         make_model({"context": 1024, "horizon": 12}, RunSettings(model="patchtst-fm-r2"))
 
 
-def test_ttm_uses_decomposed_r3_class_and_rejects_partial_checkpoint(monkeypatch):
+def test_ttm_uses_decomposed_r3_class_and_rejects_partial_checkpoint(monkeypatch, granite_template):
     import tsfm_public
 
     from fd_airquality.models import _load_granite
@@ -151,7 +129,7 @@ def test_ttm_uses_decomposed_r3_class_and_rejects_partial_checkpoint(monkeypatch
         @classmethod
         def from_pretrained(cls, identifier, **kwargs):
             called.append((identifier, kwargs))
-            return DummyBackbone(), {"missing_keys": ["trend_forecaster.weight"]}
+            return granite_template, {"missing_keys": ["trend_forecaster.weight"]}
 
     monkeypatch.setattr(tsfm_public, "TinyTimeMixerForDecomposedPrediction", Loader)
     _load_granite.cache_clear()
@@ -225,7 +203,7 @@ def test_patchtst_fp32_fallback_overrides_outer_autocast_without_cutting_gradien
     assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
 
 
-def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(monkeypatch):
+def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(monkeypatch, granite_template):
     import tsfm_public
     from tsfm_public.models.patchtst_fm import modeling_patchtst_fm
 
@@ -238,7 +216,7 @@ def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(m
         def from_pretrained(cls, identifier, **kwargs):
             assert modeling_patchtst_fm.get_autocast_context is _patchtst_autocast_context
             called.append((identifier, kwargs))
-            return DummyBackbone(), {}
+            return granite_template, {}
 
     monkeypatch.setattr(tsfm_public, "PatchTSTFMForPrediction", Loader)
     # Restore the upstream module's helper after the loader assigns it.

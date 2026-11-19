@@ -5,13 +5,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from flwr.supercore.task_identity import TaskIdentity
-from test_backtesting import temporal_family  # noqa: F401
-from test_federation import LocalTestGrid
 
 from fd_airquality.backtesting import prepare_backtest, run_backtest
-from fd_airquality.data import read_manifest
-from fd_airquality.server_app import run_server
 from fd_airquality.settings import RunSettings
 from fd_airquality.temporal_results import select_configuration, summarize_cv
 
@@ -49,7 +44,7 @@ def test_seed_is_not_selected_as_a_hyperparameter():
 
 @pytest.mark.parametrize("folds", [1, 3])
 def test_default_evaluation_uses_all_folds_without_selecting_configuration(
-    temporal_family, tmp_path, monkeypatch, folds,  # noqa: F811
+    temporal_family, tmp_path, monkeypatch, folds,
 ):
     raw, geometry = temporal_family
     family = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=folds, step_hours=48)
@@ -70,20 +65,17 @@ def test_default_evaluation_uses_all_folds_without_selecting_configuration(
     assert means["num-folds"].eq(folds).all()
     assert len(means) == 2
     # A later tuning workflow must not relabel already evaluated dates as sealed.
-    assert (family.parent / "holdout_access.json").is_file()
+    access = json.loads((family.parent / "holdout_access.json").read_text())
+    assert access["stage"] == "evaluation"
 
 
 @pytest.mark.parametrize("mode", ["local", "centralized", "federated"])
 def test_development_does_not_score_holdout_and_final_uses_only_frozen_selection(
-    temporal_family, tmp_path, mode, monkeypatch,  # noqa: F811
+    temporal_family, tmp_path, mode, in_process_federation,
 ):
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry,
                             folds=3, step_hours=48)
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda settings, dry_run=False:
-                        run_server(LocalTestGrid(settings, len(read_manifest(settings.manifest)["clients"])), settings))
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            num_server_rounds=2, hidden_size=8, batch_size=8,
                            probabilistic=1, mlflow_tracking_uri="disabled")
@@ -119,7 +111,7 @@ def test_development_does_not_score_holdout_and_final_uses_only_frozen_selection
         run_backtest(settings, ["mlp"], ["local"], stage="final", selection=selection)
 
 
-def test_final_stage_requires_selection_before_any_training(temporal_family, tmp_path):  # noqa: F811
+def test_final_stage_requires_selection_before_any_training(temporal_family, tmp_path):
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, step_hours=48)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"))

@@ -66,8 +66,34 @@ def test_zero_shot_reference_matches_inference_scale_without_filtering_other_pai
     adapted = completed_run("adapted", model="flowstate-r1", adaptation="lora", scale=2., score=1.)
     output = compare_runs([zero1, zero2, adapted], tmp_path / "comparison")
     rows = pd.read_csv(output / "comparison.csv")
+    assert set(rows["adaptation"]) == {"lora", "none"}
     assert rows.loc[rows.adaptation == "lora", "macro_mase_improvement_vs_zero_shot_pct"].item() == 50.
+    stations = pd.read_csv(output / "station_comparison.csv")
+    assert stations.loc[stations.adaptation == "lora", "mae_improvement_vs_zero_shot_pct"].tolist() == [50., 50.]
     assert len(pd.read_csv(output / "pairwise_comparison.csv")) == 3 * 2 * 4
+
+
+def test_comparison_requires_a_complete_station_panel(completed_run, tmp_path):
+    local = completed_run("local", mode="local")
+    central = completed_run("central")
+    path = central / "station_metrics.csv"
+    stations = pd.read_csv(path)
+    stations.loc[stations["partition-id"] != 0].to_csv(path, index=False)
+    with pytest.raises(ValueError, match="Panel de test"):
+        compare_runs([local, central], tmp_path / "invalid")
+
+
+def test_comparison_rejects_wrong_per_station_counts_even_with_valid_pooled_counts(completed_run, tmp_path):
+    local = completed_run("local", mode="local")
+    central = completed_run("central")
+    path = central / "station_metrics.csv"
+    stations = pd.read_csv(path)
+    # Move a target between stations without changing their total.
+    stations.loc[stations["partition-id"] == 0, "num-targets"] += 1
+    stations.loc[stations["partition-id"] == 1, "num-targets"] -= 1
+    stations.to_csv(path, index=False)
+    with pytest.raises(ValueError, match="recuentos de test"):
+        compare_runs([local, central], tmp_path / "invalid")
 
 
 def test_mismatched_zero_shot_scale_only_disables_attribution_not_comparison(completed_run, tmp_path):

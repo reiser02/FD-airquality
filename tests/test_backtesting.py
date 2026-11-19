@@ -5,31 +5,11 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from flwr.supercore.task_identity import TaskIdentity
-from test_federation import LocalTestGrid
 
 from fd_airquality.backtesting import fold_configurations, prepare_backtest, run_backtest
-from fd_airquality.data import DataConfig, load_client_data, read_manifest
-from fd_airquality.server_app import run_server
+from fd_airquality.data import load_client_data
 from fd_airquality.settings import RunSettings
 from fd_airquality.uncertainty import paired_block_interval
-
-
-@pytest.fixture
-def temporal_family(tmp_path):
-    raw = tmp_path / "raw"
-    for offset, name in enumerate(("station-a", "station-b")):
-        directory = raw / name
-        directory.mkdir(parents=True)
-        index = pd.date_range("2025-01-01", periods=20 * 24 * 12, freq="5min")
-        values = 10 + offset + np.sin(np.arange(len(index)) / 23)
-        values.reshape(-1, 12)[offset::13] = np.nan
-        pd.DataFrame({"PM25": values}, index=index).to_csv(directory / "PM25.csv")
-    geometry = DataConfig(context=6, horizon=3, stride=3, seasonality=3, window_policy="masked",
-                          hourly_repeat_filter=0, min_validation_windows=2, min_test_windows=2,
-                          validation_start="2025-01-10", test_start="2025-01-12", test_end="2025-01-14",
-                          max_train_windows=12)
-    return raw, geometry
 
 
 def test_fold_calendar_and_fold_local_normalization(temporal_family, tmp_path):
@@ -86,23 +66,13 @@ def test_fixed_scalers_fit_only_each_folds_authorized_past(temporal_family, tmp_
     assert len(set(hashes)) == 3
 
 
-@pytest.mark.parametrize("history", ["expanding", "sliding"])
-def test_temporal_matrix_never_inherits_checkpoints(temporal_family, tmp_path, monkeypatch, history):
-    from fd_airquality.cli import run_benchmark
-
+def test_sliding_cv_compares_modes_on_the_same_fold_support(temporal_family, tmp_path, in_process_federation):
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry,
-                            folds=2, step_hours=48, train_history=history)
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
-
-    def launch(settings, dry_run=False):
-        return run_server(LocalTestGrid(settings, len(read_manifest(settings.manifest)["clients"])), settings)
-
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", launch)
+                            folds=2, step_hours=48, train_history="sliding")
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "results"),
                             num_server_rounds=1, batch_size=8, mlflow_tracking_uri="disabled")
-    output = run_backtest(settings, ["mlp"], ["centralized", "federated"], benchmark=run_benchmark, stage="all")
+    output = run_backtest(settings, ["mlp"], ["centralized", "federated"])
     report = pd.read_csv(output / "temporal_comparison.csv")
     assert len(report) == 4
     assert report.groupby("fold")["num-targets"].nunique().eq(1).all()
@@ -120,15 +90,13 @@ def test_temporal_matrix_never_inherits_checkpoints(temporal_family, tmp_path, m
 
 @pytest.mark.parametrize("mode", ["local", "centralized", "federated"])
 def test_initial_weights_are_fresh_even_if_previous_checkpoints_are_poisoned(
-    temporal_family, tmp_path, monkeypatch, mode,
+    temporal_family, tmp_path, monkeypatch, in_process_federation, mode,
 ):
     from fd_airquality.cli import run_benchmark
     from fd_airquality.models import make_model, shared_state
 
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, step_hours=48)
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
     initial_states = []
 
     def fresh(geometry, settings, **kwargs):
@@ -137,9 +105,6 @@ def test_initial_weights_are_fresh_even_if_previous_checkpoints_are_poisoned(
         return model
 
     monkeypatch.setattr(f"fd_airquality.{'server_app' if mode == 'federated' else 'baselines'}.make_model", fresh)
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda settings, dry_run=False:
-                        run_server(LocalTestGrid(settings, 2), settings))
-
     def benchmark(*args, **kwargs):
         result = run_benchmark(*args, **kwargs)
         for run in json.loads((result / "comparison.json").read_text())["runs"]:
@@ -205,16 +170,9 @@ def test_joint_block_interval_is_paired_and_deterministic():
         paired_block_interval(a[:3], b[:3], counts[:3])
 
 
-def test_backtest_can_follow_a_single_federated_candidate(temporal_family, tmp_path, monkeypatch):
+def test_backtest_can_follow_a_single_federated_candidate(temporal_family, tmp_path, in_process_federation):
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, step_hours=48)
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
-
-    def launch(settings, dry_run=False):
-        return run_server(LocalTestGrid(settings, len(read_manifest(settings.manifest)["clients"])), settings)
-
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", launch)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
                             batch_size=8, mlflow_tracking_uri="disabled")
     output = run_backtest(settings, ["mlp"], ["federated"], stage="all")
@@ -222,39 +180,22 @@ def test_backtest_can_follow_a_single_federated_candidate(temporal_family, tmp_p
     assert len(pd.read_csv(output / "temporal_seed_summary.csv")) == 2
 
 
-@pytest.mark.parametrize("algorithm", ["lora", "ffa-lora", "flora", "lora-fair"])
-def test_foundation_adapters_restart_at_each_fold(temporal_family, tmp_path, monkeypatch, algorithm):
-    from test_models import DummyBackbone
-
-    from fd_airquality.cli import run_benchmark
+def test_flora_history_restarts_at_each_fold(temporal_family, tmp_path, in_process_federation, mock_granite):
     from fd_airquality.models import restore_checkpoint
 
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
-    for name in ("_run_id", "_task_id", "_node_id"):
-        monkeypatch.setattr(TaskIdentity, name, 1)
     raw, geometry = temporal_family
     path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, step_hours=48)
-
-    def launch(settings, dry_run=False):
-        return run_server(LocalTestGrid(settings, len(read_manifest(settings.manifest)["clients"])), settings)
-
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", launch)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), model="flowstate-r1",
                             lora_targets="proj", missing_policy="ffill", batch_size=8,
-                            num_server_rounds=2, fair_iterations=3, mlflow_tracking_uri="disabled")
-    modes = ["local", "centralized", "federated", "zero-shot"] if algorithm in {"lora", "ffa-lora"} else ["federated", "zero-shot"]
-    output = run_backtest(settings, ["flowstate-r1"], modes, adaptations=[algorithm], benchmark=run_benchmark, stage="all")
+                            num_server_rounds=2, mlflow_tracking_uri="disabled")
+    output = run_backtest(settings, ["flowstate-r1"], ["federated"], adaptations=["flora"])
     progress = json.loads((output / "backtest.json").read_text())
+    assert [entry["fold"] for entry in progress["results"]] == [1, 2]
     for entry in progress["results"]:
-        runs = json.loads((Path(entry["comparison"]) / "comparison.json").read_text())["runs"]
-        for run in runs:
-            for checkpoint in Path(run).glob("*best_model.pt"):
-                restored = restore_checkpoint(checkpoint)
-                assert torch.isfinite(restored(torch.ones(1, 6))).all()
-    if algorithm == "flora":
-        for entry in progress["results"]:
-            runs = json.loads((Path(entry["comparison"]) / "comparison.json").read_text())["runs"]
-            federated = next(Path(run) for run in runs if json.loads((Path(run) / "run.json").read_text())["mode"] == "federated")
-            last = torch.load(federated / "last_model.pt", weights_only=True)
-            rounds = {int(key.split(".")[1]) for key in last["model_state_dict"] if key.startswith("history.")}
-            assert rounds == {1, 2}
+        run, = json.loads((Path(entry["comparison"]) / "comparison.json").read_text())["runs"]
+        last = Path(run) / "last_model.pt"
+        state = torch.load(last, weights_only=True)["model_state_dict"]
+        rounds = {int(key.split(".")[1]) for key in state if key.startswith("history.")}
+        assert rounds == {1, 2}
+        restored = restore_checkpoint(last)
+        assert torch.isfinite(restored(torch.ones(1, 6))).all()

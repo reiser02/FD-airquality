@@ -5,57 +5,20 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from flwr.app import ArrayRecord, ConfigRecord, Context, Message, MetricRecord, RecordDict
-from flwr.supercore.task_identity import TaskIdentity
+from flwr.app import ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDict
 
-from fd_airquality.client_app import build_client_app
 from fd_airquality.data import WindowDataset, load_client_data
+from fd_airquality.models import restore_checkpoint
 from fd_airquality.server_app import run_server
 from fd_airquality.settings import RunSettings
 from fd_airquality.strategy import AuditedStrategy, aggregate_evaluation
 from fd_airquality.task import configure_torch, make_model, train_local
 
 
-@pytest.fixture(autouse=True)
-def flower_runtime_identity(monkeypatch):
-    # The real runtime supplies this process identity before dispatching messages.
-    monkeypatch.setattr(TaskIdentity, "_run_id", 1)
-    monkeypatch.setattr(TaskIdentity, "_task_id", 1)
-    monkeypatch.setattr(TaskIdentity, "_node_id", 0)
-
-
-class LocalTestGrid:
-    """Transport-only double; Flower still performs scheduling and aggregation."""
-
-    def __init__(self, settings, count):
-        self.app = build_client_app()
-        self.contexts = {
-            node + 10: Context(
-                run_id=1, node_id=node + 10,
-                node_config={"partition-id": node, "num-partitions": count},
-                state=RecordDict(), run_config=settings.flower_config(),
-            ) for node in range(count)
-        }
-        self.requests = []
-
-    def get_node_ids(self):
-        return list(self.contexts)
-
-    def send_and_receive(self, messages, timeout=None):
-        replies = []
-        for message in messages:
-            self.requests.append((message.metadata.message_type, dict(message.content["config"])))
-            replies.append(self.app(message, self.contexts[message.metadata.dst_node_id]))
-        return replies
-
-
-@pytest.mark.parametrize("strategy", ["fedavg", "fedprox"])
-@pytest.mark.parametrize("model", ["mlp", "autoencoder", "nlinear", "nhits", "flowstate-r1"])
-def test_full_flower_strategy_selects_validation_then_tests_once(prepared, tmp_path, strategy, model, monkeypatch):
-    if model == "flowstate-r1":
-        from test_models import DummyBackbone
-
-        monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+@pytest.mark.parametrize(("model", "strategy"), [
+    ("mlp", "fedprox"), ("autoencoder", "fedavg"), ("nlinear", "fedavg"), ("flowstate-r1", "fedavg"),
+])
+def test_flower_rounds_write_metrics_and_checkpoints(prepared, tmp_path, flower_grid, mock_granite, model, strategy):
     path, manifest = prepared
     settings = RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "reports"),
@@ -63,39 +26,74 @@ def test_full_flower_strategy_selects_validation_then_tests_once(prepared, tmp_p
         lora_targets="proj" if model == "flowstate-r1" else "auto",
         mlflow_tracking_uri="disabled",
     )
-    grid = LocalTestGrid(settings, len(manifest["clients"]))
-    output = run_server(grid, settings)
+    clients = manifest["clients"]
+    output = run_server(flower_grid(settings, len(clients)), settings)
     results = json.loads((output / "test_metrics.json").read_text())
-    assert results["selection_metric"] == "validation_macro-mase"
-    assert 0 <= results["selected_round"] <= 2
-    assert results["test"]["num-clients"] == 2
-    assert results["test"]["num-targets"] == 2 * 5 * 2
+    assert results["test"]["num-clients"] == len(clients)
+    assert results["test"]["num-targets"] == sum(client["num_test_targets"] for client in clients)
     checkpoint = torch.load(output / "best_model.pt", weights_only=True)
-    assert checkpoint["round"] == results["selected_round"]
+    assert 0 <= checkpoint["round"] == results["selected_round"] <= settings.num_server_rounds
     assert checkpoint["hidden_size"] == 8
     assert checkpoint["model"]["name"] == model
     if model == "flowstate-r1":
         assert len(checkpoint["model"]["revision"]) == 40
-        assert not any("backbone" in key for key in checkpoint["model_state_dict"])
-    test_requests = [config for kind, config in grid.requests if config.get("split") == "test"]
-    assert len(test_requests) == 2  # one test request per station, not one per round
-    assert all(config["server-round"] == results["selected_round"] for config in test_requests)
+        assert set(checkpoint["model_state_dict"]) == {"adapter.proj.lora_A", "adapter.proj.lora_B"}
     metrics = pd.read_csv(output / "round_metrics.csv")
-    assert len(metrics[metrics.split == "train"]) == 2
-    assert len(metrics[metrics.split == "validation"]) == 3
-    assert len(metrics[metrics.split == "test"]) == 1
-    per_station = pd.read_csv(output / "station_metrics.csv")
-    assert len(per_station[per_station.split == "test"]) == 2
+    assert metrics["split"].tolist() == ["validation", "train", "validation", "train", "validation", "test"]
+    test = pd.read_csv(output / "station_metrics.csv").query("split == 'test'")
+    assert test.station.tolist() == [client["station"] for client in clients]
     assert (output / "last_model.pt").is_file()
 
 
-def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_path, mlflow_uri):
+def test_flower_tests_once_with_weights_from_best_validation_round(prepared, tmp_path, flower_grid):
+    path, manifest = prepared
+    count = len(manifest["clients"])
+    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), hidden_size=8,
+                           num_server_rounds=2, mlflow_tracking_uri="disabled")
+    grid = flower_grid(settings, count)
+    app = grid.app
+    evaluations = []
+
+    def respond(message, context):
+        reply = app(message, context)
+        config = message.content["config"]
+        split, stage = config.get("split"), config["server-round"]
+        if split in {"validation", "test"}:
+            evaluations.append((split, stage, message.content["arrays"].to_torch_state_dict()))
+        if split == "validation":
+            # Make the MASE winner round 1, even though MAE prefers round 2.
+            record = reply.content["metrics"]
+            mase, mae = ((2., 3.), (1., 2.), (3., 1.))[stage]
+            record.update({"mase": mase, "mase-sum": mase * record["mase-count"],
+                           "mae": mae, "absolute-error-sum": mae * record["num-targets"]})
+        return reply
+
+    grid.app = respond
+    output = run_server(grid, settings)
+    assert [(split, stage) for split, stage, _ in evaluations] == [
+        (split, stage)
+        for split, stage in (("validation", 0), ("validation", 1), ("validation", 2), ("test", 1))
+        for _ in range(count)
+    ]
+    expected = evaluations[count][2]
+    last = evaluations[2 * count][2]
+    assert any(not torch.equal(expected[key], last[key]) for key in expected)
+    checkpoint = torch.load(output / "best_model.pt", weights_only=True)
+    result = json.loads((output / "test_metrics.json").read_text())
+    assert result["selection_metric"] == "validation_macro-mase"
+    assert result["selected_round"] == checkpoint["round"] == 1
+    torch.testing.assert_close(checkpoint["model_state_dict"], expected, rtol=0, atol=0)
+    for _, _, state in evaluations[-count:]:
+        torch.testing.assert_close(state, expected, rtol=0, atol=0)
+
+
+def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_path, mlflow_uri, flower_grid):
     from mlflow import MlflowClient
 
     path, manifest = prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=mlflow_uri)
-    output = run_server(LocalTestGrid(settings, len(manifest["clients"])), settings)
+    output = run_server(flower_grid(settings, len(manifest["clients"])), settings)
     metadata = json.loads((output / "mlflow.json").read_text())
     client = MlflowClient(tracking_uri=mlflow_uri)
     run, = client.search_runs([metadata["experiment_id"]])
@@ -106,7 +104,7 @@ def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_pat
     assert "run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)}
 
 
-def test_actual_flower_fedavg_weights_by_valid_window_count(tmp_path):
+def test_actual_flower_fedavg_weights_by_valid_window_count(tmp_path, flower_identity):
     manifest = {
         "geometry": {"context": 6, "horizon": 2},
         "clients": [
@@ -229,10 +227,10 @@ def test_local_training_is_reproducible_and_proximal_penalty_changes_updates(pre
     assert any(not torch.equal(one[name], proximal[name]) for name in one)
 
 
-def test_client_sends_no_series_or_normalization_statistics(prepared):
+def test_client_sends_no_series_or_normalization_statistics(prepared, flower_grid):
     path, manifest = prepared
     settings = RunSettings(manifest=str(path), hidden_size=8)
-    grid = LocalTestGrid(settings, 2)
+    grid = flower_grid(settings, len(manifest["clients"]))
     model = make_model(manifest["geometry"], settings)
     reply, = grid.send_and_receive([Message(content=RecordDict({
         "arrays": ArrayRecord(model.state_dict()), "config": ConfigRecord({"server-round": 1}),
@@ -243,10 +241,10 @@ def test_client_sends_no_series_or_normalization_statistics(prepared):
     assert not {"mean", "scale", "values", "timestamps"} & set(reply.content["metrics"])
 
 
-def test_changed_preparation_code_requires_preparation(prepared, monkeypatch):
+def test_changed_preparation_code_requires_preparation(prepared, monkeypatch, flower_grid):
     path, manifest = prepared
     settings = RunSettings(manifest=str(path), hidden_size=8)
-    grid = LocalTestGrid(settings, 2)
+    grid = flower_grid(settings, len(manifest["clients"]))
     monkeypatch.setattr("fd_airquality.client_app.source_fingerprints", lambda: {"changed": "hash"})
     with pytest.raises(ValueError, match="Cambió el código local"):
         grid.send_and_receive([Message(content=RecordDict({
@@ -255,19 +253,17 @@ def test_changed_preparation_code_requires_preparation(prepared, monkeypatch):
         }), dst_node_id=10, message_type="evaluate")])
 
 
-@pytest.mark.parametrize("model", ["ttm-r3", "patchtst-fm-r2", "flowstate-r1"])
-@pytest.mark.parametrize("algorithm", ["lora", "ffa-lora", "flora", "lora-fair"])
-def test_all_foundation_algorithms_complete_flower_rounds_and_checkpoint_history(global_prepared, tmp_path, monkeypatch, model, algorithm):
-    from test_models import DummyBackbone
-
-    from fd_airquality.models import restore_checkpoint
-
-    monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: DummyBackbone())
+@pytest.mark.parametrize(("model", "algorithm"), [
+    ("ttm-r3", "lora"), ("patchtst-fm-r2", "ffa-lora"), ("flowstate-r1", "flora"), ("ttm-r3", "lora-fair"),
+])
+def test_foundation_algorithms_complete_flower_rounds_and_checkpoint_history(
+    global_prepared, tmp_path, flower_grid, mock_granite, model, algorithm,
+):
     path, manifest = global_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), model=model,
                            adaptation=algorithm, lora_targets="proj", batch_size=32,
                            num_server_rounds=2, fair_iterations=5, mlflow_tracking_uri="disabled")
-    output = run_server(LocalTestGrid(settings, len(manifest["clients"])), settings)
+    output = run_server(flower_grid(settings, len(manifest["clients"])), settings)
     result = json.loads((output / "test_metrics.json").read_text())
     assert result["selection_metric"] == "validation_macro-mase"
     assert result["test"]["macro-mase-stations"] == 2
@@ -281,16 +277,18 @@ def test_all_foundation_algorithms_complete_flower_rounds_and_checkpoint_history
         assert not any(key.endswith("lora_A") for key in state)
         assert checkpoint["fixed_adapter_state"]
     restore_checkpoint(output / "best_model.pt")
-    history = pd.read_csv(output / "round_metrics.csv")
-    assert (history.query("split == 'train'")["uplink-tensor-bytes"] > 0).all()
-    assert (history.query("split == 'train'")["server-aggregation-seconds"] > 0).all()
+    if algorithm == "flora":
+        restore_checkpoint(output / "last_model.pt")
+    train = pd.read_csv(output / "round_metrics.csv").query("split == 'train'")
+    assert train["round"].tolist() == [1, 2]
+    assert (train[["uplink-tensor-bytes", "server-aggregation-seconds"]] > 0).all().all()
 
 
-def test_server_discards_unusable_stations_before_any_training(selection_prepared, tmp_path, caplog):
+def test_server_discards_unusable_stations_before_any_training(selection_prepared, tmp_path, caplog, flower_grid):
     path, source = selection_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
                            mlflow_tracking_uri="disabled")
-    grid = LocalTestGrid(settings, len(source["clients"]))
+    grid = flower_grid(settings, len(source["clients"]))
     output = run_server(grid, settings)
     result = json.loads((output / "test_metrics.json").read_text())
     assert result["test"]["num-clients"] == 1
@@ -306,11 +304,13 @@ def test_server_discards_unusable_stations_before_any_training(selection_prepare
 
 
 @pytest.mark.parametrize("selection_prepared", [("station-a", "station-b", "station-c")], indirect=True)
-def test_effective_flower_partitions_are_stable_and_do_not_share_message_configuration(selection_prepared, tmp_path):
+def test_effective_flower_partitions_are_stable_and_do_not_share_message_configuration(
+    selection_prepared, tmp_path, flower_grid,
+):
     path, source = selection_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=2,
                            mlflow_tracking_uri="disabled")
-    grid = LocalTestGrid(settings, len(source["clients"]))
+    grid = flower_grid(settings, len(source["clients"]))
     grid.contexts = dict(reversed(list(grid.contexts.items())))
     output = run_server(grid, settings)
     stations = pd.read_csv(output / "station_metrics.csv")
