@@ -84,31 +84,20 @@ def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: 
 
 
 def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> MetricRecord:
-    """Pool error sums; never average client RMSEs to obtain global RMSE."""
+    """Aggregate scaled errors by target, origin, and station without mixing supports."""
     records = [content["metrics"] for content in contents]
     total = sum(record["num-targets"] for record in records)
     sums = {key: sum(record[key] for record in records) for key in (
-        "absolute-error-sum", "squared-error-sum",
-        "baseline-absolute-error-sum", "baseline-squared-error-sum",
         "mase-sum", "mase-count", "rmsse-sum", "rmsse-count",
     )}
     metrics = {
         "num-clients": len(records),
         "num-examples": sum(record["num-examples"] for record in records),
         "num-targets": total,
-        "mae": sums["absolute-error-sum"] / total,
-        "rmse": math.sqrt(sums["squared-error-sum"] / total),
-        "macro-mae": float(np.mean([record["mae"] for record in records])),
-        "macro-rmse": float(np.mean([math.sqrt(record["mse"]) for record in records])),
-        "baseline-mae": sums["baseline-absolute-error-sum"] / total,
-        "baseline-rmse": math.sqrt(sums["baseline-squared-error-sum"] / total),
         "mase-count": sums["mase-count"],
         "rmsse-count": sums["rmsse-count"],
-        "absolute-error-sum": sums["absolute-error-sum"],
-        "squared-error-sum": sums["squared-error-sum"],
     }
-    for key in ("num-target-slots", "missing-targets", "missing-context-values", "signed-error-sum", "negative-predictions",
-                "seasonal-baseline-absolute-error-sum", "seasonal-baseline-squared-error-sum"):
+    for key in ("num-target-slots", "missing-targets", "missing-context-values", "signed-error-sum", "negative-predictions"):
         if all(key in record for record in records):
             metrics[key] = sum(record[key] for record in records)
     if "num-target-slots" in metrics:
@@ -117,9 +106,6 @@ def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> Me
             metrics["negative-prediction-fraction"] = metrics["negative-predictions"] / metrics["num-target-slots"]
     if "signed-error-sum" in metrics:
         metrics["bias"] = metrics["signed-error-sum"] / total
-    if "seasonal-baseline-absolute-error-sum" in metrics:
-        metrics["seasonal-baseline-mae"] = metrics["seasonal-baseline-absolute-error-sum"] / total
-        metrics["seasonal-baseline-rmse"] = math.sqrt(metrics["seasonal-baseline-squared-error-sum"] / total)
     probability_keys = {key for record in records for key in record
                         if key.startswith(("quantile-", "interval-", "wis-", "probabilistic-", "crps-"))}
     for key in sorted(probability_keys):
@@ -139,11 +125,12 @@ def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> Me
     granular = {key for record in records for key in record if key.startswith(("lead-", "block-"))}
     for key in sorted(granular):
         metrics[key] = sum(record.get(key, 0) for record in records)
-    for key in sorted(granular):
-        if key.startswith("lead-") and key.endswith("-count") and metrics[key]:
-            prefix = key.removesuffix("-count")
-            metrics[f"{prefix}-mae"] = metrics[f"{prefix}-absolute-error-sum"] / metrics[key]
-            metrics[f"{prefix}-rmse"] = math.sqrt(metrics[f"{prefix}-squared-error-sum"] / metrics[key])
+        if key.startswith("lead-") and key.endswith("-scaled-error-sum"):
+            prefix = key.removesuffix("-scaled-error-sum")
+            support = sum(record.get(f"{prefix}-target-count", 0) for record in records)
+            if support:
+                pooled = metrics[key] / support
+                metrics[prefix] = math.sqrt(pooled) if prefix.endswith("-rmsse") else pooled
     for metric in ("mase", "rmsse"):
         for suffix in ("scaled-error-sum", "target-count"):
             key = f"{metric}-{suffix}"
@@ -163,8 +150,8 @@ def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> Me
 
 def coverage_metrics(contents: list[RecordDict], manifest: dict) -> dict:
     robust = [content for content, client in zip(contents, manifest["clients"], strict=True) if client.get("robust_evaluation", False)]
-    if not robust:
-        return {"robust-num-clients": 0}
+    if not robust or len(robust) == len(contents):
+        return {"robust-num-clients": len(robust)}
     return {f"robust-{key}": value for key, value in aggregate_evaluation(robust, "num-examples").items()}
 
 
@@ -327,17 +314,10 @@ class AuditedStrategy(Strategy):
                 "round": server_round, "split": split,
                 "station": self.manifest["clients"][partition]["station"], **local_metrics,
             }
-            report_progress(split, f"round={server_round} station={row['station']} "
-                            f"windows={row['num-examples']} mae={row.get('mae', '-')} "
-                            f"train_seconds={row.get('train-seconds', '-')}")
-            if "mse" in row:
-                row["rmse"] = math.sqrt(row["mse"])
-                for name in ("mase", "rmsse"):
-                    if row[f"{name}-count"]:
-                        row[f"mean-{name}"] = row[f"{name}-sum"] / row[f"{name}-count"]
+            for name in ("mase", "rmsse"):
+                if row.get(f"{name}-count"):
+                    row[f"mean-{name}"] = row[f"{name}-sum"] / row[f"{name}-count"]
             self.station_history.append(row)
-            if self.tracker is not None:
-                self.tracker.log_metrics(split, row, server_round, partition=partition)
         pd.DataFrame(self.history).to_csv(self.output / "round_metrics.csv", index=False)
         pd.DataFrame(self.station_history).to_csv(self.output / "station_metrics.csv", index=False)
 

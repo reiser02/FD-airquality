@@ -89,7 +89,7 @@ def test_baseline_completes_on_cpu_and_records_effective_device_after_cuda_failu
 
 @pytest.mark.parametrize(("metric", "mase_defined", "rmsse_defined", "allowed"), [
     ("macro-mase", False, True, False), ("macro-rmsse", False, True, True),
-    ("macro-rmsse", True, False, False), ("mae", False, False, True),
+    ("macro-rmsse", True, False, False),
 ])
 def test_effective_panel_checks_only_the_selected_metric(metric, mase_defined, rmsse_defined, allowed):
     manifest = {"schema_version": 4, "clients": [

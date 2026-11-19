@@ -48,8 +48,6 @@ def _pooled(frame: pd.DataFrame) -> dict:
         raise ValueError("La CV no tiene targets observados; no se puede asignar error cero.")
     result = {
         "num-targets": count, "num-folds": frame["fold"].nunique(),
-        "mae": frame["absolute-error-sum"].sum() / count,
-        "rmse": np.sqrt(frame["squared-error-sum"].sum() / count),
     }
     if "num-target-slots" in frame:
         result["target-coverage"] = count / frame["num-target-slots"].sum()
@@ -68,7 +66,7 @@ def _pooled(frame: pd.DataFrame) -> dict:
 
 def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.DataFrame:
     frame, local = pd.DataFrame(rows), pd.DataFrame(stations)
-    summaries, station_rows, fold_means = [], [], []
+    summaries, fold_means = [], []
     for (configuration, seed), group in frame.groupby(["temporal_configuration", "seed"], sort=False):
         identity = {key: group.iloc[0][key] for key in (
             "temporal_configuration", "seed", "model", "mode", "adaptation", "strategy",
@@ -79,12 +77,11 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
         for _, fold_group in group.groupby("fold", sort=False):
             fold_score = _pooled(fold_group)
             fold_score.update({key: fold_group.iloc[0][key] for key in (
-                "macro-mae", "macro-rmse", "macro-mase", "macro-rmsse", "macro-crps",
+                "macro-mase", "macro-rmsse", "macro-crps",
             ) if key in fold_group})
             fold_scores.append(fold_score)
         fold_frame = pd.DataFrame(fold_scores)
-        for metric in ("mae", "rmse", "mase", "rmsse", "crps", "macro-mae", "macro-rmse",
-                       "macro-mase", "macro-rmsse", "macro-crps"):
+        for metric in ("mase", "rmsse", "crps", "macro-mase", "macro-rmsse", "macro-crps"):
             if metric in fold_frame:
                 values = fold_frame[metric]
                 defined = np.isfinite(values)
@@ -95,12 +92,8 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
         fold_means.append(means)
         score = _pooled(group)
         panel = local.loc[(local.temporal_configuration == configuration) & (local.seed == seed)]
-        per_station = []
-        for station, group_station in panel.groupby("station", sort=False):
-            station_score = _pooled(group_station)
-            per_station.append(station_score)
-            station_rows.append(identity | {"station": station} | station_score)
-        for name in ("mae", "rmse", "mase", "rmsse", "crps"):
+        per_station = [_pooled(group) for _, group in panel.groupby("station", sort=False)]
+        for name in ("mase", "rmsse", "crps"):
             valid = [record[name] for record in per_station if name in record]
             score[f"macro-{name}-stations"] = len(valid)
             if valid:
@@ -108,7 +101,6 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
         summaries.append(identity | score)
     result = pd.DataFrame(summaries)
     result.to_csv(output / "cv_summary.csv", index=False)
-    pd.DataFrame(station_rows).to_csv(output / "cv_station_summary.csv", index=False)
     pd.DataFrame(fold_means).to_csv(output / "cv_fold_mean.csv", index=False)
     return result
 

@@ -21,7 +21,7 @@ EXCLUSION_COLUMNS = (
 
 
 def selection_exclusions(manifest: dict, selection_metric: str) -> list[dict]:
-    if manifest["schema_version"] < 4 or selection_metric in {"mae", "macro-mae"}:
+    if manifest["schema_version"] < 4:
         return []
     metric = selection_metric.removeprefix("macro-")
     rows = []

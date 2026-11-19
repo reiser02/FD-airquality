@@ -69,7 +69,6 @@ def round_validation_view(artifact: dict, geometry: dict, settings):
 def normalization_artifact(artifact: dict, geometry: dict, settings) -> dict:
     """Runtime copy only. Never fit a fixed scaler with an unreleased observation."""
     result = artifact.copy()
-    result["canonical_mean"] = artifact.get("canonical_mean", artifact["mean"])
     reference_end = ""
     if settings.normalization != "fixed":
         result.update(mean=np.array(0.), scale=np.array(1.))

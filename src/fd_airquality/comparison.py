@@ -12,6 +12,24 @@ import pandas as pd
 
 from fd_airquality.missing import resolve_missing_policy
 
+_MACRO_ERRORS = ("macro-mase", "macro-rmsse")
+_REPORT_METRICS = (
+    *_MACRO_ERRORS, "pooled-mase", "pooled-rmsse", "mean-mase", "mean-rmsse",
+    "num-clients", "num-examples", "num-targets", "num-target-slots", "target-coverage",
+    "macro-mase-stations", "macro-rmsse-stations", "mase-count", "rmsse-count",
+    "bias", "missing-targets", "missing-context-values", "negative-prediction-fraction",
+    "probabilistic-available", "crps", "crps-count", "wis", "mean-quantile-loss", "quantile-count",
+    "robust-num-clients",
+)
+
+
+def _missing_policy(run: dict) -> str:
+    settings = run["settings"]
+    if "missing_policy" not in settings:
+        # Historical candidates used complete windows, including retired models.
+        return "strict"
+    return resolve_missing_policy(settings["model"], settings["missing_policy"], settings.get("missing_policies", "{}"))
+
 
 def _same_inference(run: dict, reference: dict) -> bool:
     model = run["settings"].get("model", "mlp")
@@ -23,8 +41,7 @@ def _same_inference(run: dict, reference: dict) -> bool:
                 for key in ("normalization", "scaler_type", "normalization_reference_end"))
         and (model != "flowstate-r1" or run["settings"].get("flowstate_scale_factor", 1.0)
               == reference["settings"].get("flowstate_scale_factor", 1.0))
-        and resolve_missing_policy(model, run["settings"].get("missing_policy", "auto"), run["settings"].get("missing_policies", "{}"))
-        == resolve_missing_policy(model, reference["settings"].get("missing_policy", "auto"), reference["settings"].get("missing_policies", "{}"))
+        and _missing_policy(run) == _missing_policy(reference)
     )
 
 
@@ -37,30 +54,24 @@ def _metric_difference(metric: str, value_a: float, value_b: float) -> dict:
     }
 
 
-def _write_pairwise(rows: list[dict], stations: list[pd.DataFrame], output: Path) -> None:
-    global_rows, station_rows = [], []
-    indexed = [frame.set_index("partition-id") for frame in stations]
+def _write_pairwise(rows: list[dict], output: Path) -> None:
+    pairs = []
+    metrics = (*_MACRO_ERRORS, "crps") if any("crps" in row for row in rows) else _MACRO_ERRORS
     for a, b in permutations(range(len(rows)), 2):
         identity = {"run_a": rows[a]["run"], "run_b": rows[b]["run"]}
-        for metric in ("mae", "rmse", "macro-mase", "macro-rmsse", *(["crps"] if any("crps" in row for row in rows) else [])):
-            global_rows.append(identity | _metric_difference(
+        for metric in metrics:
+            pairs.append(identity | _metric_difference(
                 metric, rows[a].get(metric, np.nan), rows[b].get(metric, np.nan),
             ))
-        for partition, station_a in indexed[a].iterrows():
-            station_b = indexed[b].loc[partition]
-            for metric in ("mae", "rmse", "mase", "rmsse", *(["crps"] if "crps" in station_a or "crps" in station_b else [])):
-                station_rows.append(identity | {"partition-id": partition, "station": station_a["station"]}
-                                    | _metric_difference(metric, station_a.get(metric, np.nan), station_b.get(metric, np.nan)))
-    metrics_columns = ["metric", "value_a", "value_b", "delta_a_minus_b", "improvement_a_vs_b_pct"]
-    pd.DataFrame(global_rows, columns=["run_a", "run_b", *metrics_columns]).to_csv(output / "pairwise_comparison.csv", index=False)
-    pd.DataFrame(station_rows, columns=["run_a", "run_b", "partition-id", "station", *metrics_columns]).to_csv(output / "station_pairwise_comparison.csv", index=False)
+    columns = ["run_a", "run_b", "metric", "value_a", "value_b", "delta_a_minus_b", "improvement_a_vs_b_pct"]
+    pd.DataFrame(pairs, columns=columns).to_csv(output / "pairwise_comparison.csv", index=False)
 
 
 def compare_runs(paths: list[Path], output: Path, *, allow_training_differences: bool = False,
                   allow_single: bool = False) -> Path:
     if len(paths) < (1 if allow_single else 2) or len({path.resolve() for path in paths}) != len(paths):
         raise ValueError("Indica al menos dos ejecuciones diferentes y completas.")
-    runs, rows, station_frames, warnings = [], [], [], []
+    runs, rows, blocks, warnings = [], [], [], []
     for path in paths:
         run = json.loads((path / "run.json").read_text(encoding="utf-8"))
         result = json.loads((path / "test_metrics.json").read_text(encoding="utf-8"))
@@ -100,15 +111,18 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         if metrics["num-targets"] != sum(client.get("num_test_targets", client["num_test_windows"] * run["manifest"]["geometry"]["horizon"])
                                          for client in run["manifest"]["clients"]):
             raise ValueError(f"Número de targets incompatible: {path}")
-        stations["run"], stations["model"], stations["mode"], stations["adaptation"] = label, model, mode, adaptation
-        station_frames.append(stations)
+        scores = {key: metrics[key] for key in _REPORT_METRICS if key in metrics}
+        if 0 < metrics.get("robust-num-clients", 0) < expected:
+            scores.update({f"robust-{key}": metrics[f"robust-{key}"] for key in _MACRO_ERRORS
+                           if f"robust-{key}" in metrics})
+        blocks.append({"run": label} | {key: value for key, value in metrics.items() if key.startswith("block-")})
         rows.append({
             "run": label, "model": model, "mode": mode, "adaptation": adaptation,
             "seed": run["settings"].get("seed"), "lora_rank": run["settings"].get("lora_rank"),
             "flowstate_scale_factor": run["settings"].get("flowstate_scale_factor") if model == "flowstate-r1" else None,
             "revision": run.get("model", {}).get("revision"),
             "selection_metric": result.get("selection_metric"),
-            "missing_policy": resolve_missing_policy(model, run["settings"].get("missing_policy", "auto"), run["settings"].get("missing_policies", "{}")),
+            "missing_policy": _missing_policy(run),
             "candidate_configuration": sha256(json.dumps({
                 "settings": {key: value for key, value in run["settings"].items()
                              if key not in {"seed", "output_dir", "manifest", "mlflow_tracking_uri",
@@ -118,30 +132,19 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
                 "granite_source": run.get("granite_source"),
             }, sort_keys=True).encode()).hexdigest(),
             "strategy": run["settings"]["strategy"] if mode == "federated" else "none",
-            "selected_round": result["selected_round"], **metrics,
-            "mae_improvement_vs_persistence_pct": (
-                100 * (1 - metrics["mae"] / metrics["baseline-mae"]) if metrics["baseline-mae"] else None
-            ),
-            "mae_improvement_vs_seasonal_naive_pct": (
-                100 * (1 - metrics["mae"] / metrics["seasonal-baseline-mae"])
-                if metrics.get("seasonal-baseline-mae") else None
-            ),
+            "selected_round": result["selected_round"], **scores,
         })
         runs.append(run)
-    for row, run, stations in zip(rows, runs, station_frames, strict=True):
-        references = [(ref, frame, reference_run) for ref, frame, reference_run in zip(rows, station_frames, runs, strict=True)
+    for row, run in zip(rows, runs, strict=True):
+        references = [ref for ref, reference_run in zip(rows, runs, strict=True)
                        if ref["model"] == row["model"] and ref["mode"] == "zero-shot"
                        and _same_inference(run, reference_run)]
         if len(references) == 1:
-            reference, reference_stations, _ = references[0]
-            for metric in ("mae", "macro-mase", "macro-rmsse"):
-                denominator = reference.get(metric)
+            for metric in _MACRO_ERRORS:
+                denominator = references[0].get(metric)
                 row[f"{metric.replace('-', '_')}_improvement_vs_zero_shot_pct"] = (
                     100 * (1 - row[metric] / denominator) if denominator and metric in row else None
                 )
-            baseline = reference_stations.set_index("partition-id")["mae"]
-            denominators = stations["partition-id"].map(baseline).replace(0, np.nan)
-            stations["mae_improvement_vs_zero_shot_pct"] = 100 * (1 - stations["mae"] / denominators)
         elif len(references) > 1:
             warnings.append(f"Varias referencias zero-shot para {row['model']}; no se elige una silenciosamente.")
         elif any(ref["model"] == row["model"] and ref["mode"] == "zero-shot" for ref in rows):
@@ -149,13 +152,13 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
                             "se conserva en todas las comparaciones por pares.")
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
-    pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
+    table = pd.DataFrame(rows)
+    table.to_csv(output / "comparison.csv", index=False)
     _write_seed_summary(rows, output)
-    pd.concat(station_frames, ignore_index=True).to_csv(output / "station_comparison.csv", index=False)
-    _write_pairwise(rows, station_frames, output)
+    _write_pairwise(rows, output)
     from fd_airquality.uncertainty import compare_calendar_blocks
 
-    compare_calendar_blocks(rows, output)
+    compare_calendar_blocks(blocks, output)
     (output / "comparison.json").write_text(json.dumps({
         "manifest_sha256": runs[0]["manifest_sha256"], "runs": [str(path.resolve()) for path in paths],
         "evaluation_sha256": runs[0]["manifest"].get("evaluation_sha256"),
@@ -165,7 +168,7 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         "pairwise_convention": "Todos los pares ordenados A/B. Delta = A - B; negativo favorece A. "
                                "Mejora (%) = 100 * (1 - A/B); positiva favorece A; indefinida si B=0 o falta una métrica.",
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(pd.DataFrame(rows)[["model", "adaptation", "mode", "strategy", "mae", "rmse", "baseline-mae"]].to_string(index=False))
+    print(table.reindex(columns=["model", "adaptation", "mode", "strategy", *_MACRO_ERRORS]).to_string(index=False))
     for warning in warnings:
         print(f"AVISO: {warning}")
     print(f"Comparación: {output}")
@@ -174,7 +177,7 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
 
 def _write_seed_summary(rows: list[dict], output: Path) -> None:
     frame = pd.DataFrame(rows)
-    metrics = [name for name in ("mae", "rmse", "macro-mae", "macro-rmse", "macro-mase", "macro-rmsse", "crps") if name in frame]
+    metrics = [name for name in (*_MACRO_ERRORS, "crps") if name in frame]
     summaries = []
     for signature, group in frame.groupby("candidate_configuration", sort=False):
         by_seed = group.groupby("seed", dropna=False)[metrics].mean()

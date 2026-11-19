@@ -230,7 +230,8 @@ def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared,
     assert set(zip(comparison["model"], comparison["mode"], strict=True)) == {
         (row["model"], row["mode"]) for row in rows
     }
-    assert len(pd.read_csv(output / "station_comparison.csv")) == len(rows) * count
+    assert comparison["num-clients"].eq(count).all()
+    assert not list(output.glob("station_*"))
     for row in rows:
         run = Path(row["output"])
         metadata = json.loads((run / "run.json").read_text())

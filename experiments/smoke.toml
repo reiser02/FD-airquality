@@ -22,7 +22,7 @@ scaler-type = "standard"
 probabilistic = 1
 batch-size = 8
 mlflow-tracking-uri = "disabled"
-selection-metric = "macro-mae"
+selection-metric = "macro-mase"
 
 [benchmark]
 models = ["mlp", "autoencoder", "nlinear", "nhits"]

@@ -95,8 +95,8 @@ class RunSettings:
                 or self.lora_alpha <= 0 or not 0 <= self.lora_dropout < 1
                 or self.fair_learning_rate <= 0 or self.fair_lambda < 0 or not self.lora_targets.strip()):
             raise ValueError("Hiperparámetros LoRA/LoRA-FAIR inválidos.")
-        if self.selection_metric not in {"macro-mase", "macro-rmsse", "mae", "macro-mae"}:
-            raise ValueError("selection_metric debe ser macro-mase, macro-rmsse, macro-mae o mae.")
+        if self.selection_metric not in {"macro-mase", "macro-rmsse"}:
+            raise ValueError("selection_metric debe ser macro-mase o macro-rmsse.")
         from fd_airquality.missing import resolve_missing_policy
 
         resolve_missing_policy(self.model, self.missing_policy, self.missing_policies)

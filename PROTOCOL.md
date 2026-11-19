@@ -257,14 +257,14 @@ también el rendimiento dando igual importancia a cada estación.
 
 Cada ronda evalúa **validación local**, no un dataset central. La **MASE macro** de
 validación selecciona el checkpoint, incluida la ronda cero. Se puede elegir
-explícitamente `macro-rmsse` o `mae`, nunca una métrica de test. Al terminar
+explícitamente `macro-rmsse`, nunca una métrica de test. Al terminar
 se envía ese checkpoint a todos los clientes para evaluar el test una sola vez.
 El test no decide rondas ni hiperparámetros automáticamente.
 
-Se calculan MAE/RMSE en unidades originales y un baseline de persistencia sobre
-los mismos targets. El servidor suma errores absolutos, errores cuadrados y
-recuentos; el RMSE global es la raíz del MSE agrupado, no la media de los RMSE
-locales. También se reportan MAE/RMSE macro por estación.
+No se calculan MAE/RMSE no escalados ni la persistencia evaluada con ellos en las
+nuevas ejecuciones. Se escalan los residuos de targets observados por estación.
+El servidor combina sumas escaladas y recuentos para las métricas agrupadas;
+`macro-mase` y `macro-rmsse` dan el mismo peso a cada estación con escala definida.
 
 MASE/RMSSE usan una **referencia previa de 28 días naturales** (`error_scale_hours=672`,
 opción `prepare --error-scale-hours`), separada del contexto de entrada y del
@@ -286,8 +286,9 @@ Para `seasonality=24`, ambos extremos de cada diferencia deben estar observados,
 pertenecer a la referencia y distar exactamente 24 horas. No se exige observar
 las horas intermedias. Se conserva el calendario con sus `NaN`, sin concatenar
 fragmentos ni extender la referencia hacia datos antiguos para reemplazar huecos.
-MASE divide MAE por la media de diferencias absolutas; RMSSE divide MSE por la
-media de diferencias cuadráticas antes de extraer raíz. Es la fórmula estacional
+MASE promedia el error absoluto dividido por la media de diferencias absolutas;
+RMSSE extrae la raíz de la media del error cuadrado dividido por la media de
+diferencias cuadráticas. Es la fórmula estacional
 de MASE/RMSSE con una ventana de referencia reciente explícita, no una escala
 calculada sobre todo el entrenamiento. La elección de 28 días es de protocolo,
 no una duración impuesta por MASE ni un número de observaciones independientes.
@@ -304,9 +305,8 @@ Con selección por `macro-mase` o `macro-rmsse`, en tiempo de ejecución se desc
 cada estación sin escala válida de **validación**, antes de entrenar. Se aplica la
 misma regla a modelos locales, compartidos y zero-shot, incluso si un compartido
 podría obtener una métrica macro usando solo parte del panel. No se decide la
-elegibilidad usando el error de test ni cambiando sus targets. La selección por
-`mae` no exige denominador estacional; permite conservar ese panel sin modificar
-el cálculo reportado de MASE/RMSSE.
+elegibilidad usando el error de test ni cambiando sus targets. No hay alternativa
+automática a una escala indefinida.
 
 Cada descarte se avisa en el log y se registra por separado en
 `excluded_stations.csv`: estación, partición original, causa, métrica de selección,
@@ -406,20 +406,20 @@ Un fallo detiene/cancela los procesos del benchmark, marca los casos no finaliza
 y evita comparar un panel o una matriz incompletos. El orden de terminación de
 candidatos no cambia la identidad ni el orden de las filas de resultados.
 `compare` requiere el mismo SHA del manifest, clientes completos y recuentos de
-targets compatibles. Emite una tabla global y otra por estación, además de
-`pairwise_comparison.csv` y `station_pairwise_comparison.csv`: todos los pares
-ordenados A/B, sin filtrar familias, adaptaciones ni hiperparámetros. Las diferencias
-globales son de MAE, RMSE, macro-MASE y macro-RMSSE; las locales de MAE, RMSE,
-MASE y RMSSE. Delta = A − B (negativo favorece A); mejora (%) = `100 × (1 − A/B)`
+targets compatibles. Verifica la identidad y el soporte de cada estación usando
+la auditoría local, sin generar comparaciones individuales. `pairwise_comparison.csv`
+incluye todos los pares ordenados A/B para macro-MASE, macro-RMSSE y CRPS si está
+disponible, sin filtrar familias, adaptaciones ni hiperparámetros.
+Delta = A − B (negativo favorece A); mejora (%) = `100 × (1 − A/B)`
 (positiva favorece A, indefinida si B=0 o falta una métrica).
 La mejora atribuible a adaptación frente a zero-shot solo se añade cuando hay una
 única referencia del mismo modelo, revisión y configuración de inferencia, incluida
 la escala de FlowState. Su ausencia o ambigüedad no bloquea las comparaciones
 generales. Se registran escala de FlowState y revisión en la tabla global; avisa cuando las
-versiones de ejecución, semillas o presupuestos difieren. La mejora porcentual
-frente a persistencia es `100 × (1 − MAE_modelo / MAE_persistencia)`; queda vacía
-si la MAE de persistencia es cero. Las comparaciones son descriptivas, sin afirmar
-significación estadística ni independencia de los orígenes rolling solapados.
+versiones de ejecución, semillas o presupuestos difieren. Las comparaciones son
+descriptivas, sin afirmar significación estadística ni independencia de los
+orígenes rolling solapados. Los intervalos exploratorios por bloques se calculan
+sobre diferencias de MASE agrupado con soporte de test idéntico.
 
 ## Trazabilidad con MLflow
 
@@ -434,16 +434,18 @@ El heartbeat informa de estado y tiempo sin nuevos eventos; no mide avance real,
 porcentaje de cómputo o ETA. `benchmark.json` se actualiza con reemplazo atómico.
 
 Cada ejecución registra un run MLflow desde el servidor o coordinador del control,
-no desde cada actor Ray. Se guardan parámetros, geometría, hash del manifest,
-revisión oficial del checkpoint y métricas globales y por estación para cada
-split/etapa. Los JSON, CSV y checkpoints se registran mediante una lista permitida;
+no desde cada actor Ray. Se indexan parámetros aplicables, geometría, hash del
+manifest, revisión oficial y una selección de métricas agregadas por split/etapa.
+No se publican series de métricas ni CSV de resultados por estación. Los JSON, CSV
+y checkpoints se registran mediante una lista permitida;
 no hay autologging ni subida recursiva de directorios de datos. Se conserva además
 el resultado local aunque se use un servidor MLflow remoto. Los pesos Granite
 registrados son **solo el adaptador**: para reconstruir el predictor se requiere
 el backbone en la revisión anotada y el escalador local correspondiente.
 FFA guarda A congelada y FLoRA la historia acumulada. `restore_checkpoint` verifica
-revisión/capas y reconstruye esos estados. Se registran tiempo, parámetros,
-refinamiento, RSS y payload tensorial, no framing de red. El máximo RSS es del
+revisión/capas y reconstruye esos estados. En MLflow quedan tiempos, uso de CUDA
+para FAIR y payload tensorial, no framing de red. El CSV global conserva los
+diagnósticos del refinamiento, entrenamiento y memoria. El máximo RSS es del
 proceso, no memoria exclusiva del modelo. `resource_metrics.json` registra el
 tiempo total del coordinador. MLflow se fija a 3.17.2 en ambos entornos.
 Los contadores de bytes son de entrenamiento; no incluyen evaluación ni descarga

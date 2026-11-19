@@ -26,11 +26,12 @@ def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_pa
     assert not (output / "mlflow.json").exists()
     if mode == "local":
         assert results["selected_round"] is None
+        stages = test["round"].tolist()
         names = [f"client_{client['partition_id']:03d}_best_model.pt" for client in clients]
     else:
-        assert results["selected_rounds"] == [results["selected_round"]]
+        stages = [results["selected_round"]]
         names = ["best_model.pt"]
-    for name, stage in zip(names, results["selected_rounds"], strict=True):
+    for name, stage in zip(names, stages, strict=True):
         checkpoint = torch.load(output / name, weights_only=True)
         assert 0 <= checkpoint["round"] == stage <= settings.num_server_rounds
         assert checkpoint["model"]["name"] == model
@@ -58,9 +59,9 @@ def test_centralized_restores_validation_winner_and_tests_once(prepared, tmp_pat
         evaluations.append((dataset.split, stage))
         metrics = evaluate_local(model, dataset, *args)
         if dataset.split == "validation":
-            mase, mae = {0.: (2., 3.), 1.: (1., 2.), 2.: (3., 1.)}[stage]
+            mase, rmsse = {0.: (2., 3.), 1.: (1., 2.), 2.: (3., 1.)}[stage]
             metrics.update({"mase": mase, "mase-sum": mase * metrics["mase-count"],
-                            "mae": mae, "absolute-error-sum": mae * metrics["num-targets"]})
+                            "rmsse": rmsse, "rmsse-sum": rmsse * metrics["rmsse-count"]})
         return metrics
 
     monkeypatch.setattr("fd_airquality.baselines.make_model", lambda *_: model)
@@ -162,14 +163,10 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
         calls.append((model.index, dataset.split, weight))
         count = len(dataset)
         targets = count * dataset.horizon
-        error = 1.0 / weight
         # Station 0 prefers the earlier round, station 1 the last one.
         scaled_error = float(1 + abs(weight - (2, 4)[model.index]))
         return {
             "num-examples": count, "num-targets": targets,
-            "absolute-error-sum": targets * error, "squared-error-sum": targets * error**2,
-            "baseline-absolute-error-sum": targets, "baseline-squared-error-sum": targets,
-            "mae": error, "mse": error**2, "baseline-mae": 1.0,
             "mase-sum": count * scaled_error, "mase-count": count,
             "rmsse-sum": count * scaled_error, "rmsse-count": count,
             "mase": scaled_error, "rmsse": scaled_error,
@@ -186,7 +183,8 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
     assert len(models) == 2
     result = json.loads((output / "test_metrics.json").read_text())
     assert result["selection_metric"] == "station_validation_macro-mase"
-    assert result["selected_rounds"] == [1, 2]
+    assert result["selected_round"] is None
+    assert pd.read_csv(output / "station_metrics.csv").query("split == 'test'")["round"].tolist() == [1, 2]
     for index, (best_round, best_weight) in enumerate(((1, 2.0), (2, 4.0))):
         assert [(split, weight) for i, split, weight in calls if i == index] == [
             ("validation", index + 1), ("train", index + 2), ("validation", index + 2),

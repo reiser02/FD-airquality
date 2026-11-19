@@ -332,8 +332,8 @@ observados a distancia real de `m` horas:
 ```text
 a = media |y(t) − y(t−m)|
 q = media (y(t) − y(t−m))²
-MASE  = MAE / a
-RMSSE = sqrt(MSE / q)
+MASE  = media (|predicción − y| / a)
+RMSSE = sqrt(media ((predicción − y)² / q))
 ```
 
 Nunca se compacta el calendario ni se interpolan las escalas. Con `training`,
@@ -349,9 +349,9 @@ El panel de selección se fija usando la disponibilidad de la métrica interna,
 no los errores externos.
 
 En CV se suman errores escalados y conteos antes de dividir; para RMSSE se extrae
-la raíz después de agrupar, no se promedian raíces de folds. Se publican también
-MAE/RMSE físicos. `cv_summary.csv` incluye resultados por semilla y macroestación;
-`cv_station_summary.csv`, la reducción por estación.
+la raíz después de agrupar, no se promedian raíces de folds. `cv_summary.csv`
+incluye resultados por semilla y promedios macro por estación. El cálculo por
+estación es interno: no se publica un resumen individual ni MAE/RMSE físicos.
 
 ## Cuantiles y CRPS
 

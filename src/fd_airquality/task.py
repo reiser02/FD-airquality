@@ -20,7 +20,6 @@ from fd_airquality.metrics import compute_mase, compute_rmsse
 from fd_airquality.missing import (
     forecast,
     forecast_distribution,
-    impute_context,
     resolve_missing_policy,
 )
 from fd_airquality.models import ForecastAutoencoder, make_model, shared_state  # noqa: F401
@@ -112,7 +111,7 @@ def train_local(
         if validation_data is None or not len(validation_data):
             raise ValueError("Early stopping/scheduler requieren una validación interna observada, nunca el test.")
         control = TrainingControl(model, optimizer, settings)
-        control.observe(0, training_validation_mae(model, validation_data, settings, device))
+        control.observe(0, training_validation_mse(model, validation_data, settings, device))
     microbatch_size = _microbatch_size(settings, device)
     optimizer_steps = 0
     window_occurrences = selected_targets = 0
@@ -193,9 +192,9 @@ def train_local(
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={len(loader)}/{len(loader)} "
                         f"mse_normalized={total_squared_error / targets:.6g}")
         if control is not None:
-            score = training_validation_mae(model, validation_data, settings, device)
+            score = training_validation_mse(model, validation_data, settings, device)
             stop = control.observe(epoch, score)
-            report_progress("training-validation", f"epoch={epoch} mae={score:.6g} "
+            report_progress("training-validation", f"epoch={epoch} mse={score:.6g} "
                             f"lr={optimizer.param_groups[0]['lr']:.6g} patience={control.bad_epochs}/"
                             f"{settings.early_stopping_patience} stop={stop}")
             if stop:
@@ -230,7 +229,7 @@ def train_local(
         "best-epoch": control.best_epoch if control is not None else epochs_completed,
     }
     if control is not None:
-        metrics["training-validation-mae"] = control.best_score
+        metrics["training-validation-mse"] = control.best_score
         metrics["training-validation-windows"] = len(validation_data)
     metrics["train-objective-normalized"] = total_objective / targets
     if hasattr(dataset, "candidate_windows"):
@@ -245,8 +244,8 @@ def train_local(
 
 
 @torch.no_grad()
-def training_validation_mae(model, dataset, settings, device) -> float:
-    """Pooled observed-label MAE in original units, not a mean of batch means."""
+def training_validation_mse(model, dataset, settings, device) -> float:
+    """Pool observed squared residuals in original units before dividing by support."""
     was_training = model.training
     model.eval()
     try:
@@ -278,7 +277,7 @@ def _training_validation_totals(model, dataset, settings, device):
         else:
             scale = getattr(dataset, "scale", 1.)
         mask = torch.isfinite(actual)
-        error += float((prediction[mask] - actual[mask]).abs().sum()) * scale
+        error += float((prediction[mask].double() - actual[mask]).square().sum()) * scale**2
         count += int(mask.sum())
         offset += len(actual)
     return error, count
@@ -294,7 +293,7 @@ def evaluate_local(
     seasonality: int,
 ) -> dict[str, float | int]:
     model.to(device).eval()
-    predictions, actuals, baselines, seasonal = [], [], [], []
+    predictions, actuals = [], []
     missing_context = 0
     quantile_batches, quantile_levels = [], None
     row_offset = 0
@@ -320,20 +319,10 @@ def evaluate_local(
         # rounding could depend on the candidate's training scaler.
         actuals.append(artifact["values"][positions].astype(np.float64))
         missing_context += int(torch.isnan(inputs).sum())
-        history = artifact["values"][starts[:, None] + np.arange(dataset.context)].astype(np.float64)
-        canonical_mean = float(artifact.get("canonical_mean", dataset.mean))
-        baseline_inputs = impute_context(torch.from_numpy(history - canonical_mean), "ffill").numpy() + canonical_mean
-        baselines.append(np.repeat(
-            baseline_inputs[:, -1:],
-            dataset.horizon, axis=1,
-        ))
-        if dataset.context >= seasonality:
-            lags = dataset.context - seasonality + np.arange(dataset.horizon) % seasonality
-            seasonal.append(baseline_inputs[:, lags])
         if time.monotonic() - last_report >= settings.heartbeat_seconds:
             report_progress(dataset.split, f"batches={batch}/{len(loader)} device={device}")
             last_report = time.monotonic()
-    prediction, actual, baseline = map(np.concatenate, (predictions, actuals, baselines))
+    prediction, actual = map(np.concatenate, (predictions, actuals))
     if not np.isfinite(prediction).all():
         raise ValueError("Predicciones no finitas.")
     observed = np.isfinite(actual)
@@ -341,24 +330,18 @@ def evaluate_local(
     if not count:
         raise ValueError("No hay targets observados para evaluar.")
     error = np.where(observed, prediction - actual, 0.0)
-    baseline_error = np.where(observed, baseline - actual, 0.0)
+    signed_error = float(error.sum())
+    negative = int((prediction < 0).sum())
     stats: dict[str, float | int] = {
         "num-examples": len(dataset),
         "num-targets": count,
         "num-target-slots": actual.size,
         "missing-targets": actual.size - count,
         "missing-context-values": missing_context,
-        "absolute-error-sum": float(np.abs(error).sum()),
-        "squared-error-sum": float(np.square(error).sum()),
-        "baseline-absolute-error-sum": float(np.abs(baseline_error).sum()),
-        "baseline-squared-error-sum": float(np.square(baseline_error).sum()),
-        "mae": float(np.abs(error).sum() / count),
-        "mse": float(np.square(error).sum() / count),
-        "baseline-mae": float(np.abs(baseline_error).sum() / count),
-        "signed-error-sum": float(error.sum()),
-        "bias": float(error.sum() / count),
-        "negative-predictions": int((prediction < 0).sum()),
-        "negative-prediction-fraction": float((prediction < 0).mean()),
+        "signed-error-sum": signed_error,
+        "bias": signed_error / count,
+        "negative-predictions": negative,
+        "negative-prediction-fraction": negative / actual.size,
         "mase-sum": 0.0,
         "mase-count": 0,
         "rmsse-sum": 0.0,
@@ -369,41 +352,38 @@ def evaluate_local(
         from fd_airquality.probabilistic import quantile_statistics
 
         stats.update(quantile_statistics(actual, np.concatenate(quantile_batches), quantile_levels))
-    if seasonal:
-        seasonal_error = np.where(observed, np.concatenate(seasonal) - actual, 0.0)
-        stats.update({"seasonal-baseline-absolute-error-sum": float(np.abs(seasonal_error).sum()),
-                      "seasonal-baseline-squared-error-sum": float(np.square(seasonal_error).sum()),
-                      "seasonal-baseline-mae": float(np.abs(seasonal_error).sum() / count)})
-    for lead in range(dataset.horizon):
-        prefix_lead = f"lead-{lead + 1:02d}"
-        stats.update({f"{prefix_lead}-count": int(observed[:, lead].sum()),
-                      f"{prefix_lead}-absolute-error-sum": float(np.abs(error[:, lead]).sum()),
-                      f"{prefix_lead}-squared-error-sum": float(np.square(error[:, lead]).sum())})
-    # Only final-test calendar aggregates leave the client, not predictions.
-    if dataset.split == "test" and "timestamps" in artifact:
-        origins = pd.to_datetime(artifact["timestamps"][dataset.starts + dataset.context]).normalize()
-        for day in origins.unique():
-            rows = origins == day
-            prefix_day = f"block-{day:%Y%m%d}"
-            stats.update({f"{prefix_day}-count": int(observed[rows].sum()),
-                          f"{prefix_day}-absolute-error-sum": float(np.abs(error[rows]).sum()),
-                          f"{prefix_day}-squared-error-sum": float(np.square(error[rows]).sum())})
+    lead_counts = observed.sum(axis=0)
+    for lead, support in enumerate(lead_counts, start=1):
+        stats[f"lead-{lead:02d}-count"] = int(support)
     prefix = f"{dataset.split}_" if f"{dataset.split}_mase_scale" in artifact else ""
     if f"{prefix}mase_scale" in artifact and f"{prefix}rmsse_scale" in artifact:
         if prefix:
             stats["error-scale-pairs"] = int(artifact[f"{prefix}scale_pairs"])
-        for name in ("mase", "rmsse"):
+        origin_counts = observed.sum(axis=1)
+        valid = origin_counts > 0
+        for name, transform in (("mase", np.abs), ("rmsse", np.square)):
             denominator = float(artifact[f"{prefix}{name}_scale"])
-            if np.isfinite(denominator) and denominator > 0:
-                origin_counts = observed.sum(axis=1)
-                valid = origin_counts > 0
-                per_origin = (np.abs(error).sum(axis=1)[valid] / origin_counts[valid] / denominator if name == "mase"
-                              else np.sqrt(np.square(error).sum(axis=1)[valid] / origin_counts[valid] / denominator))
-                stats[f"{name}-sum"] = float(per_origin.sum())
-                stats[f"{name}-count"] = len(per_origin)
-                stats[name] = stats["mae"] / denominator if name == "mase" else float(np.sqrt(stats["mse"] / denominator))
-                stats[f"{name}-scaled-error-sum"] = (stats["absolute-error-sum"] if name == "mase" else stats["squared-error-sum"]) / denominator
-                stats[f"{name}-target-count"] = count
+            if not np.isfinite(denominator) or denominator <= 0:
+                continue
+            scaled_error = transform(error) / denominator
+            by_origin = scaled_error.sum(axis=1)
+            total = float(by_origin.sum())
+            per_origin = by_origin[valid] / origin_counts[valid]
+            stats[f"{name}-sum"] = float((per_origin if name == "mase" else np.sqrt(per_origin)).sum())
+            stats[f"{name}-count"] = len(per_origin)
+            stats[name] = total / count if name == "mase" else float(np.sqrt(total / count))
+            stats[f"{name}-scaled-error-sum"] = total
+            stats[f"{name}-target-count"] = count
+            for lead, numerator in enumerate(scaled_error.sum(axis=0), start=1):
+                stats[f"lead-{lead:02d}-{name}-scaled-error-sum"] = float(numerator)
+                stats[f"lead-{lead:02d}-{name}-target-count"] = int(lead_counts[lead - 1])
+            # Keep only scaled calendar aggregates for the paired test bootstrap.
+            if name == "mase" and dataset.split == "test" and "timestamps" in artifact:
+                days = pd.to_datetime(artifact["timestamps"][dataset.starts + dataset.context]).normalize()
+                for day in days.unique():
+                    rows = days == day
+                    stats[f"block-{day:%Y%m%d}-mase-scaled-error-sum"] = float(by_origin[rows].sum())
+                    stats[f"block-{day:%Y%m%d}-mase-target-count"] = int(origin_counts[rows].sum())
         return stats
     # Historical schema-2 artifacts only: their original origin-dependent scales
     # are not silently relabelled as a fixed-reference protocol.
@@ -431,7 +411,7 @@ def selection_value(metrics: dict, settings: RunSettings, *, local: bool = False
 
 
 def validate_selection_coverage(manifest: dict, settings: RunSettings, mode: str) -> None:
-    if manifest["schema_version"] < 4 or settings.selection_metric in {"mae", "macro-mae"}:
+    if manifest["schema_version"] < 4:
         return
     metric = settings.selection_metric.removeprefix("macro-")
     clients = manifest["clients"]

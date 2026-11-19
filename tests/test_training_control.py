@@ -18,7 +18,7 @@ from fd_airquality.baselines import run_baseline
 from fd_airquality.data import load_client_data, prepare
 from fd_airquality.server_app import run_server
 from fd_airquality.settings import RunSettings
-from fd_airquality.task import train_local, training_validation_mae
+from fd_airquality.task import train_local, training_validation_mse
 from fd_airquality.training_control import ContextSupervisionDataset, TrainingControl
 
 
@@ -66,7 +66,7 @@ def test_actual_epoch_loop_stops_reduces_lr_and_preserves_aggregation_counts(mon
         states.append({key: value.detach().clone() for key, value in model.state_dict().items()})
         return next(scores)
 
-    monkeypatch.setattr("fd_airquality.task.training_validation_mae", monitor)
+    monkeypatch.setattr("fd_airquality.task.training_validation_mse", monitor)
     settings = RunSettings(local_epochs=20, batch_size=5, early_stopping_patience=3, lr_scheduler_patience=0)
     metrics = train_local(model, data, settings, torch.device("cpu"), 42, validation_data=data)
     assert metrics["epochs-completed"] == metrics["optimizer-steps"] == 4
@@ -96,11 +96,11 @@ def test_monitor_pools_observed_errors_and_station_scales():
     y = torch.full((2, 9), float("nan"))
     y[0, 0], y[1] = 0., 10.
     data = TensorDataset(torch.ones(2, 1), y)
-    assert training_validation_mae(model, data, RunSettings(batch_size=1), torch.device("cpu")) == 9.
+    assert training_validation_mse(model, data, RunSettings(batch_size=1), torch.device("cpu")) == 90.
     a = TensorDataset(torch.ones(1, 1), torch.ones(1, 9))
     b = TensorDataset(torch.ones(3, 1), torch.full((3, 9), 3.))
     a.scale, b.scale = 2., 10.
-    assert training_validation_mae(model, ConcatDataset([a, b]), RunSettings(), torch.device("cpu")) == 23.
+    assert training_validation_mse(model, ConcatDataset([a, b]), RunSettings(), torch.device("cpu")) == 676.
     assert model.training
 
 
@@ -201,5 +201,5 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
     if mode != "centralized":
         assert train["learning-rate-final"].eq(settings.learning_rate / 4).all()
     run = json.loads((output / "run.json").read_text())
-    assert run["training_controls"]["monitor"] == "pooled_observed_mae_original_units"
+    assert run["training_controls"]["monitor"] == "pooled_observed_mse_original_units"
     assert (output / "test_metrics.json").is_file()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import math
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -75,13 +74,10 @@ class Recorder:
                 "round": station_step, "split": split, "partition-id": partition,
                 "station": self.manifest["clients"][partition]["station"], **record,
             }
-            if "mse" in row:
-                row["rmse"] = math.sqrt(row["mse"])
-                for name in ("mase", "rmsse"):
-                    if row[f"{name}-count"]:
-                        row[f"mean-{name}"] = row[f"{name}-sum"] / row[f"{name}-count"]
+            for name in ("mase", "rmsse"):
+                if row.get(f"{name}-count"):
+                    row[f"mean-{name}"] = row[f"{name}-sum"] / row[f"{name}-count"]
             self.stations.append(row)
-            self.tracker.log_metrics(split, row, station_step, partition=partition)
         pd.DataFrame(self.rounds).to_csv(self.output / "round_metrics.csv", index=False)
         pd.DataFrame(self.stations).to_csv(self.output / "station_metrics.csv", index=False)
         return metrics
@@ -202,8 +198,7 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 tracker.log_metrics("train", metrics, stage)
         validation = evaluate("validation")
         pooled = recorder.record(stage, "validation", validation)
-        report_progress("validation", f"round={stage} mae={pooled['mae']:.6g} "
-                        f"{settings.selection_metric}={pooled.get(settings.selection_metric)}")
+        report_progress("validation", f"round={stage} {settings.selection_metric}={pooled.get(settings.selection_metric)}")
         candidates = [selection_value(record, settings, local=True) for record in validation] if independent else [selection_value(pooled, settings)]
         for index, candidate in enumerate(candidates):
             if candidate < best_scores[index]:
@@ -219,13 +214,12 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
     # Test is accessed once, only after validation-only checkpoint selection finishes.
     tests = evaluate("test")
     metrics = recorder.record(max(best_rounds), "test", tests, best_rounds if independent else None)
-    report_progress("test", f"mae={metrics['mae']:.6g} rmse={metrics['rmse']:.6g}; test final único")
-    for index, (stage, score) in enumerate(zip(best_rounds, best_scores, strict=True)):
-        tracker.log_metrics("selection", {"round": stage, "validation_score": score}, stage,
-                            partition=index if independent else None)
+    report_progress("test", f"macro-mase={metrics.get('macro-mase', '-')} "
+                    f"macro-rmsse={metrics.get('macro-rmsse', '-')}; test final único")
+    if not independent:
+        tracker.log_metrics("selection", {"round": best_rounds[0], "validation_score": best_scores[0]}, best_rounds[0])
     (output / "test_metrics.json").write_text(json.dumps({
         "selected_round": None if independent else best_rounds[0],
-        "selected_rounds": best_rounds,
         "selection_metric": f"{'station_' if independent else ''}validation_{settings.selection_metric}",
-        "validation_score": best_scores if independent else best_scores[0], "test": metrics,
+        "validation_score": None if independent else best_scores[0], "test": metrics,
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
