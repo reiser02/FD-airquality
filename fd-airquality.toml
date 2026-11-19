@@ -217,8 +217,9 @@ history-hours = 672
 
 [backtest]
 output-dir = "reports/backtests"
-# Desarrollo no consulta el último fold. Para final: --stage final --selection <selection.json>.
-stage = "development"
+# Normal: evaluar todos los folds, sin buscar ni elegir una configuración.
+# Opt-in de búsqueda: stage = "development"; después stage = "final" con --selection.
+stage = "evaluation"
 models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
 modes = ["local", "centralized", "federated", "zero-shot"]
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]

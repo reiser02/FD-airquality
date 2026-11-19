@@ -69,8 +69,8 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     baseline.add_argument("--output-dir", default="reports/non_federated")
     benchmark = commands.add_parser("benchmark", help="Matriz de modelos y métodos sobre un único manifest.")
     backtest = commands.add_parser("backtest", help="CV temporal: reiniciar los modelos en cada fold.")
-    backtest.add_argument("--stage", choices=["development", "final", "all"], default="development",
-                          help="Desarrollo sin holdout; final exige selección congelada; all es exploratorio.")
+    backtest.add_argument("--stage", choices=["evaluation", "development", "final", "all"], default="evaluation",
+                          help="evaluation evalúa todos los folds sin seleccionar configuración; development/final son opt-in; all es exploratorio.")
     backtest.add_argument("--selection", type=Path, help="selection.json del desarrollo para consultar el holdout.")
     for command in (benchmark, backtest):
         command.add_argument("--manifest")

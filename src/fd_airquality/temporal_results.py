@@ -68,11 +68,31 @@ def _pooled(frame: pd.DataFrame) -> dict:
 
 def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.DataFrame:
     frame, local = pd.DataFrame(rows), pd.DataFrame(stations)
-    summaries, station_rows = [], []
+    summaries, station_rows, fold_means = [], [], []
     for (configuration, seed), group in frame.groupby(["temporal_configuration", "seed"], sort=False):
         identity = {key: group.iloc[0][key] for key in (
             "temporal_configuration", "seed", "model", "mode", "adaptation", "strategy",
         )}
+        means = identity | {"num-folds": group["fold"].nunique(),
+                            "aggregation": "unweighted_fold_mean"}
+        fold_scores = []
+        for _, fold_group in group.groupby("fold", sort=False):
+            fold_score = _pooled(fold_group)
+            fold_score.update({key: fold_group.iloc[0][key] for key in (
+                "macro-mae", "macro-rmse", "macro-mase", "macro-rmsse", "macro-crps",
+            ) if key in fold_group})
+            fold_scores.append(fold_score)
+        fold_frame = pd.DataFrame(fold_scores)
+        for metric in ("mae", "rmse", "mase", "rmsse", "crps", "macro-mae", "macro-rmse",
+                       "macro-mase", "macro-rmsse", "macro-crps"):
+            if metric in fold_frame:
+                values = fold_frame[metric]
+                defined = np.isfinite(values)
+                means[f"{metric}-defined-folds"] = int(defined.sum())
+                means[metric] = float(values.mean()) if defined.all() else np.nan
+                means[f"{metric}-std"] = float(values.std(ddof=1)) if defined.all() and len(values) > 1 else (
+                    0. if defined.all() else np.nan)
+        fold_means.append(means)
         score = _pooled(group)
         panel = local.loc[(local.temporal_configuration == configuration) & (local.seed == seed)]
         per_station = []
@@ -89,6 +109,7 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
     result = pd.DataFrame(summaries)
     result.to_csv(output / "cv_summary.csv", index=False)
     pd.DataFrame(station_rows).to_csv(output / "cv_station_summary.csv", index=False)
+    pd.DataFrame(fold_means).to_csv(output / "cv_fold_mean.csv", index=False)
     return result
 
 

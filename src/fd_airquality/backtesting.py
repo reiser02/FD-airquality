@@ -66,8 +66,8 @@ def prepare_backtest(raw_root: Path, output: Path, pollutant: str, config: DataC
                                 "protocol": "temporal_cv", "fold_initialization": "fresh",
                                 "train_history": train_history,
                                 "step_hours": step_hours, "folds": entries,
-                                "final_holdout_fold": folds,
-                                "note": "Simulación retrospectiva; no certifica predicciones emitidas en tiempo real."},
+                                 "final_holdout_fold": None, "potential_holdout_fold": folds,
+                                 "note": "Simulación retrospectiva. El último fold solo se reserva al solicitar development/final."},
                                indent=2, allow_nan=False) + "\n", encoding="utf-8")
     return path
 
@@ -111,7 +111,9 @@ def _effective_folds(family: dict, settings, root: Path, *, panel_folds: int | N
         path = root / f"fold_{index + 1:03d}_manifest.json"
         effective = manifest | {"clients": retained, "temporal_panel": {
             "fold": index + 1, "selection_metric": settings.selection_metric,
-            "note": "Panel fijado con los folds de desarrollo; el holdout no decide estaciones ni se usan sus errores."}}
+             "note": ("Panel fijado con todos los folds de evaluación, sin usar sus errores."
+                      if panel_folds == len(manifests) else
+                      "Panel fijado con los folds de desarrollo; el holdout no decide estaciones ni se usan sus errores.")}}
         effective["evaluation_sha256"] = evaluation_identity(effective)
         path.write_text(json.dumps(effective, indent=2, allow_nan=False) + "\n", encoding="utf-8")
         paths.append(path)
@@ -121,23 +123,24 @@ def _effective_folds(family: dict, settings, root: Path, *, panel_folds: int | N
 
 def run_backtest(settings, models: list[str], modes: list[str], *, adaptations=None, seeds=None,
                   lora_ranks=None, strategies=None, max_parallel_models=None, benchmark=None,
-                  stage: str = "development", selection: Path | None = None) -> Path:
+                   stage: str = "evaluation", selection: Path | None = None) -> Path:
     if benchmark is None:
         from fd_airquality.cli import run_benchmark
 
         benchmark = run_benchmark
     family = json.loads(Path(settings.manifest).read_text(encoding="utf-8"))
+    holdout_fold = family.get("potential_holdout_fold", family.get("final_holdout_fold"))
     normalize_pollutant(family.get("pollutant", ""))
     if (family.get("schema_version") != 2 or not family.get("folds")
             or family.get("protocol") != "temporal_cv"
             or family.get("fold_initialization") != "fresh"
             or family.get("train_history") not in {"expanding", "sliding"}
             or [entry.get("fold") for entry in family["folds"]] != list(range(1, len(family["folds"]) + 1))
-            or family.get("final_holdout_fold") != len(family["folds"])):
+            or holdout_fold != len(family["folds"])):
         raise ValueError("Se requiere una preparación de CV con reinicio por fold; vuelve a ejecutar prepare-backtest.")
-    if stage not in {"development", "final", "all"}:
-        raise ValueError("stage debe ser development, final o all (exploratorio).")
-    if stage != "all" and len(family["folds"]) < 2:
+    if stage not in {"evaluation", "development", "final", "all"}:
+        raise ValueError("stage debe ser evaluation, development, final o all (exploratorio).")
+    if stage in {"development", "final"} and len(family["folds"]) < 2:
         raise ValueError("La separación desarrollo/holdout requiere al menos dos folds.")
     recipe = None
     source_hash = file_digest(Path(settings.manifest))
@@ -177,18 +180,22 @@ def run_backtest(settings, models: list[str], modes: list[str], *, adaptations=N
         raise ValueError("--selection solo se utiliza con --stage final.")
     root = create_run_dir(Path(settings.output_dir).resolve(), f"backtest_{datetime.now(UTC):%Y%m%d_%H%M%S}")
     manifests = _effective_folds(
-        family, settings, root, panel_folds=max(1, len(family["folds"]) - 1),
+        family, settings, root, panel_folds=(len(family["folds"]) if stage == "evaluation"
+                                           else max(1, len(family["folds"]) - 1)),
         stations=recipe["stations"] if recipe else None,
     )
     progress = family | {"source_sha256": source_hash, "results": [], "stage": stage,
-                         "final_holdout_scored": stage in {"final", "all"},
-                         "exploratory": stage == "all"}
+                          "final_holdout_scored": stage in {"final", "all"},
+                          "final_holdout_fold": None if stage == "evaluation" else holdout_fold,
+                          "configuration_selection": stage in {"development", "all"},
+                          "primary_summary": "cv_fold_mean.csv" if stage == "evaluation" else "cv_summary.csv",
+                          "exploratory": stage == "all"}
     rows, summaries = [], []
     cv_rows, cv_stations = [], []
     indices = ([len(manifests) - 1] if stage == "final" else
-               list(range(len(manifests) if stage == "all" else len(manifests) - 1)))
+               list(range(len(manifests) if stage in {"evaluation", "all"} else len(manifests) - 1)))
     # Record access before running: a failed partial holdout is not untouched.
-    if stage in {"final", "all"}:
+    if stage in {"evaluation", "final", "all"}:
         ledger = Path(settings.manifest).parent / "holdout_access.json"
         if stage == "final" and ledger.exists():
             raise ValueError("El holdout ya fue consultado por este protocolo; no puede presentarse como sellado.")
@@ -217,7 +224,7 @@ def run_backtest(settings, models: list[str], modes: list[str], *, adaptations=N
             summary.insert(0, "fold", index + 1)
             summaries.append(summary)
             entry.update(status="completed", comparison=str(comparison))
-            if index + 1 != family["final_holdout_fold"]:
+            if stage == "evaluation" or index + 1 != holdout_fold:
                 run_rows, station_rows = temporal_run_rows(run_paths, index + 1)
                 cv_rows.extend(run_rows)
                 cv_stations.extend(station_rows)
@@ -230,6 +237,8 @@ def run_backtest(settings, models: list[str], modes: list[str], *, adaptations=N
     pd.concat(summaries, ignore_index=True).to_csv(root / "temporal_seed_summary.csv", index=False)
     if cv_rows:
         summary = summarize_cv(cv_rows, cv_stations, root)
+        if stage == "evaluation":
+            return root
         winner = select_configuration(summary, settings.selection_metric)
         last_fold = max(row["fold"] for row in cv_rows)
         selected_runs = [Path(row["run_path"]) for row in cv_rows

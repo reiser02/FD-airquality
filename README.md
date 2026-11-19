@@ -174,8 +174,9 @@ uv run fd-airquality benchmark --num-server-rounds 5
 congelada. Son **27 configuraciones de foundations**, más doce controles clásicos:
 **39 ejecuciones** con una semilla y rango. Zero-shot no se duplica por semilla/rango;
 los clásicos no se duplican por rango. Las tres semillas del TOML raíz producen
-111 ejecuciones por fold. La CV por defecto utiliza dos folds de desarrollo y
-reserva el tercero para la configuración seleccionada. FLoRA y LoRA-FAIR no tienen modalidades
+111 ejecuciones por fold. La CV por defecto evalúa todos los folds y publica su
+media, sin seleccionar una configuración. El flujo de desarrollo/holdout requiere
+`--stage development` explícito. FLoRA y LoRA-FAIR no tienen modalidades
 centralizadas nativas ni se cruzan automáticamente con FedProx.
 
 ### Modos secuenciales y candidatos paralelos por GPU

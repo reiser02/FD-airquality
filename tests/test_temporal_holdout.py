@@ -34,6 +34,9 @@ def test_external_cv_pools_counts_not_fold_means_and_roots_after_pooling(tmp_pat
     assert summary.mase == summary["macro-mase"] == 4.5
     assert summary.rmsse == pytest.approx(np.sqrt(90 / 4))
     assert summary.crps == 3.
+    means = pd.read_csv(tmp_path / "cv_fold_mean.csv").iloc[0]
+    assert means.mae == 5. and means.rmse == 5.
+    assert means["mae-defined-folds"] == 2
 
 
 def test_seed_is_not_selected_as_a_hyperparameter():
@@ -42,6 +45,32 @@ def test_seed_is_not_selected_as_a_hyperparameter():
     assert select_configuration(frame, "mae") == "b"
     with pytest.raises(ValueError, match="indefinida"):
         select_configuration(frame.assign(mae=np.nan), "mae")
+
+
+@pytest.mark.parametrize("folds", [1, 3])
+def test_default_evaluation_uses_all_folds_without_selecting_configuration(
+    temporal_family, tmp_path, monkeypatch, folds,  # noqa: F811
+):
+    raw, geometry = temporal_family
+    family = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=folds, step_hours=48)
+    assert json.loads(family.read_text())["final_holdout_fold"] is None
+    monkeypatch.setattr("fd_airquality.backtesting.select_configuration",
+                        lambda *_: pytest.fail("La evaluación normal no selecciona configuraciones"))
+    settings = RunSettings(manifest=str(family), output_dir=str(tmp_path / "runs"),
+                           num_server_rounds=1, hidden_size=8, mlflow_tracking_uri="disabled")
+    output = run_backtest(settings, ["mlp", "nlinear"], ["local"])
+    progress = json.loads((output / "backtest.json").read_text())
+    assert progress["stage"] == "evaluation"
+    assert progress["final_holdout_fold"] is None
+    assert not progress["configuration_selection"]
+    assert len(progress["results"]) == folds
+    assert not (output / "selection.json").exists()
+    assert (output / "cv_summary.csv").is_file()
+    means = pd.read_csv(output / "cv_fold_mean.csv")
+    assert means["num-folds"].eq(folds).all()
+    assert len(means) == 2
+    # A later tuning workflow must not relabel already evaluated dates as sealed.
+    assert (family.parent / "holdout_access.json").is_file()
 
 
 @pytest.mark.parametrize("mode", ["local", "centralized", "federated"])
@@ -58,7 +87,7 @@ def test_development_does_not_score_holdout_and_final_uses_only_frozen_selection
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            num_server_rounds=2, hidden_size=8, batch_size=8,
                            probabilistic=1, mlflow_tracking_uri="disabled")
-    development = run_backtest(settings, ["mlp", "nlinear"], [mode], seeds=[42, 43])
+    development = run_backtest(settings, ["mlp", "nlinear"], [mode], seeds=[42, 43], stage="development")
     progress = json.loads((development / "backtest.json").read_text())
     assert [entry["fold"] for entry in progress["results"]] == [1, 2]
     assert not progress["final_holdout_scored"]

@@ -157,6 +157,14 @@ siguiente ajuste ni el ajuste final dependen de ellos.
 
 ### Desarrollo y evaluación final separados
 
+**El modo normal es `--stage evaluation`:** puntúa todos los folds, publica la
+media aritmética en `cv_fold_mean.csv` y no selecciona una configuración. No
+reserva automáticamente el último. `cv_summary.csv` conserva además la
+agregación por conteos observados, que no siempre coincide con esa media.
+La preparación marca un posible holdout; solo el flujo optativo le asigna ese papel.
+
+El flujo de selección siguiente debe solicitarse explícitamente:
+
 ```bash
 uv run --frozen fd-airquality prepare-backtest --config experiments/smoke.toml
 uv run --frozen fd-airquality backtest --config experiments/smoke.toml \
@@ -167,7 +175,7 @@ uv run --frozen fd-airquality backtest --config experiments/smoke.toml \
   --selection <resultado_desarrollo>/selection.json
 ```
 
-Por defecto se puntúan todos los folds **menos el último**. Se agregan errores
+Con `--stage development` se puntúan todos los folds **menos el último**. Se agregan errores
 observados y conteos dentro de cada estación, se calculan métricas macro y se
 promedian las réplicas de semillas al elegir configuración. No se elige la mejor
 semilla como hiperparámetro. `selection.json` congela candidato, presupuesto,
@@ -187,6 +195,8 @@ el último fold para todos los candidatos, lo marca como consultado y no lo llam
 holdout sellado. El registro es un control del software, no prueba de que nadie
 haya visto antes esos datos, ni de ausencia de contaminación en preentrenamiento.
 Los periodos utilizados en pruebas históricas no se convierten en inéditos.
+Lo mismo ocurre si se puntuaron previamente con `evaluation`: se registra el
+acceso y no se permite relabelar posteriormente el último como holdout intacto.
 
 La CV externa es propia del protocolo común a Flower, Granite y NeuralForecast.
 No se utiliza el ajuste de alto nivel de NeuralForecast dentro de Flower, porque
