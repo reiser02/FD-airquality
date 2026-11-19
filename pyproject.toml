@@ -10,7 +10,8 @@ readme = "README.md"
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "flwr[simulation]>=1.40,<1.41",
-    "darts[torch]>=0.48.1,<0.49",
+    # Same immutable implementation audited in the missing-data protocol.
+    "neuralforecast @ git+https://github.com/Nixtla/neuralforecast.git@69e431413b22cbb1a74d35db2fa7994092ce0ea4",
     # TTM-R3 is not implemented in the PyPI 0.3.10 release. Pin upstream source.
     "granite-tsfm @ git+https://github.com/ibm-granite/granite-tsfm.git@3d92535ca4138648b9d1e2f3f1421b5dec4dc3aa",
     "datasets>=4,<5",
@@ -93,6 +94,16 @@ fair-lambda = 1.0
 selection-metric = "macro-mase"
 heartbeat-seconds = 60.0
 log-level = "INFO"
+missing-policy = "auto"
+missing-policies = "{}"
+deterministic = 0
+probabilistic = 0
+training-data-availability-threshold = "0.0"
+training-availability = "{}"
+normalization = "window"
+scaler-type = "standard"
+normalization-reference-end = ""
+arrival-period-hours = 24
 
 [tool.setuptools.packages.find]
 where = ["src"]

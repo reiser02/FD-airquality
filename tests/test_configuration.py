@@ -1,4 +1,5 @@
 import json
+import tomllib
 from dataclasses import asdict, fields
 from pathlib import Path
 
@@ -36,20 +37,60 @@ def test_toml_defaults_and_preparation_overrides_are_valid(tmp_path, monkeypatch
                 assert getattr(args, key) == value
 
 
-def test_project_toml_is_valid_without_requiring_builtin_defaults():
-    path = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
+def test_explicit_toml_is_valid_without_requiring_builtin_defaults(tmp_path):
+    path = tmp_path / "experiment.toml"
+    path.write_text('[prepare]\npollutant = "PM25"\ncontext = 24\nhorizon = 6\nstride = 3\n'
+                    '[run]\nseed = 17\nbatch-size = 16\n')
     data = arguments(["prepare", "--config", str(path)])
-    DataConfig(**{field.name: getattr(data, field.name)
-                  for field in fields(DataConfig) if getattr(data, field.name) is not None})
+    geometry = DataConfig(**{field.name: getattr(data, field.name)
+                             for field in fields(DataConfig) if getattr(data, field.name) is not None})
+    assert (geometry.context, geometry.horizon, geometry.stride) == (24, 6, 3)
     for command in ("simulate", "baseline", "benchmark"):
         args = arguments([command, "--config", str(path)])
-        RunSettings(**{field.name: getattr(args, field.name) for field in fields(RunSettings)})
+        settings = RunSettings(**{field.name: getattr(args, field.name) for field in fields(RunSettings)})
+        assert (settings.seed, settings.batch_size) == (17, 16)
 
 
 def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert arguments(["simulate"]).batch_size == RunSettings().batch_size
     assert arguments(["prepare"]).context is None
+
+
+def test_new_blocks_are_default_without_changing_fold_history(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    removed = {"arrival_history", "arrival_history_hours"}
+    assert not removed.intersection(asdict(RunSettings()))
+    for command in ("simulate", "baseline", "benchmark", "backtest"):
+        assert not removed.intersection(vars(arguments([command])))
+        for option in ("--arrival-history", "--arrival-history-hours"):
+            with pytest.raises(SystemExit):
+                arguments([command, option, "expanding" if option == "--arrival-history" else "24"])
+    assert arguments(["prepare-backtest"]).train_history == "expanding"
+    root = Path(__file__).resolve().parents[1]
+    for filename in ("fd-airquality.toml", "experiments/smoke.toml"):
+        config = tomllib.loads((root / filename).read_text())
+        assert not {"arrival-history", "arrival-history-hours"}.intersection(config["run"])
+        assert config["prepare-backtest"]["train-history"] == "expanding"
+    flower = tomllib.loads((root / "pyproject.toml").read_text())["tool"]["flwr"]["app"]["config"]
+    assert not {"arrival-history", "arrival-history-hours"}.intersection(flower)
+    for name in removed:
+        with pytest.raises(ValueError, match="desconocidas"):
+            RunSettings.from_mapping({name: "expanding" if name == "arrival_history" else 24})
+
+
+@pytest.mark.parametrize("text", [
+    '[prepare]\npollutant = "NO2"\n',
+    '[run]\nbatch-size = -1\n',
+    'invalid TOML [',
+])
+def test_default_config_fixture_excludes_working_directory_experiments(tmp_path, monkeypatch, text):
+    user_directory = tmp_path / "user-project"
+    user_directory.mkdir()
+    (user_directory / "fd-airquality.toml").write_text(text)
+    monkeypatch.chdir(user_directory)
+    assert arguments(["prepare"]).pollutant == "PM25"
+    assert arguments(["simulate"]).batch_size == RunSettings().batch_size
 
 
 def test_auto_config_precedence_and_explicit_builtin_values(tmp_path, monkeypatch):
@@ -82,8 +123,8 @@ def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypat
     )
     assert arguments(["prepare"]).station == ["old-a", "old-b"]
     assert arguments(["prepare", "--station", "new"]).station == ["new"]
-    args = arguments(["benchmark", "--models", "darts-nlinear", "--seeds", "42"])
-    assert (args.models, args.seeds) == (["darts-nlinear"], [42])
+    args = arguments(["benchmark", "--models", "nlinear", "--seeds", "42"])
+    assert (args.models, args.seeds) == (["nlinear"], [42])
 
 
 @pytest.mark.parametrize("text", [
@@ -147,7 +188,7 @@ def test_main_passes_merged_configuration_to_the_launcher(prepared, tmp_path, mo
 def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monkeypatch):
     config = tmp_path / "experiment.toml"
     config.write_text('[prepare]\ncontext = 16\nhorizon = 4\nstation = ["old"]\n'
-                      'raw-root = "raw"\npollutant = "CO"\n')
+                      'raw-root = "raw"\npollutant = "PM25"\n')
     received = []
 
     def prepare(*args):
@@ -159,7 +200,7 @@ def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monk
     main(["prepare", "--config", str(config), "--station", "new", "--stride", "2"])
     raw_root, _, pollutant, geometry, stations = received[0]
     assert (geometry.context, geometry.horizon, geometry.stride) == (16, 4, 2)
-    assert (raw_root, pollutant, stations) == (Path("raw").resolve(), "CO", {"new"})
+    assert (raw_root, pollutant, stations) == (Path("raw").resolve(), "PM25", {"new"})
 
 
 def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_path, monkeypatch):

@@ -38,71 +38,55 @@ GRANITE = {
         "FlowStateForPrediction",
     ),
 }
-MODEL_NAMES = ("mlp", "autoencoder", "darts-nlinear", *GRANITE)
-
-
-class ForecastMLP(nn.Module):
-    """Direct residual forecast, initialized to persistence."""
-
-    def __init__(self, context: int, horizon: int, hidden_size: int):
-        super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(context, hidden_size), nn.ReLU(), nn.Linear(hidden_size, horizon)
-        )
-        nn.init.zeros_(self.network[-1].weight)
-        nn.init.zeros_(self.network[-1].bias)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        anchor = inputs[:, -1:]
-        return anchor + self.network(inputs - anchor)
+MODEL_NAMES = ("mlp", "autoencoder", "nlinear", "nhits", *GRANITE)
 
 
 class ForecastAutoencoder(nn.Module):
     """Shared bottleneck for context reconstruction and supervised forecasting."""
 
-    def __init__(self, context: int, horizon: int, hidden: int, latent: int):
+    handles_missing_context = True
+
+    def __init__(self, context: int, horizon: int, hidden: int, latent: int,
+                 scaler_type: str = "identity"):
         super().__init__()
+        from neuralforecast.common._scalers import TemporalNorm
+
+        self.scaler = TemporalNorm(scaler_type=scaler_type, dim=1)
         self.encoder = nn.Sequential(nn.Linear(context, hidden), nn.ReLU(), nn.Linear(hidden, latent))
         self.reconstruction = nn.Sequential(nn.Linear(latent, hidden), nn.ReLU(), nn.Linear(hidden, context))
         self.forecast = nn.Linear(latent, horizon)
         nn.init.zeros_(self.forecast.weight)
         nn.init.zeros_(self.forecast.bias)
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        anchor = inputs[:, -1:]
-        return anchor + self.forecast(self.encoder(inputs - anchor))
+    def prepare_context(self, inputs, missing_policy="ffill"):
+        from fd_airquality.missing import impute_context
+
+        mask = torch.isfinite(inputs)
+        normalized = self.scaler.transform(inputs.nan_to_num(), mask=mask)
+        return impute_context(normalized.masked_fill(~mask, float("nan")), missing_policy)
+
+    def forward(self, inputs: torch.Tensor, *, missing_policy="ffill") -> torch.Tensor:
+        values = self.prepare_context(inputs, missing_policy)
+        anchor = values[:, -1:]
+        return self.scaler.inverse_transform(anchor + self.forecast(self.encoder(values - anchor)))
+
+    def training_objective(self, inputs, actual, *, missing_policy="ffill"):
+        from neuralforecast.losses.pytorch import MSE
+
+        values = self.prepare_context(inputs, missing_policy)
+        anchor = values[:, -1:]
+        prediction = anchor + self.forecast(self.encoder(values - anchor))
+        if prediction.shape != actual.shape or not torch.isfinite(prediction).all():
+            raise ValueError("Forma de predicción autoencoder incompatible o no finita.")
+        mask = torch.isfinite(actual)
+        target = self.scaler.scaler(actual.nan_to_num(), self.scaler.x_shift, self.scaler.x_scale)
+        squared = (prediction[mask] - target[mask]).square().sum()
+        return MSE()(y=target.unsqueeze(-1), y_hat=prediction.unsqueeze(-1),
+                     mask=mask.unsqueeze(-1)), squared
 
     def reconstruction_loss(self, inputs: torch.Tensor) -> torch.Tensor:
         centered = inputs - inputs[:, -1:]
         return nn.functional.mse_loss(self.reconstruction(self.encoder(centered)), centered)
-
-
-class DartsNLinear(nn.Module):
-    """Use the actual Darts NLinear module, not a reimplementation of its formula."""
-
-    def __init__(self, context: int, horizon: int):
-        super().__init__()
-        import numpy as np
-        from darts.models import NLinearModel
-        from darts.utils.data.torch_datasets.utils import TorchTrainingSample
-
-        owner = NLinearModel(
-            input_chunk_length=context, output_chunk_length=horizon,
-            shared_weights=True, normalize=True, use_static_covariates=False,
-        )
-        # Darts exposes module construction through this version-sensitive hook.
-        # No synthetic samples are fitted; these arrays specify shapes only.
-        self.module = owner._create_model(TorchTrainingSample(
-            past_target=np.zeros((context, 1), dtype=np.float32),
-            future_target=np.zeros((horizon, 1), dtype=np.float32),
-        ))
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        from darts.utils.data.torch_datasets.utils import ModuleStage, PLModuleInput
-
-        stage = ModuleStage.TRAIN if self.training else ModuleStage.PREDICT
-        output = self.module(PLModuleInput(past_target=inputs.unsqueeze(-1), stage=stage))
-        return output.prediction[:, :, 0, 0]
 
 
 def validate_model_geometry(geometry: dict, settings: RunSettings) -> None:
@@ -191,8 +175,16 @@ def _template(settings):
 class GraniteForecaster(nn.Module):
     """Pinned pretrained weights with internal adapters, not an output-correction MLP."""
 
+    handles_missing_context = True
+
     def __init__(self, geometry: dict, settings: RunSettings, pretrained: bool = True):
         super().__init__()
+        from neuralforecast.common._scalers import TemporalNorm
+
+        self.scaler = TemporalNorm(
+            scaler_type=settings.scaler_type if settings.normalization == "window" else "identity",
+            dim=1,
+        )
         self.name, self.horizon = settings.model, geometry["horizon"]
         self.algorithm = effective_adaptation(settings)
         self.scale_factor = settings.flowstate_scale_factor
@@ -284,10 +276,26 @@ class GraniteForecaster(nn.Module):
                 self.layers[path].merged_delta = merged
         self.history = {key: value.detach().cpu().clone() for key, value in history.items()}
 
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+    def forward(self, inputs: torch.Tensor, *, missing_policy: str = "strict", return_quantiles: bool = False):
         if self.backbone is None:
             raise RuntimeError("El servidor solo construye el estado de adaptación; la inferencia pertenece al cliente.")
+        from fd_airquality.missing import impute_context
+
+        original_mask = torch.isfinite(inputs)
+        if torch.isinf(inputs).any() or not original_mask.any(dim=1).all():
+            raise ValueError("Contexto Granite infinito o sin observaciones.")
+        normalized = self.scaler.transform(inputs.nan_to_num(), mask=original_mask)
+        incomplete = normalized.masked_fill(~original_mask, float("nan"))
+        inputs = impute_context(incomplete, missing_policy)
         options = {"past_values": inputs.unsqueeze(-1), "return_dict": True, "return_loss": False}
+        if missing_policy == "native":
+            observed = torch.isfinite(inputs).unsqueeze(-1)
+            if self.name == "ttm-r3":
+                options.update(past_values=torch.nan_to_num(inputs).unsqueeze(-1), past_observed_mask=observed)
+            elif self.name == "patchtst-fm-r2":
+                options["past_observed_mask"] = observed
+            elif torch.isnan(inputs).any() and not getattr(self.backbone.config, "with_missing", False):
+                raise ValueError("Esta revisión FlowState no tiene with_missing; elige un imputador explícito.")
         if self.name != "ttm-r3":
             options["prediction_length"] = self.horizon
         if self.name == "flowstate-r1":
@@ -306,36 +314,82 @@ class GraniteForecaster(nn.Module):
         prediction = prediction[:, :self.horizon, 0]
         if prediction.shape != (len(inputs), self.horizon):
             raise ValueError("El checkpoint no cubre el horizonte solicitado.")
+        prediction = self.scaler.inverse_transform(prediction)
+        if return_quantiles:
+            quantiles = getattr(output, "quantile_outputs", None)
+            levels = getattr(self.backbone.config, "quantiles" if self.name == "flowstate-r1" else "quantile_levels", None)
+            if quantiles is None or levels is None:
+                return prediction, None, None
+            if (quantiles.ndim != 4 or quantiles.shape[0] != len(inputs) or quantiles.shape[1] != len(levels)
+                    or quantiles.shape[2] < self.horizon or quantiles.shape[3] != 1):
+                raise ValueError("Forma de cuantiles Granite incompatible.")
+            quantiles = quantiles[:, :, :self.horizon, 0].transpose(1, 2)
+            quantiles = self.scaler.inverse_transform(
+                quantiles, x_shift=self.scaler.x_shift.unsqueeze(-1),
+                x_scale=self.scaler.x_scale.unsqueeze(-1),
+            )
+            return prediction, quantiles, levels
         return prediction
+
+    def forecast_distribution(self, inputs: torch.Tensor, *, missing_policy: str = "strict"):
+        return self.forward(inputs, missing_policy=missing_policy, return_quantiles=True)
+
+    def training_objective(self, inputs, actual, *, missing_policy="native"):
+        from neuralforecast.losses.pytorch import MSE
+
+        prediction = self.forward(inputs, missing_policy=missing_policy)
+        if prediction.shape != actual.shape or not torch.isfinite(prediction).all():
+            raise ValueError("Forma de predicción Granite incompatible o no finita.")
+        target = self.scaler.scaler(actual.nan_to_num(), self.scaler.x_shift, self.scaler.x_scale)
+        predicted = self.scaler.scaler(prediction, self.scaler.x_shift, self.scaler.x_scale)
+        mask = torch.isfinite(actual)
+        squared = (predicted[mask] - target[mask]).square().sum()
+        return MSE()(y=target.unsqueeze(-1), y_hat=predicted.unsqueeze(-1),
+                     mask=mask.unsqueeze(-1)), squared
 
 
 def make_model(geometry: dict, settings: RunSettings, *, pretrained: bool = True) -> nn.Module:
     validate_model_geometry(geometry, settings)
     context, horizon = geometry["context"], geometry["horizon"]
-    if settings.model == "mlp":
-        return ForecastMLP(context, horizon, settings.hidden_size)
+    if settings.model in {"mlp", "nlinear", "nhits"}:
+        from fd_airquality.neural import NeuralForecaster
+
+        return NeuralForecaster(context, horizon, settings)
     if settings.model == "autoencoder":
-        return ForecastAutoencoder(context, horizon, settings.hidden_size, settings.latent_size)
-    if settings.model == "darts-nlinear":
-        return DartsNLinear(context, horizon)
+        return ForecastAutoencoder(context, horizon, settings.hidden_size, settings.latent_size,
+                                   settings.scaler_type if settings.normalization == "window" else "identity")
     return GraniteForecaster(geometry, settings, pretrained=pretrained)
 
 
 def shared_state(model: nn.Module) -> dict[str, torch.Tensor]:
     # The immutable pretrained backbone, including FlowState complex buffers, is
     # never averaged or transmitted by Flower. Only adaptation weights travel.
-    return model.export_state() if isinstance(model, GraniteForecaster) else model.state_dict()
+    return model.export_state() if hasattr(model, "export_state") else model.state_dict()
 
 
 def load_shared_state(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
-    if isinstance(model, GraniteForecaster):
+    if hasattr(model, "import_state"):
         model.import_state(state)
     else:
         model.load_state_dict(state, strict=True)
 
 
 def model_metadata(geometry: dict, settings: RunSettings) -> dict:
-    metadata = {"name": settings.model, "context": geometry["context"], "horizon": geometry["horizon"]}
+    metadata = {"name": settings.model, "context": geometry["context"], "horizon": geometry["horizon"],
+                "normalization": settings.normalization,
+                "scaler_type": settings.scaler_type if settings.normalization == "window" else "identity"}
+    if settings.model in {"mlp", "nlinear", "nhits"}:
+        from importlib.metadata import version
+
+        from fd_airquality.neural import NEURALFORECAST_REVISION, QUANTILE_LEVELS
+
+        metadata.update(backend="neuralforecast", version=version("neuralforecast"),
+                        revision=NEURALFORECAST_REVISION, normalization=settings.normalization,
+                        scaler_type=settings.scaler_type if settings.normalization == "window" else "identity",
+                        quantiles=list(QUANTILE_LEVELS) if settings.probabilistic else [],
+                        point_forecast="median" if settings.probabilistic else "point",
+                        training_loss="mean_pinball" if settings.probabilistic else "masked_mse",
+                        window_interface="package_normalization_parse_forward_loss_v1")
     if settings.model in GRANITE:
         identifier, revision, _ = GRANITE[settings.model]
         metadata.update(
@@ -346,6 +400,10 @@ def model_metadata(geometry: dict, settings: RunSettings) -> dict:
         )
         metadata["trainable_parameters"] = 0
         metadata["base_parameters"] = sum(parameter.numel() for parameter in _template(settings).parameters())
+        if settings.probabilistic:
+            config = _template(settings).config
+            levels = getattr(config, "quantiles" if settings.model == "flowstate-r1" else "quantile_levels", None)
+            metadata["quantiles"] = list(levels) if levels is not None else []
         if effective_adaptation(settings) != "none":
             targets = target_linears(_template(settings), settings.model, settings.lora_targets)
             if any(settings.lora_rank > min(layer.in_features, layer.out_features) for layer in targets.values()):
@@ -357,7 +415,8 @@ def model_metadata(geometry: dict, settings: RunSettings) -> dict:
     return metadata
 
 
-def checkpoint_payload(geometry: dict, settings: RunSettings, state: dict, round_number: int) -> dict:
+def checkpoint_payload(geometry: dict, settings: RunSettings, state: dict, round_number: int,
+                       *, state_role: str = "selected") -> dict:
     fixed = {}
     if settings.model in GRANITE and effective_adaptation(settings) == "ffa-lora":
         server = make_model(geometry, settings, pretrained=False)
@@ -366,6 +425,8 @@ def checkpoint_payload(geometry: dict, settings: RunSettings, state: dict, round
         "checkpoint_version": 2, "model_state_dict": {key: value.detach().cpu().clone() for key, value in state.items()},
         "fixed_adapter_state": fixed, "round": round_number, "geometry": geometry,
         "hidden_size": settings.hidden_size, "settings": settings.flower_config(), "model": model_metadata(geometry, settings),
+        "state_role": state_role,
+        "information_cutoff": geometry.get("validation_start" if state_role == "training" else "test_start"),
     }
 
 

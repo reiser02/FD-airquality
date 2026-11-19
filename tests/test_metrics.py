@@ -2,17 +2,15 @@ import numpy as np
 import pandas as pd
 import pytest
 import torch
-from darts import TimeSeries
-from darts.metrics import mase, rmsse
 
 from fd_airquality.data import DataConfig, WindowDataset, split_station
-from fd_airquality.metrics import seasonal_error_scales
+from fd_airquality.metrics import compute_mase, compute_rmsse, seasonal_error_scales
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import evaluate_local
 
 
 @pytest.mark.parametrize("gap", [False, True])
-def test_recent_scales_match_published_seasonal_formula_and_darts(gap):
+def test_recent_scales_match_independent_seasonal_formula(gap):
     index = pd.date_range("2026-03-01", periods=672, freq="h")
     values = np.arange(672, dtype=float) ** 2
     if gap:
@@ -25,11 +23,10 @@ def test_recent_scales_match_published_seasonal_formula_and_darts(gap):
     assert squared == pytest.approx(np.square(differences).mean())
     assert pairs == 648 - (2 if gap else 0)
     times = pd.date_range("2026-03-29", periods=12, freq="h")
-    actual = TimeSeries.from_times_and_values(times, np.full(12, 10.))
-    prediction = TimeSeries.from_times_and_values(times, np.full(12, 9.))
-    insample = TimeSeries.from_series(reference)
-    assert mase(actual, prediction, insample, m=24) == pytest.approx(1 / absolute)
-    assert rmsse(actual, prediction, insample, m=24) == pytest.approx(np.sqrt(1 / squared))
+    actual = pd.Series(np.full(12, 10.), index=times)
+    prediction = pd.Series(np.full(12, 9.), index=times)
+    assert compute_mase(actual, prediction, reference, seasonality_m=24) == pytest.approx(1 / absolute)
+    assert compute_rmsse(actual, prediction, reference, seasonality_m=24) == pytest.approx(np.sqrt(1 / squared))
 
 
 def test_missing_timestamps_are_not_treated_as_adjacent_hours():

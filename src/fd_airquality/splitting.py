@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-from darts import TimeSeries
-from darts.utils.missing_values import extract_subseries
 
 from fd_airquality.preprocessing import ensure_datetime_series
 
@@ -62,6 +60,36 @@ def _observed_runs(series: pd.Series) -> list[tuple[int, int]]:
     return runs
 
 
+def masked_window_starts(series: pd.Series, *, context: int, horizon: int,
+                         validation_start: str, test_start: str, test_end: str,
+                         train_stride: int = 1, stride: int = 6,
+                         min_context_observed: int = 1, min_target_observed: int = 1,
+                         train_start: str = "") -> dict[str, np.ndarray]:
+    """Keep the calendar and incomplete windows; model adapters handle histories."""
+    index = series.index
+    width = context + horizon
+    starts = np.arange(max(0, len(series) - width + 1), dtype=np.int64)
+    observed = np.isfinite(series.to_numpy())
+    counts = np.r_[0, np.cumsum(observed)]
+    breaks = np.r_[0, np.cumsum(np.diff(index.asi8) != pd.Timedelta(hours=1).value)]
+    usable = ((counts[starts + context] - counts[starts] >= min_context_observed)
+              & (counts[starts + width] - counts[starts + context] >= min_target_observed)
+              & (breaks[starts + width - 1] == breaks[starts]))
+    first, last = index[starts + context], index[starts + width - 1]
+    train = usable & (last < pd.Timestamp(validation_start)) & (starts % train_stride == 0)
+    if train_start:
+        train &= first >= pd.Timestamp(train_start)
+    result = {"train_starts": starts[train]}
+    for name, lower, upper in (("validation", validation_start, test_start), ("test", test_start, test_end)):
+        offset = (first.asi8 - pd.Timestamp(lower).value) // pd.Timedelta(hours=1).value
+        result[f"{name}_starts"] = starts[usable & (first >= pd.Timestamp(lower))
+                                                & (last < pd.Timestamp(upper)) & (offset % stride == 0)]
+    train_mask = observed & (index < pd.Timestamp(validation_start))
+    if train_start:
+        train_mask &= index >= pd.Timestamp(train_start)
+    return result | {"train_mask": np.asarray(train_mask)}
+
+
 def select_holdout_window(
     series: pd.Series,
     *,
@@ -105,20 +133,21 @@ def select_holdout_window(
 
 
 def split_train_val_subseries(
-    train_ts: TimeSeries,
+    train_ts: pd.Series,
     *,
     input_chunk: int,
     size_k: int,
     validation_len: int = 48,
     validation_stride: int | None = None,
-) -> tuple[list[TimeSeries], list[TimeSeries]] | None:
+) -> tuple[list[pd.Series], list[pd.Series]] | None:
     validation_stride = size_k if validation_stride is None else validation_stride
     if min(input_chunk, size_k, validation_len, validation_stride) <= 0:
         raise ValueError("Las longitudes y el stride de validacion deben ser positivos")
     if validation_len < size_k:
         raise ValueError("validation_len debe ser >= size_k")
     width = input_chunk + size_k
-    subseries = [ss for ss in extract_subseries(train_ts, min_gap_size=1) if len(ss) >= width]
+    subseries = [train_ts.iloc[first:end] for first, end in _observed_runs(train_ts)
+                 if end - first >= width]
     if not subseries:
         return None
 
@@ -128,7 +157,7 @@ def split_train_val_subseries(
             continue
         val_host = subseries[i]
         train_subs = [
-            ss for ss in (*subseries[:i], val_host[:-validation_len]) if len(ss) >= width
+            ss for ss in (*subseries[:i], val_host.iloc[:-validation_len]) if len(ss) >= width
         ]
         if not train_subs:
             return None
@@ -136,6 +165,6 @@ def split_train_val_subseries(
         val_subs = []
         for target in range(first_target, len(val_host) - size_k + 1, validation_stride):
             window_start = target - input_chunk
-            val_subs.append(val_host[window_start : window_start + width])
+            val_subs.append(val_host.iloc[window_start : window_start + width])
         return train_subs, val_subs
     return None

@@ -15,7 +15,7 @@ from fd_airquality.settings import RunSettings
 from fd_airquality.task import configure_torch, train_local
 
 
-@pytest.mark.parametrize("name", ["mlp", "autoencoder", "darts-nlinear"])
+@pytest.mark.parametrize("name", ["mlp", "autoencoder", "nlinear", "nhits"])
 def test_trainable_models_have_forecast_shapes_and_gradients(name):
     settings = RunSettings(model=name, hidden_size=8, latent_size=3)
     configure_torch(settings, 17)
@@ -28,8 +28,8 @@ def test_trainable_models_have_forecast_shapes_and_gradients(name):
     clone = make_model({"context": 6, "horizon": 2}, settings)
     load_shared_state(clone, shared_state(model))
     torch.testing.assert_close(model(inputs), clone(inputs))
-    if name == "darts-nlinear":
-        assert type(model.module).__module__.startswith("darts.")
+    if name != "autoencoder":
+        assert type(model.module).__module__.startswith("neuralforecast.")
 
 
 def test_autoencoder_reconstruction_uses_context_only(prepared):

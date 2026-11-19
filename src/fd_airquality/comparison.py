@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+from hashlib import sha256
 from itertools import permutations
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+
+from fd_airquality.missing import resolve_missing_policy
 
 
 def _same_inference(run: dict, reference: dict) -> bool:
@@ -16,8 +19,12 @@ def _same_inference(run: dict, reference: dict) -> bool:
         model == reference["settings"].get("model", "mlp")
         and all(run.get("model", {}).get(key) == reference.get("model", {}).get(key)
                 for key in ("revision", "point_forecast"))
+        and all(run["settings"].get(key) == reference["settings"].get(key)
+                for key in ("normalization", "scaler_type", "normalization_reference_end"))
         and (model != "flowstate-r1" or run["settings"].get("flowstate_scale_factor", 1.0)
-             == reference["settings"].get("flowstate_scale_factor", 1.0))
+              == reference["settings"].get("flowstate_scale_factor", 1.0))
+        and resolve_missing_policy(model, run["settings"].get("missing_policy", "auto"), run["settings"].get("missing_policies", "{}"))
+        == resolve_missing_policy(model, reference["settings"].get("missing_policy", "auto"), reference["settings"].get("missing_policies", "{}"))
     )
 
 
@@ -35,28 +42,34 @@ def _write_pairwise(rows: list[dict], stations: list[pd.DataFrame], output: Path
     indexed = [frame.set_index("partition-id") for frame in stations]
     for a, b in permutations(range(len(rows)), 2):
         identity = {"run_a": rows[a]["run"], "run_b": rows[b]["run"]}
-        for metric in ("mae", "rmse", "macro-mase", "macro-rmsse"):
+        for metric in ("mae", "rmse", "macro-mase", "macro-rmsse", *(["crps"] if any("crps" in row for row in rows) else [])):
             global_rows.append(identity | _metric_difference(
                 metric, rows[a].get(metric, np.nan), rows[b].get(metric, np.nan),
             ))
         for partition, station_a in indexed[a].iterrows():
             station_b = indexed[b].loc[partition]
-            for metric in ("mae", "rmse", "mase", "rmsse"):
+            for metric in ("mae", "rmse", "mase", "rmsse", *(["crps"] if "crps" in station_a or "crps" in station_b else [])):
                 station_rows.append(identity | {"partition-id": partition, "station": station_a["station"]}
                                     | _metric_difference(metric, station_a.get(metric, np.nan), station_b.get(metric, np.nan)))
-    pd.DataFrame(global_rows).to_csv(output / "pairwise_comparison.csv", index=False)
-    pd.DataFrame(station_rows).to_csv(output / "station_pairwise_comparison.csv", index=False)
+    metrics_columns = ["metric", "value_a", "value_b", "delta_a_minus_b", "improvement_a_vs_b_pct"]
+    pd.DataFrame(global_rows, columns=["run_a", "run_b", *metrics_columns]).to_csv(output / "pairwise_comparison.csv", index=False)
+    pd.DataFrame(station_rows, columns=["run_a", "run_b", "partition-id", "station", *metrics_columns]).to_csv(output / "station_pairwise_comparison.csv", index=False)
 
 
-def compare_runs(paths: list[Path], output: Path) -> Path:
-    if len(paths) < 2 or len({path.resolve() for path in paths}) != len(paths):
+def compare_runs(paths: list[Path], output: Path, *, allow_training_differences: bool = False,
+                  allow_single: bool = False) -> Path:
+    if len(paths) < (1 if allow_single else 2) or len({path.resolve() for path in paths}) != len(paths):
         raise ValueError("Indica al menos dos ejecuciones diferentes y completas.")
     runs, rows, station_frames, warnings = [], [], [], []
     for path in paths:
         run = json.loads((path / "run.json").read_text(encoding="utf-8"))
         result = json.loads((path / "test_metrics.json").read_text(encoding="utf-8"))
         if runs and run["manifest_sha256"] != runs[0]["manifest_sha256"]:
-            raise ValueError("Comparación rechazada: los manifests/paneles/ventanas no son idénticos.")
+            signature = run["manifest"].get("evaluation_sha256")
+            if (not allow_training_differences or not signature
+                    or signature != runs[0]["manifest"].get("evaluation_sha256")):
+                raise ValueError("Comparación rechazada: los manifests/paneles/ventanas no son idénticos.")
+            warnings.append(f"Preparación de entrenamiento distinta, evaluación idéntica por firma: {path}.")
         if runs and run["versions"] != runs[0]["versions"]:
             warnings.append(f"Entorno distinto: {path}. Consulta versions en run.json.")
         if runs and run.get("granite_source") != runs[0].get("granite_source"):
@@ -82,9 +95,10 @@ def compare_runs(paths: list[Path], output: Path) -> Path:
         for client in run["manifest"]["clients"]:
             station = stations.loc[stations["partition-id"] == client["partition_id"]].iloc[0]
             if (station["station"] != client["station"] or station["num-examples"] != client["num_test_windows"]
-                    or station["num-targets"] != client["num_test_windows"] * run["manifest"]["geometry"]["horizon"]):
+                    or station["num-targets"] != client.get("num_test_targets", client["num_test_windows"] * run["manifest"]["geometry"]["horizon"])):
                 raise ValueError(f"Identidad o recuentos de test incompatibles: {path}")
-        if metrics["num-targets"] != sum(client["num_test_windows"] for client in run["manifest"]["clients"]) * run["manifest"]["geometry"]["horizon"]:
+        if metrics["num-targets"] != sum(client.get("num_test_targets", client["num_test_windows"] * run["manifest"]["geometry"]["horizon"])
+                                         for client in run["manifest"]["clients"]):
             raise ValueError(f"Número de targets incompatible: {path}")
         stations["run"], stations["model"], stations["mode"], stations["adaptation"] = label, model, mode, adaptation
         station_frames.append(stations)
@@ -94,10 +108,23 @@ def compare_runs(paths: list[Path], output: Path) -> Path:
             "flowstate_scale_factor": run["settings"].get("flowstate_scale_factor") if model == "flowstate-r1" else None,
             "revision": run.get("model", {}).get("revision"),
             "selection_metric": result.get("selection_metric"),
+            "missing_policy": resolve_missing_policy(model, run["settings"].get("missing_policy", "auto"), run["settings"].get("missing_policies", "{}")),
+            "candidate_configuration": sha256(json.dumps({
+                "settings": {key: value for key, value in run["settings"].items()
+                             if key not in {"seed", "output_dir", "manifest", "mlflow_tracking_uri",
+                                            "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level"}},
+                "mode": mode, "manifest": run["manifest_sha256"], "model": run.get("model"),
+                "application_sources": run.get("application_sources"), "versions": run["versions"],
+                "granite_source": run.get("granite_source"),
+            }, sort_keys=True).encode()).hexdigest(),
             "strategy": run["settings"]["strategy"] if mode == "federated" else "none",
             "selected_round": result["selected_round"], **metrics,
             "mae_improvement_vs_persistence_pct": (
                 100 * (1 - metrics["mae"] / metrics["baseline-mae"]) if metrics["baseline-mae"] else None
+            ),
+            "mae_improvement_vs_seasonal_naive_pct": (
+                100 * (1 - metrics["mae"] / metrics["seasonal-baseline-mae"])
+                if metrics.get("seasonal-baseline-mae") else None
             ),
         })
         runs.append(run)
@@ -123,10 +150,16 @@ def compare_runs(paths: list[Path], output: Path) -> Path:
     output = output.expanduser().resolve()
     output.mkdir(parents=True, exist_ok=False)
     pd.DataFrame(rows).to_csv(output / "comparison.csv", index=False)
+    _write_seed_summary(rows, output)
     pd.concat(station_frames, ignore_index=True).to_csv(output / "station_comparison.csv", index=False)
     _write_pairwise(rows, station_frames, output)
+    from fd_airquality.uncertainty import compare_calendar_blocks
+
+    compare_calendar_blocks(rows, output)
     (output / "comparison.json").write_text(json.dumps({
         "manifest_sha256": runs[0]["manifest_sha256"], "runs": [str(path.resolve()) for path in paths],
+        "evaluation_sha256": runs[0]["manifest"].get("evaluation_sha256"),
+        "allow_training_differences": allow_training_differences,
         "warnings": warnings,
         "interpretation": "Comparación descriptiva; targets rolling solapados, sin test de significación.",
         "pairwise_convention": "Todos los pares ordenados A/B. Delta = A - B; negativo favorece A. "
@@ -137,3 +170,17 @@ def compare_runs(paths: list[Path], output: Path) -> Path:
         print(f"AVISO: {warning}")
     print(f"Comparación: {output}")
     return output
+
+
+def _write_seed_summary(rows: list[dict], output: Path) -> None:
+    frame = pd.DataFrame(rows)
+    metrics = [name for name in ("mae", "rmse", "macro-mae", "macro-rmse", "macro-mase", "macro-rmsse", "crps") if name in frame]
+    summaries = []
+    for signature, group in frame.groupby("candidate_configuration", sort=False):
+        by_seed = group.groupby("seed", dropna=False)[metrics].mean()
+        identity = {key: group.iloc[0][key] for key in ("model", "mode", "adaptation", "strategy", "lora_rank", "missing_policy")}
+        row = identity | {"candidate_configuration": signature, "num_seeds": len(by_seed), "num_runs": len(group)}
+        for metric in metrics:
+            row.update({f"{metric}-mean": by_seed[metric].mean(), f"{metric}-std": by_seed[metric].std(ddof=1)})
+        summaries.append(row)
+    pd.DataFrame(summaries).to_csv(output / "seed_summary.csv", index=False)

@@ -8,9 +8,15 @@ import pytest
 from fd_airquality.data import DataConfig, prepare, read_manifest
 
 
+@pytest.fixture(autouse=True)
+def isolated_default_config(tmp_path, monkeypatch):
+    # Tests may create this controlled file, but never load the user's experiment.
+    monkeypatch.setattr("fd_airquality.configuration.DEFAULT_CONFIG", tmp_path / "fd-airquality.toml")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def cpu_test_environment():
-    # CUDA behavior is mocked explicitly in unit tests. In particular, Darts must
+    # CUDA behavior is mocked explicitly in unit tests. In particular, libraries must
     # not initialize every physical GPU just to preserve RNG state on CPU.
     with pytest.MonkeyPatch.context() as patch:
         patch.setenv("CUDA_VISIBLE_DEVICES", "")
@@ -63,8 +69,8 @@ def prepared(tmp_path, geometry):
         if hours > 10:
             values[20 * 12 : 25 * 12] = np.nan
             values[60 * 12 : 65 * 12] = np.nan
-        pd.DataFrame({"NO2": values}, index=index).to_csv(directory / f"{name}_NO2.csv")
-    path = prepare(raw, tmp_path / "prepared", "NO2", geometry)
+        pd.DataFrame({"PM25": values}, index=index).to_csv(directory / f"{name}_PM25.csv")
+    path = prepare(raw, tmp_path / "prepared", "PM25", geometry)
     return path, read_manifest(path)
 
 
@@ -78,9 +84,9 @@ def global_prepared(tmp_path):
         if name == "station-a":
             values[20 * 12:25 * 12] = np.nan
             values[60 * 12:65 * 12] = np.nan
-        pd.DataFrame({"NO2": values}, index=pd.date_range("2025-01-01", periods=len(values), freq="5min")).to_csv(folder / f"{name}_NO2.csv")
+        pd.DataFrame({"PM25": values}, index=pd.date_range("2025-01-01", periods=len(values), freq="5min")).to_csv(folder / f"{name}_PM25.csv")
     config = DataConfig(validation_start="2025-01-10", test_start="2025-01-12", test_end="2025-01-16")
-    path = prepare(raw, tmp_path / "global_prepared", "NO2", config)
+    path = prepare(raw, tmp_path / "global_prepared", "PM25", config)
     return path, read_manifest(path)
 
 
@@ -94,8 +100,8 @@ def selection_prepared(tmp_path, request):
         values = 10 + offset + np.sin(np.arange(len(index)) / 31) + np.arange(len(index)) / 10000
         if name == "station-a":
             values[96 * 12:144 * 12] = np.nan
-        pd.DataFrame({"NO2": values}, index=index).to_csv(folder / f"{name}_NO2.csv")
+        pd.DataFrame({"PM25": values}, index=index).to_csv(folder / f"{name}_PM25.csv")
     config = DataConfig(context=6, horizon=2, stride=2, error_scale_hours=48,
                         validation_start="2025-01-07", test_start="2025-01-09", test_end="2025-01-11")
-    path = prepare(raw, tmp_path / "selection_prepared", "NO2", config)
+    path = prepare(raw, tmp_path / "selection_prepared", "PM25", config)
     return path, read_manifest(path)

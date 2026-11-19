@@ -10,6 +10,7 @@ from pathlib import Path
 
 from fd_airquality.artifacts import file_digest
 from fd_airquality.data import read_manifest
+from fd_airquality.quality import evaluation_identity
 from fd_airquality.settings import RunSettings
 
 LOGGER = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ EXCLUSION_COLUMNS = (
 
 
 def selection_exclusions(manifest: dict, selection_metric: str) -> list[dict]:
-    if manifest["schema_version"] < 4 or selection_metric == "mae":
+    if manifest["schema_version"] < 4 or selection_metric in {"mae", "macro-mae"}:
         return []
     metric = selection_metric.removeprefix("macro-")
     rows = []
@@ -28,12 +29,15 @@ def selection_exclusions(manifest: dict, selection_metric: str) -> list[dict]:
         if client[f"validation_{metric}_defined"]:
             continue
         no_pairs = client["validation_scale_pairs"] == 0
+        insufficient = client["validation_scale_pairs"] < manifest.get("geometry", {}).get("min_scale_pairs", 1)
         rows.append({
             "station": client["station"],
             "source_partition_id": client.get("source_partition_id", client["partition_id"]),
-            "reason": "validation_reference_no_pairs" if no_pairs else f"validation_{metric}_scale_zero",
+            "reason": ("validation_reference_no_pairs" if no_pairs else "validation_reference_insufficient_pairs"
+                       if insufficient else f"validation_{metric}_scale_zero"),
             "detail": ("Sin pares observados en la referencia de validación."
-                       if no_pairs else f"Escala {metric.upper()} de validación nula."),
+                       if no_pairs else "Pares observados insuficientes para el mínimo configurado."
+                       if insufficient else f"Escala {metric.upper()} de validación nula."),
             "selection_metric": selection_metric,
             "reference_start": client["validation_scale_start"],
             "reference_end": client["validation_scale_end"],
@@ -84,6 +88,7 @@ def prepare_runtime_panel(settings: RunSettings, output: Path) -> tuple[RunSetti
                 "selection_metric": settings.selection_metric,
             }) | {"excluded_stations": (previous or {}).get("excluded_stations", []) + exclusions},
         }
+        manifest["evaluation_sha256"] = evaluation_identity(manifest)
     report = write_exclusions(manifest, output)
     if not manifest["clients"]:
         raise ValueError(f"Ninguna estación utilizable para {settings.selection_metric}. Consulta {report}")

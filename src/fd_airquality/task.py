@@ -16,7 +16,13 @@ from torch.utils.data import DataLoader, Dataset
 
 from fd_airquality.data import WindowDataset
 from fd_airquality.metrics import compute_mase, compute_rmsse
-from fd_airquality.models import ForecastAutoencoder, ForecastMLP, make_model, shared_state  # noqa: F401
+from fd_airquality.missing import (
+    forecast,
+    forecast_distribution,
+    impute_context,
+    resolve_missing_policy,
+)
+from fd_airquality.models import ForecastAutoencoder, make_model, shared_state  # noqa: F401
 from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 
@@ -46,6 +52,9 @@ def configure_torch(settings: RunSettings, seed: int) -> torch.device:
     np.random.seed(seed % (2**32))
     torch.manual_seed(seed)
     torch.set_num_threads(settings.torch_threads)
+    if settings.deterministic:
+        torch.use_deterministic_algorithms(True)
+        torch.backends.cudnn.benchmark = False
     return device
 
 
@@ -69,6 +78,8 @@ def train_local(
     parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if not parameters:
         raise ValueError("No hay parámetros entrenables; zero-shot no debe entrar en train_local.")
+    if not len(dataset):
+        raise ValueError("No hay ventanas admisibles de entrenamiento tras aplicar disponibilidad/llegada.")
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     reference = [parameter.detach().clone() for parameter in parameters] if proximal_mu else []
@@ -82,30 +93,52 @@ def train_local(
     )
     microbatch_size = _microbatch_size(settings, device)
     optimizer_steps = 0
-    total_squared_error, targets = 0.0, 0
+    total_squared_error, total_objective, targets = 0.0, 0.0, 0
     for epoch in range(1, settings.local_epochs + 1):
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches=0/{len(loader)} device={device} "
                         f"effective_batch_size={settings.batch_size} microbatch_size={microbatch_size}")
         last_report = time.monotonic()
         for batch, (inputs, actual) in enumerate(loader, start=1):
+            observed_targets = int(torch.isfinite(actual).sum())
+            if not observed_targets:
+                continue
             optimizer.zero_grad(set_to_none=True)
             for start in range(0, len(inputs), microbatch_size):
                 micro_inputs = inputs[start:start + microbatch_size].to(device)
                 micro_actual = actual[start:start + microbatch_size].to(device)
-                mse = nn.functional.mse_loss(model(micro_inputs), micro_actual)
-                loss = mse
+                mask = torch.isfinite(micro_actual)
+                if not mask.any():
+                    continue
+                policy = resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies)
+                if hasattr(model, "training_objective"):
+                    objective, squared = model.training_objective(
+                        micro_inputs, micro_actual, missing_policy=policy,
+                    )
+                    loss = objective * int(mask.sum()) / observed_targets
+                else:
+                    prediction = forecast(model, micro_inputs, settings)
+                    if prediction.shape != micro_actual.shape or not torch.isfinite(prediction).all():
+                        raise ValueError("Forma de predicción incompatible o predicciones no finitas.")
+                    squared = (prediction[mask] - micro_actual[mask]).square().sum()
+                    loss = squared / observed_targets
+                total_objective += float(loss.detach()) * observed_targets
                 if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight:
-                    loss = loss + settings.reconstruction_weight * model.reconstruction_loss(micro_inputs)
+                    filled = model.prepare_context(micro_inputs, policy)
+                    centered = filled - filled[:, -1:]
+                    reconstruction = model.reconstruction(model.encoder(centered))
+                    context_mask = torch.isfinite(micro_inputs)
+                    context_count = int(torch.isfinite(inputs).sum())
+                    loss = loss + settings.reconstruction_weight * (reconstruction[context_mask] - centered[context_mask]).square().sum() / max(1, context_count)
                 if not torch.isfinite(loss):
                     raise ValueError("Pérdida local no finita; se aborta para no contaminar los pesos globales.")
                 if not loss.requires_grad:
                     raise RuntimeError("El modelo cortó autograd: los adaptadores no reciben gradientes.")
                 # Weight by targets, including uneven microbatches and the final
                 # partial logical batch. Backward releases each activation graph.
-                (loss * (micro_actual.numel() / actual.numel())).backward()
-                total_squared_error += float(mse.detach()) * micro_actual.numel()
-                targets += micro_actual.numel()
-                del loss, mse
+                loss.backward()
+                total_squared_error += float(squared.detach())
+                targets += int(mask.sum())
+                del loss, squared
             if proximal_mu:
                 penalty = sum(
                     (parameter - initial).square().sum()
@@ -123,6 +156,8 @@ def train_local(
             if time.monotonic() - last_report >= settings.heartbeat_seconds:
                 report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={batch}/{len(loader)}")
                 last_report = time.monotonic()
+        if not targets:
+            raise ValueError("No hay targets de entrenamiento observados; no se puede optimizar.")
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={len(loader)}/{len(loader)} "
                         f"mse_normalized={total_squared_error / targets:.6g}")
     if any(not torch.isfinite(value).all() for value in shared_state(model).values()):
@@ -134,7 +169,13 @@ def train_local(
         "peak-process-rss-mib": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024,
         "effective-batch-size": settings.batch_size, "microbatch-size": microbatch_size,
         "optimizer-steps": optimizer_steps,
+        "num-targets": targets // settings.local_epochs,
     }
+    metrics["train-objective-normalized"] = total_objective / targets
+    if hasattr(dataset, "candidate_windows"):
+        metrics.update({"candidate-windows": dataset.candidate_windows,
+                        "availability-excluded-windows": dataset.availability_excluded_windows,
+                        "windows-before-cap": dataset.windows_before_cap})
     if device.type == "cuda":
         metrics["peak-cuda-allocated-mib"] = torch.cuda.max_memory_allocated(device) / 1024**2
     return metrics
@@ -150,39 +191,100 @@ def evaluate_local(
     seasonality: int,
 ) -> dict[str, float | int]:
     model.to(device).eval()
-    predictions, actuals, baselines = [], [], []
+    predictions, actuals, baselines, seasonal = [], [], [], []
+    missing_context = 0
+    quantile_batches, quantile_levels = [], None
+    row_offset = 0
     loader = DataLoader(dataset, batch_size=_microbatch_size(settings, device), num_workers=0)
     last_report = time.monotonic()
     for batch, (inputs, actual) in enumerate(loader, start=1):
-        forecast = model(inputs.to(device)).cpu().numpy().astype(np.float64)
-        predictions.append(forecast * dataset.scale + dataset.mean)
-        actuals.append(actual.numpy().astype(np.float64) * dataset.scale + dataset.mean)
+        if settings.probabilistic:
+            predicted, quantiles, levels = forecast_distribution(model, inputs.to(device), settings)
+            if quantiles is not None:
+                if quantile_levels is not None and list(levels) != list(quantile_levels):
+                    raise ValueError("Los niveles de cuantiles cambiaron entre lotes.")
+                quantile_levels = levels
+                quantile_batches.append(quantiles.cpu().numpy().astype(np.float64) * dataset.scale + dataset.mean)
+        else:
+            predicted = forecast(model, inputs.to(device), settings)
+        if predicted.shape != actual.shape or not torch.isfinite(predicted).all():
+            raise ValueError("Forma de predicción incompatible o predicciones no finitas.")
+        predictions.append(predicted.cpu().numpy().astype(np.float64) * dataset.scale + dataset.mean)
+        starts = dataset.starts[row_offset:row_offset + len(actual)]
+        row_offset += len(actual)
+        positions = starts[:, None] + dataset.context + np.arange(dataset.horizon)
+        # Score the canonical labels, not a normalization round trip whose
+        # rounding could depend on the candidate's training scaler.
+        actuals.append(artifact["values"][positions].astype(np.float64))
+        missing_context += int(torch.isnan(inputs).sum())
+        history = artifact["values"][starts[:, None] + np.arange(dataset.context)].astype(np.float64)
+        canonical_mean = float(artifact.get("canonical_mean", dataset.mean))
+        baseline_inputs = impute_context(torch.from_numpy(history - canonical_mean), "ffill").numpy() + canonical_mean
         baselines.append(np.repeat(
-            inputs[:, -1:].numpy().astype(np.float64) * dataset.scale + dataset.mean,
+            baseline_inputs[:, -1:],
             dataset.horizon, axis=1,
         ))
+        if dataset.context >= seasonality:
+            lags = dataset.context - seasonality + np.arange(dataset.horizon) % seasonality
+            seasonal.append(baseline_inputs[:, lags])
         if time.monotonic() - last_report >= settings.heartbeat_seconds:
             report_progress(dataset.split, f"batches={batch}/{len(loader)} device={device}")
             last_report = time.monotonic()
     prediction, actual, baseline = map(np.concatenate, (predictions, actuals, baselines))
     if not np.isfinite(prediction).all():
         raise ValueError("Predicciones no finitas.")
-    error, baseline_error = prediction - actual, baseline - actual
+    observed = np.isfinite(actual)
+    count = int(observed.sum())
+    if not count:
+        raise ValueError("No hay targets observados para evaluar.")
+    error = np.where(observed, prediction - actual, 0.0)
+    baseline_error = np.where(observed, baseline - actual, 0.0)
     stats: dict[str, float | int] = {
         "num-examples": len(dataset),
-        "num-targets": actual.size,
+        "num-targets": count,
+        "num-target-slots": actual.size,
+        "missing-targets": actual.size - count,
+        "missing-context-values": missing_context,
         "absolute-error-sum": float(np.abs(error).sum()),
         "squared-error-sum": float(np.square(error).sum()),
         "baseline-absolute-error-sum": float(np.abs(baseline_error).sum()),
         "baseline-squared-error-sum": float(np.square(baseline_error).sum()),
-        "mae": float(np.abs(error).mean()),
-        "mse": float(np.square(error).mean()),
-        "baseline-mae": float(np.abs(baseline_error).mean()),
+        "mae": float(np.abs(error).sum() / count),
+        "mse": float(np.square(error).sum() / count),
+        "baseline-mae": float(np.abs(baseline_error).sum() / count),
+        "signed-error-sum": float(error.sum()),
+        "bias": float(error.sum() / count),
+        "negative-predictions": int((prediction < 0).sum()),
+        "negative-prediction-fraction": float((prediction < 0).mean()),
         "mase-sum": 0.0,
         "mase-count": 0,
         "rmsse-sum": 0.0,
         "rmsse-count": 0,
     }
+    stats["probabilistic-available"] = int(bool(quantile_batches))
+    if quantile_batches:
+        from fd_airquality.probabilistic import quantile_statistics
+
+        stats.update(quantile_statistics(actual, np.concatenate(quantile_batches), quantile_levels))
+    if seasonal:
+        seasonal_error = np.where(observed, np.concatenate(seasonal) - actual, 0.0)
+        stats.update({"seasonal-baseline-absolute-error-sum": float(np.abs(seasonal_error).sum()),
+                      "seasonal-baseline-squared-error-sum": float(np.square(seasonal_error).sum()),
+                      "seasonal-baseline-mae": float(np.abs(seasonal_error).sum() / count)})
+    for lead in range(dataset.horizon):
+        prefix_lead = f"lead-{lead + 1:02d}"
+        stats.update({f"{prefix_lead}-count": int(observed[:, lead].sum()),
+                      f"{prefix_lead}-absolute-error-sum": float(np.abs(error[:, lead]).sum()),
+                      f"{prefix_lead}-squared-error-sum": float(np.square(error[:, lead]).sum())})
+    # Only final-test calendar aggregates leave the client, not predictions.
+    if dataset.split == "test" and "timestamps" in artifact:
+        origins = pd.to_datetime(artifact["timestamps"][dataset.starts + dataset.context]).normalize()
+        for day in origins.unique():
+            rows = origins == day
+            prefix_day = f"block-{day:%Y%m%d}"
+            stats.update({f"{prefix_day}-count": int(observed[rows].sum()),
+                          f"{prefix_day}-absolute-error-sum": float(np.abs(error[rows]).sum()),
+                          f"{prefix_day}-squared-error-sum": float(np.square(error[rows]).sum())})
     prefix = f"{dataset.split}_" if f"{dataset.split}_mase_scale" in artifact else ""
     if f"{prefix}mase_scale" in artifact and f"{prefix}rmsse_scale" in artifact:
         if prefix:
@@ -190,10 +292,15 @@ def evaluate_local(
         for name in ("mase", "rmsse"):
             denominator = float(artifact[f"{prefix}{name}_scale"])
             if np.isfinite(denominator) and denominator > 0:
-                per_origin = np.abs(error).mean(axis=1) / denominator if name == "mase" else np.sqrt(np.square(error).mean(axis=1) / denominator)
+                origin_counts = observed.sum(axis=1)
+                valid = origin_counts > 0
+                per_origin = (np.abs(error).sum(axis=1)[valid] / origin_counts[valid] / denominator if name == "mase"
+                              else np.sqrt(np.square(error).sum(axis=1)[valid] / origin_counts[valid] / denominator))
                 stats[f"{name}-sum"] = float(per_origin.sum())
                 stats[f"{name}-count"] = len(per_origin)
                 stats[name] = stats["mae"] / denominator if name == "mase" else float(np.sqrt(stats["mse"] / denominator))
+                stats[f"{name}-scaled-error-sum"] = (stats["absolute-error-sum"] if name == "mase" else stats["squared-error-sum"]) / denominator
+                stats[f"{name}-target-count"] = count
         return stats
     # Historical schema-2 artifacts only: their original origin-dependent scales
     # are not silently relabelled as a fixed-reference protocol.
@@ -221,7 +328,7 @@ def selection_value(metrics: dict, settings: RunSettings, *, local: bool = False
 
 
 def validate_selection_coverage(manifest: dict, settings: RunSettings, mode: str) -> None:
-    if manifest["schema_version"] < 4 or settings.selection_metric == "mae":
+    if manifest["schema_version"] < 4 or settings.selection_metric in {"mae", "macro-mae"}:
         return
     metric = settings.selection_metric.removeprefix("macro-")
     clients = manifest["clients"]

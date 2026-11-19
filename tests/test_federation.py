@@ -49,7 +49,7 @@ class LocalTestGrid:
 
 
 @pytest.mark.parametrize("strategy", ["fedavg", "fedprox"])
-@pytest.mark.parametrize("model", ["mlp", "autoencoder", "darts-nlinear", "flowstate-r1"])
+@pytest.mark.parametrize("model", ["mlp", "autoencoder", "nlinear", "nhits", "flowstate-r1"])
 def test_full_flower_strategy_selects_validation_then_tests_once(prepared, tmp_path, strategy, model, monkeypatch):
     if model == "flowstate-r1":
         from test_models import DummyBackbone

@@ -10,6 +10,7 @@ from flwr.serverapp import Grid, ServerApp
 from fd_airquality.data import read_manifest
 from fd_airquality.models import (
     effective_adaptation,
+    make_model,
     shared_state,
     validate_model_geometry,
     validate_run_mode,
@@ -18,7 +19,7 @@ from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
 from fd_airquality.settings import RunSettings
 from fd_airquality.strategy import AuditedStrategy
-from fd_airquality.task import configure_torch, make_model, validate_selection_coverage
+from fd_airquality.task import configure_torch, validate_selection_coverage
 from fd_airquality.tracking import RunTracker, write_run
 
 
@@ -53,7 +54,7 @@ def _run_server(grid, settings, output):
 def _fit(grid: Grid, settings: RunSettings, manifest: dict, strategy: AuditedStrategy):
     configure_torch(settings, settings.seed)
     arrays = ArrayRecord(shared_state(make_model(manifest["geometry"], settings, pretrained=False)))
-    # Round zero may be persistence, an untrained Darts model, or a foundation model.
+    # The initial state is evaluated only when the protocol allows it.
     validation_config = ConfigRecord({"split": "validation"})
     initial_messages = strategy.configure_evaluate(0, arrays, validation_config, grid)
     strategy.aggregate_evaluate(0, grid.send_and_receive(initial_messages, timeout=3600))

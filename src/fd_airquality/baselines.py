@@ -14,6 +14,7 @@ import torch
 from flwr.app import MetricRecord, RecordDict
 from torch.utils.data import ConcatDataset
 
+from fd_airquality.arrival import audit_normalization, normalization_artifact, training_view
 from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.data import WindowDataset, load_client_data, read_manifest
 from fd_airquality.models import (
@@ -119,9 +120,14 @@ def _run_baseline(settings, mode, manifest, output):
         report_progress("loading-data", f"station={manifest['clients'][partition]['station']} "
                         f"partition={partition + 1}/{len(manifest['clients'])}")
         _, artifact = load_client_data(settings.manifest, partition)
+        artifact = normalization_artifact(artifact, geometry, settings)
+        audit_normalization(artifact, settings, partition, output / "clients")
         artifacts.append(artifact)
         datasets.append({split: WindowDataset(artifact, split, geometry["context"], geometry["horizon"])
                          for split in ("train", "validation", "test")})
+        datasets[-1]["train"] = training_view(artifact, geometry, settings)
+        if mode != "zero-shot" and not len(datasets[-1]["train"]):
+            raise ValueError(f"Sin ventanas de entrenamiento para {manifest['clients'][partition]['station']} tras el umbral.")
     report_progress("loading-model", f"model={settings.model} device={settings.device}")
     write_run(output, settings, manifest, mode)
     with RunTracker(settings, output, mode, manifest) as tracker:
@@ -197,6 +203,8 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 selected_states[index] = _copy_state(models[index])
                 report_progress("checkpoint", f"model_index={index} selected_round={stage} score={candidate:.6g}")
     for index, model in enumerate(models):
+        last_filename = f"client_{index:03d}_last_model.pt" if independent else "last_model.pt"
+        torch.save(checkpoint_payload(geometry, settings, _copy_state(model), stages, state_role="training"), output / last_filename)
         load_shared_state(model, selected_states[index])
         filename = f"client_{index:03d}_best_model.pt" if independent else "best_model.pt"
         torch.save(checkpoint_payload(geometry, settings, selected_states[index], best_rounds[index]), output / filename)

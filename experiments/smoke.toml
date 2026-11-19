@@ -1,0 +1,40 @@
+[prepare]
+raw-root = "data/raw/datos_estaciones_5m"
+output = "data/smoke"
+pollutant = "PM25"
+context = 90
+horizon = 12
+stride = 6
+train-stride = 6
+station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+max-train-windows = 16
+window-policy = "masked"
+min-useful = 9
+hourly-repeat-filter = 0
+
+[run]
+device = "cpu"
+num-server-rounds = 3
+arrival-period-hours = 24
+normalization = "window"
+scaler-type = "standard"
+probabilistic = 1
+batch-size = 8
+mlflow-tracking-uri = "disabled"
+selection-metric = "macro-mae"
+
+[benchmark]
+models = ["mlp", "autoencoder", "nlinear", "nhits"]
+modes = ["local", "centralized", "federated"]
+seeds = [42]
+
+[prepare-backtest]
+output = "data/smoke_backtests"
+folds = 2
+step-hours = 672
+train-history = "expanding"
+
+[backtest]
+models = ["mlp", "autoencoder", "nlinear", "nhits"]
+modes = ["local", "centralized", "federated"]
+seeds = [42]

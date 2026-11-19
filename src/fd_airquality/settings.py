@@ -1,5 +1,6 @@
 """Shared configuration for the CLI and Flower App entrypoints."""
 
+import json
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
@@ -41,6 +42,16 @@ class RunSettings:
     selection_metric: str = "macro-mase"
     heartbeat_seconds: float = 60.0
     log_level: str = "INFO"
+    missing_policy: str = "auto"
+    missing_policies: str = "{}"
+    deterministic: int = 0
+    probabilistic: int = 0
+    training_data_availability_threshold: str = "0.0"
+    training_availability: str = "{}"
+    normalization: str = "window"
+    scaler_type: str = "standard"
+    normalization_reference_end: str = ""
+    arrival_period_hours: int = 24
 
     def __post_init__(self) -> None:
         for name in ("num_server_rounds", "local_epochs", "batch_size", "hidden_size", "torch_threads", "latent_size", "lora_rank", "fair_iterations"):
@@ -76,8 +87,30 @@ class RunSettings:
                 or self.lora_alpha <= 0 or not 0 <= self.lora_dropout < 1
                 or self.fair_learning_rate <= 0 or self.fair_lambda < 0 or not self.lora_targets.strip()):
             raise ValueError("Hiperparámetros LoRA/LoRA-FAIR inválidos.")
-        if self.selection_metric not in {"macro-mase", "macro-rmsse", "mae"}:
-            raise ValueError("selection_metric debe ser macro-mase, macro-rmsse o mae.")
+        if self.selection_metric not in {"macro-mase", "macro-rmsse", "mae", "macro-mae"}:
+            raise ValueError("selection_metric debe ser macro-mase, macro-rmsse, macro-mae o mae.")
+        from fd_airquality.missing import resolve_missing_policy
+
+        resolve_missing_policy(self.model, self.missing_policy, self.missing_policies)
+        from fd_airquality.availability import availability_threshold
+
+        availability_threshold(self)
+        if self.normalization not in {"window", "fixed", "none"}:
+            raise ValueError("normalization debe ser window, fixed o none.")
+        if self.scaler_type not in {"identity", "standard", "robust", "minmax"}:
+            raise ValueError("scaler_type debe ser identity, standard, robust o minmax.")
+        if self.normalization_reference_end:
+            import pandas as pd
+
+            date = pd.Timestamp(self.normalization_reference_end)
+            if pd.isna(date) or date.tz is not None or date != date.floor("h"):
+                raise ValueError("normalization_reference_end debe ser una fecha horaria sin zona.")
+        if type(self.arrival_period_hours) is not int or self.arrival_period_hours < 0:
+            raise ValueError("arrival_period_hours debe ser un entero no negativo (0 desactiva llegada).")
+        if type(self.deterministic) is not int or self.deterministic not in {0, 1}:
+            raise ValueError("deterministic debe ser 0/1.")
+        if type(self.probabilistic) is not int or self.probabilistic not in {0, 1}:
+            raise ValueError("probabilistic debe ser 0/1.")
         if not isfinite(self.heartbeat_seconds) or self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds debe ser finito y positivo.")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:
@@ -96,13 +129,18 @@ class RunSettings:
         return {key.replace("_", "-"): value for key, value in asdict(self).items()}
 
 
-def resolve_manifest(path: str | None) -> Path:
+def resolve_manifest(path: str | None, *, backtest: bool = False) -> Path:
     if path:
         result = Path(path).expanduser().resolve()
         if not result.is_file():
             raise FileNotFoundError(f"No existe el manifest: {result}")
         return result
-    candidates = list(Path("data/federated").glob("*/manifest.json"))
+    from fd_airquality.loaders import POLLUTANT
+
+    root, filename, command = (("data/backtests", "backtest_manifest.json", "prepare-backtest")
+                               if backtest else ("data/federated", "manifest.json", "prepare"))
+    candidates = [entry for entry in Path(root).glob(f"*/{filename}")
+                  if json.loads(entry.read_text(encoding="utf-8")).get("pollutant") == POLLUTANT]
     if not candidates:
-        raise FileNotFoundError("No hay datos preparados; ejecuta uv run fd-airquality prepare.")
+        raise FileNotFoundError(f"No hay datos preparados de {POLLUTANT}; ejecuta uv run fd-airquality {command}.")
     return max(candidates, key=lambda entry: entry.stat().st_mtime_ns).resolve()

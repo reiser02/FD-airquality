@@ -166,11 +166,11 @@ def test_reference_windows_exclude_old_and_future_values_and_do_not_follow_origi
 def test_causal_quality_is_prefix_invariant_at_completed_hours():
     index = pd.date_range("2025-01-01", periods=48, freq="5min")
     frame = pd.DataFrame({"station": np.r_[np.arange(10.), np.repeat(17., 38)]}, index=index)
-    full = hourly_mean(frame, "NO2", quality_mode="causal")
+    full = hourly_mean(frame, "PM25", quality_mode="causal")
     for hours in (1, 2, 3):
-        prefix = hourly_mean(frame.iloc[:hours * 12], "NO2", quality_mode="causal")
+        prefix = hourly_mean(frame.iloc[:hours * 12], "PM25", quality_mode="causal")
         pd.testing.assert_frame_equal(prefix, full.iloc[:hours])
-    retrospective = hourly_mean(frame, "NO2", quality_mode="retrospective")
+    retrospective = hourly_mean(frame, "PM25", quality_mode="retrospective")
     assert not full.equals(retrospective)
 
 
@@ -180,8 +180,8 @@ def test_global_preparation_has_audited_retention_and_immutable_calendar(tmp_pat
         folder = raw / name
         folder.mkdir(parents=True)
         values = 10 + np.sin(np.arange(hours * 12) / 31)
-        pd.DataFrame({"NO2": values}, index=pd.date_range("2025-01-01", periods=len(values), freq="5min")).to_csv(folder / f"{name}_NO2.csv")
-    path = prepare(raw, tmp_path / "prepared", "NO2", global_geometry)
+        pd.DataFrame({"PM25": values}, index=pd.date_range("2025-01-01", periods=len(values), freq="5min")).to_csv(folder / f"{name}_PM25.csv")
+    path = prepare(raw, tmp_path / "prepared", "PM25", global_geometry)
     manifest = read_manifest(path)
     assert manifest["schema_version"] == 4
     assert manifest["protocol"] == "global_temporal_forecasting_v3"

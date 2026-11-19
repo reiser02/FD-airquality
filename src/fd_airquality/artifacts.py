@@ -12,6 +12,7 @@ PREPARATION_FILES = (
     "preprocessing.py",
     "splitting.py",
     "metrics.py",
+    "quality.py",
 )
 
 

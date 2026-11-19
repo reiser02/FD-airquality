@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import tomllib
 from dataclasses import fields
 from pathlib import Path
@@ -10,7 +11,7 @@ from pathlib import Path
 from fd_airquality.settings import RunSettings
 
 DEFAULT_CONFIG = Path("fd-airquality.toml")
-RUN_COMMANDS = {"simulate", "baseline", "benchmark"}
+RUN_COMMANDS = {"simulate", "baseline", "benchmark", "backtest"}
 
 
 def _value(action: argparse.Action, value, location: str):
@@ -41,13 +42,30 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
             document = tomllib.load(stream)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"TOML inválido en {path}: {exc}") from exc
-    unknown = document.keys() - (commands.keys() | {"run"})
+    unknown = document.keys() - (commands.keys() | {"run", "missing", "availability"})
     if unknown:
         raise ValueError(f"Secciones desconocidas en {path}: {sorted(unknown)}")
     sections = {}
     for section, options in document.items():
         if not isinstance(options, dict):
             raise TypeError(f"{path}: [{section}] debe ser una tabla TOML.")
+        if section == "missing":
+            from fd_airquality.missing import DEFAULT_POLICIES, POLICIES
+
+            if set(options) - DEFAULT_POLICIES.keys() or any(not isinstance(value, str) or value not in POLICIES for value in options.values()):
+                raise ValueError(f"{path}: [missing] debe asociar modelos conocidos a políticas válidas.")
+            sections[section] = options
+            continue
+        if section == "availability":
+            from fd_airquality.availability import parse_threshold
+            from fd_airquality.models import MODEL_NAMES
+
+            if set(options) - set(MODEL_NAMES):
+                raise ValueError(f"{path}: [availability] contiene modelos desconocidos.")
+            for value in options.values():
+                parse_threshold(value)
+            sections[section] = options
+            continue
         command = commands["simulate" if section == "run" else section]
         actions = {action.dest: action for action in command._actions if action.dest not in {"help", "config"}}
         if section == "run":
@@ -59,6 +77,11 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
                 raise ValueError(f"Opción desconocida en {path}: [{section}].{key}")
             if name in converted:
                 raise ValueError(f"Opción duplicada en {path}: [{section}].{key}")
+            if name == "training_data_availability_threshold" and not isinstance(value, str):
+                from fd_airquality.availability import parse_threshold
+
+                parse_threshold(value)
+                value = json.dumps(value)
             converted[name] = _value(actions[name], value, f"{path}: [{section}].{key}")
         sections[section] = converted
     return sections
@@ -79,6 +102,13 @@ def parse_configured_args(parser: argparse.ArgumentParser, commands: dict[str, a
         raise ValueError(str(exc)) from exc
     command = defaults["command"]
     configured = (sections.get("run", {}) if command in RUN_COMMANDS else {}) | sections.get(command, {})
+    if command == "prepare-backtest":
+        inherited = {key: value for key, value in sections.get("prepare", {}).items() if key != "output"}
+        configured = inherited | configured
+    if command in RUN_COMMANDS and "missing" in sections:
+        configured.setdefault("missing_policies", json.dumps(sections["missing"], sort_keys=True))
+    if command in RUN_COMMANDS and "availability" in sections:
+        configured.setdefault("training_availability", json.dumps(sections["availability"], sort_keys=True))
     actions = [action for owner in (parser, *commands.values()) for action in owner._actions]
     saved = [action.default for action in actions]
     try:

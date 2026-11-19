@@ -1,28 +1,23 @@
-"""Seasonal error scales on real timestamps, plus legacy Darts metric wrappers."""
+"""Calendar-preserving seasonal scales and observed-label external scores."""
 
 from __future__ import annotations
 
-import logging
-
 import numpy as np
 import pandas as pd
-from darts import TimeSeries
-from darts.metrics import mase as darts_mase
-from darts.metrics import rmsse as darts_rmsse
-
-logger = logging.getLogger(__name__)
 
 
 def seasonal_error_scales(series: pd.Series, seasonality: int) -> tuple[float, float, int]:
-    """Return absolute/squared seasonal difference means and valid pair count.
+    """Average valid seasonal pairs, preserving real hourly lags across gaps.
 
-    Only the endpoints must be observed. Datetime lags are elapsed hours, never
-    positions in a compacted array. The caller supplies the reference interval.
+    The caller defines the historical reference. No interpolation, compaction,
+    or extension of that reference is performed.
     """
     values = series.to_numpy(dtype=float)
     if not isinstance(seasonality, int) or isinstance(seasonality, bool) or seasonality < 1:
         raise ValueError("La estacionalidad debe ser un entero positivo.")
     if isinstance(series.index, pd.DatetimeIndex):
+        if not series.index.is_unique:
+            raise ValueError("La referencia estacional contiene timestamps duplicados.")
         previous = series.reindex(series.index - pd.Timedelta(hours=seasonality)).to_numpy(dtype=float)
     else:
         if len(values) <= seasonality:
@@ -35,80 +30,50 @@ def seasonal_error_scales(series: pd.Series, seasonality: int) -> tuple[float, f
     return float(np.abs(differences).mean()), float(np.square(differences).mean()), len(differences)
 
 
-def compute_mase(
-    actual: pd.Series | TimeSeries,
-    pred: pd.Series | TimeSeries,
-    insample: pd.Series | TimeSeries,
-    *,
-    seasonality_m: int,
-) -> float:
-    actual_s = actual.to_series() if isinstance(actual, TimeSeries) else actual
-    pred_s = pred.to_series() if isinstance(pred, TimeSeries) else pred
-    insample_s = insample.to_series() if isinstance(insample, TimeSeries) else insample
+def effective_error_scales(absolute: float, squared: float, pairs: int, *,
+                           policy: str = "unfloored", epsilon: float = 0.01,
+                           min_pairs: int = 1) -> tuple[float, float]:
+    # Read old immutable manifests without silently changing their definition.
+    policy = {"gift": "unfloored", "impermanent": "epsilon"}.get(policy, policy)
+    if policy not in {"unfloored", "epsilon"} or not np.isfinite(epsilon) or epsilon <= 0:
+        raise ValueError("Política de escalas o epsilon inválidos.")
+    if not np.isfinite([absolute, squared]).all() or absolute < 0 or squared < 0:
+        raise ValueError("Las escalas deben ser finitas y no negativas.")
+    if type(pairs) is not int or type(min_pairs) is not int or pairs < 0 or min_pairs < 1:
+        raise ValueError("Los recuentos de pares deben ser enteros válidos.")
+    if pairs < min_pairs:
+        return 0.0, 0.0
+    if policy == "epsilon":
+        return max(absolute, epsilon), max(squared, epsilon**2)
+    return absolute, squared
 
-    aligned_idx = actual_s.index.intersection(pred_s.index)
-    actual_s = actual_s.reindex(aligned_idx).astype(float)
-    pred_s = pred_s.reindex(aligned_idx).astype(float)
-    valid = np.isfinite(actual_s.to_numpy()) & np.isfinite(pred_s.to_numpy())
-    actual_values = actual_s.to_numpy()[valid]
-    pred_values = pred_s.to_numpy()[valid]
-    if len(actual_values) == 0:
+
+def _scaled_error(actual, pred, insample, seasonality_m: int, squared: bool,
+                  policy: str, epsilon: float) -> float:
+    actual = actual if isinstance(actual, pd.Series) else actual.to_series()
+    pred = pred if isinstance(pred, pd.Series) else pred.to_series()
+    insample = insample if isinstance(insample, pd.Series) else insample.to_series()
+    if not actual.index.equals(pred.index):
+        raise ValueError("Predicción y targets deben tener exactamente el mismo índice.")
+    forecasts = pred.to_numpy(dtype=float)
+    if not np.isfinite(forecasts).all():
+        raise ValueError("Predicciones no finitas; no se pueden omitir para mejorar la métrica.")
+    truth = actual.to_numpy(dtype=float)
+    mask = np.isfinite(truth)
+    absolute, square, pairs = seasonal_error_scales(insample, seasonality_m)
+    absolute, square = effective_error_scales(absolute, square, pairs, policy=policy, epsilon=epsilon)
+    denominator = square if squared else absolute
+    if not mask.any() or denominator <= 0:
         return float("nan")
-
-    insample_values = insample_s.astype(float).to_numpy()
-    if len(insample_values) <= seasonality_m or np.isinf(insample_values).any():
-        return float("nan")
-
-    # Synthetic indices meet Darts' insample boundary contract without compacting history.
-    split = len(insample_values)
-    insample_ts = TimeSeries.from_times_and_values(pd.RangeIndex(split), insample_values)
-    eval_index = pd.RangeIndex(split, split + len(actual_values))
-    actual_ts = TimeSeries.from_times_and_values(eval_index, actual_values)
-    pred_ts = TimeSeries.from_times_and_values(eval_index, pred_values)
-    try:
-        value = float(darts_mase(
-            actual_series=actual_ts, pred_series=pred_ts, insample=insample_ts, m=int(seasonality_m),
-        ))
-        return value if np.isfinite(value) else float("nan")
-    except Exception as exc:  # noqa: BLE001 -- undefined Darts scales remain missing.
-        logger.warning("MASE no computable: %s", exc)
-        return float("nan")
+    errors = forecasts[mask] - truth[mask]
+    return float(np.sqrt(np.square(errors).mean() / denominator) if squared else np.abs(errors).mean() / denominator)
 
 
-def compute_rmsse(
-    actual: pd.Series | TimeSeries,
-    pred: pd.Series | TimeSeries,
-    insample: pd.Series | TimeSeries,
-    *,
-    seasonality_m: int,
-) -> float:
-    actual_s = actual.to_series() if isinstance(actual, TimeSeries) else actual
-    pred_s = pred.to_series() if isinstance(pred, TimeSeries) else pred
-    insample_s = insample.to_series() if isinstance(insample, TimeSeries) else insample
+def compute_mase(actual, pred, insample, *, seasonality_m: int,
+                 policy: str = "unfloored", epsilon: float = 0.01) -> float:
+    return _scaled_error(actual, pred, insample, seasonality_m, False, policy, epsilon)
 
-    aligned_idx = actual_s.index.intersection(pred_s.index)
-    actual_s = actual_s.reindex(aligned_idx).astype(float)
-    pred_s = pred_s.reindex(aligned_idx).astype(float)
-    valid = np.isfinite(actual_s.to_numpy()) & np.isfinite(pred_s.to_numpy())
-    actual_values = actual_s.to_numpy()[valid]
-    pred_values = pred_s.to_numpy()[valid]
-    if len(actual_values) == 0:
-        return float("nan")
 
-    insample_values = insample_s.astype(float).to_numpy()
-    if len(insample_values) <= seasonality_m or np.isinf(insample_values).any():
-        return float("nan")
-
-    split = len(insample_values)
-    insample_ts = TimeSeries.from_times_and_values(pd.RangeIndex(split), insample_values)
-    eval_index = pd.RangeIndex(split, split + len(actual_values))
-    actual_ts = TimeSeries.from_times_and_values(eval_index, actual_values)
-    pred_ts = TimeSeries.from_times_and_values(eval_index, pred_values)
-    try:
-        value = float(darts_rmsse(
-            actual_series=actual_ts, pred_series=pred_ts, insample=insample_ts, m=int(seasonality_m),
-        ))
-        return value if np.isfinite(value) else float("nan")
-    except Exception as exc:  # noqa: BLE001 -- undefined Darts scales remain missing.
-        logger.warning("RMSSE no computable: %s", exc)
-        return float("nan")
+def compute_rmsse(actual, pred, insample, *, seasonality_m: int,
+                   policy: str = "unfloored", epsilon: float = 0.01) -> float:
+    return _scaled_error(actual, pred, insample, seasonality_m, True, policy, epsilon)

@@ -11,7 +11,7 @@ from fd_airquality.settings import RunSettings
 
 
 @pytest.mark.parametrize("mode", ["local", "centralized"])
-@pytest.mark.parametrize("model", ["mlp", "autoencoder", "darts-nlinear"])
+@pytest.mark.parametrize("model", ["mlp", "autoencoder", "nlinear", "nhits"])
 def test_non_federated_controls_select_validation_and_test_once(prepared, tmp_path, monkeypatch, mode, model):
     from fd_airquality.baselines import evaluate_local as original
 

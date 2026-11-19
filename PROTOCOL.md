@@ -1,8 +1,19 @@
 # Protocolo de forecasting federado
 
+> **Ámbito de esta referencia:** las restricciones de ventanas completas y los
+> recuentos históricos de este documento describen el protocolo estricto de
+> esquema 4. El TOML raíz utiliza ahora ventanas `masked` de esquema 5 y
+> tratamiento del contexto específico por modelo. Su definición, folds
+> con reinicio de modelos por fold, pérdida enmascarada, ponderación por targets,
+> métricas externas, cuantiles y auditoría están en
+> [TEMPORAL_EVALUATION.md](TEMPORAL_EVALUATION.md). No se reinterpretan artefactos
+> históricos como resultados del nuevo protocolo. Las secciones siguientes son
+> una referencia histórica: las reglas actuales de normalización, llegada por
+> ronda, selección y modelos de NeuralForecast prevalecen en esa guía.
+
 ## Datos fragmentados e implementación local
 
-Un experimento trabaja con un único contaminante. Cada CSV de estación genera
+El único contaminante admitido es PM2.5 (`PM25`). Cada CSV de PM25 de una estación genera
 un cliente, sin mezclar estaciones ni sus calendarios. Los datos se leen de una
 copia física local en `data/raw/datos_estaciones_5m/`; las preparaciones se escriben
 sin alterar esos CSV. No se necesitan código, configuración ni datos de otro
@@ -24,7 +35,7 @@ El tratamiento conserva la geometría temporal: primero rejilla de
 cinco minutos, después media horaria de lecturas útiles. Actualmente `min_run=6`
 detecta rachas congeladas **no nulas** desde la sexta lectura de cinco minutos y
 `min_useful=1` exige una lectura útil por hora. Se aplican los límites de detección
-locales (`0.0` para CO, NO₂ y O₃, con comparación inclusiva `>=`) y se marcan
+locales (`0.0` para PM25, con comparación inclusiva `>=`) y se marcan
 repeticiones horarias no nulas. Los ceros se tratan por separado: una racha corta
 puede ser válida; `zero_run_hours=24` (`prepare --zero-run-hours`) marca como
 congelado al acumular 24 horas observadas a cero desde la última hora válida no
@@ -114,8 +125,8 @@ univariante sobre las mismas ventanas. No se comparten estadísticas de normaliz
 
 ### Modelos y parámetros agregados
 
-- **MLP residual:** la última capa inicializada a cero hace que la ronda cero
-  equivalga a persistencia.
+- **MLP:** actualmente usa el paquete NeuralForecast; su inicialización no equivale
+  necesariamente a persistencia.
 - **Autoencoder de forecasting:** encoder `context → hidden → latent`, decoder
   `latent → hidden → context` y cabeza `latent → horizon`, residual respecto a la
   última observación. Se minimiza MSE de forecasting más
@@ -124,11 +135,9 @@ univariante sobre las mismas ventanas. No se comparten estadísticas de normaliz
   no imputa huecos ni ve targets de validación/test. Flower agrega encoder,
   decoder y cabeza. `latent-size` es 16 por defecto; la selección usa únicamente
   error de forecasting, no reconstrucción. La ronda cero es persistencia.
-- **Darts NLinear:** módulo original de Darts 0.48.x, con normalización por última
-  observación y pesos compartidos. Se construye mediante su hook `_create_model`
-  y se invoca con `PLModuleInput`, sin `fit` sobre series compactadas. El bucle
-  común usa AdamW y las ventanas auditadas; no es el Trainer predeterminado de
-  Darts. Su inicialización es la de Darts y no se presupone persistencia.
+- **NLinear y NHITS:** actualmente se utilizan directamente las clases del paquete
+  NeuralForecast, sus máscaras, su `TemporalNorm` y sus pérdidas. El bucle externo
+  conserva AdamW, Flower y los cortes auditados. No se copia su implementación.
 - **Granite TTM-R3, PatchTST-FM-R2 y FlowState-R1:** adaptación interna en lineales
   `W0 + (alpha/r) BA`, no MLP externo ni fine-tuning completo. Pesos preentrenados
   y dropout del backbone permanecen congelados/en evaluación, pero autograd

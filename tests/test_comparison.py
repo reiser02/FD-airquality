@@ -88,3 +88,52 @@ def test_zero_reference_error_has_a_delta_but_no_infinite_percentage(completed_r
     assert (zero_reference.delta_a_minus_b == 1.).all()
     assert zero_reference.improvement_a_vs_b_pct.isna().all()
     assert not np.isinf(pairs.improvement_a_vs_b_pct).any()
+
+
+def test_seed_summary_averages_repeated_seeds_before_reporting_variability(completed_run, tmp_path):
+    paths = [completed_run("seed42a", score=2.), completed_run("seed42b", score=4.),
+             completed_run("seed43", score=6.)]
+    metadata = json.loads((paths[2] / "run.json").read_text())
+    metadata["settings"]["seed"] = 43
+    (paths[2] / "run.json").write_text(json.dumps(metadata))
+    output = compare_runs(paths, tmp_path / "comparison")
+    summary = pd.read_csv(output / "seed_summary.csv")
+    assert len(summary) == 1
+    assert summary.iloc[0]["num_seeds"] == 2
+    assert summary.iloc[0]["num_runs"] == 3
+    assert summary.iloc[0]["mae-mean"] == 4.5
+    assert summary.iloc[0]["mae-std"] == pytest.approx(np.std([3., 6.], ddof=1))
+
+
+@pytest.mark.parametrize("changed", ["model", "application_sources", "versions"])
+def test_seed_summary_never_pools_different_checkpoints_or_software(completed_run, tmp_path, changed):
+    paths = [completed_run("first"), completed_run("second")]
+    metadata = json.loads((paths[1] / "run.json").read_text())
+    if changed == "model":
+        metadata["model"]["revision"] = "another-pinned-revision"
+    else:
+        metadata[changed] = {"changed": "revision"}
+    (paths[1] / "run.json").write_text(json.dumps(metadata))
+    output = compare_runs(paths, tmp_path / "comparison")
+    summary = pd.read_csv(output / "seed_summary.csv")
+    assert len(summary) == 2
+    assert summary["num_seeds"].eq(1).all()
+    assert summary["mae-std"].isna().all()
+
+
+@pytest.mark.parametrize("allow,matches", [(False, True), (True, False), (True, True)])
+def test_distinct_training_artifacts_need_opt_in_and_matching_evaluation(completed_run, tmp_path, allow, matches):
+    paths = [completed_run("first"), completed_run("second")]
+    for index, path in enumerate(paths):
+        metadata = json.loads((path / "run.json").read_text())
+        metadata["manifest_sha256"] = f"training-{index}"
+        metadata["manifest"]["evaluation_sha256"] = "common-evaluation" if matches else f"evaluation-{index}"
+        (path / "run.json").write_text(json.dumps(metadata))
+    if not (allow and matches):
+        with pytest.raises(ValueError, match="manifests/paneles/ventanas"):
+            compare_runs(paths, tmp_path / "comparison", allow_training_differences=allow)
+    else:
+        output = compare_runs(paths, tmp_path / "comparison", allow_training_differences=True)
+        metadata = json.loads((output / "comparison.json").read_text())
+        assert metadata["allow_training_differences"]
+        assert any("evaluación idéntica por firma" in warning for warning in metadata["warnings"])

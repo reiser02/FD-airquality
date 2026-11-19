@@ -86,7 +86,7 @@ def test_concurrency_cap_limits_non_federated_candidates(tmp_path, monkeypatch):
         return result(tmp_path, len(seen))
 
     monkeypatch.setattr("fd_airquality.execution._candidate_process", parallel)
-    plan = [candidate(name, "local") for name in ("mlp", "autoencoder", "darts-nlinear")]
+    plan = [candidate(name, "local") for name in ("mlp", "autoencoder", "nlinear")]
     with RunLogging(tmp_path, "test", stream=StringIO()) as log:
         execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                      max_parallel_models=1, baseline=None, launch=None, progress_log=log)

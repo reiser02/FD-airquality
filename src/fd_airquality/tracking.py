@@ -6,6 +6,7 @@ import json
 import logging
 import math
 import os
+import platform
 import resource
 import sys
 import time
@@ -14,7 +15,10 @@ from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 
+import torch
+
 from fd_airquality.artifacts import file_digest
+from fd_airquality.missing import resolve_missing_policy
 from fd_airquality.models import model_metadata
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
@@ -45,21 +49,56 @@ def initialize_tracking(settings: RunSettings, artifacts: Path) -> None:
 def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) -> None:
     versions = {}
     for name in (
-        "fd-airquality", "flwr", "ray", "torch", "darts", "numpy", "pandas", "numba",
+        "fd-airquality", "flwr", "ray", "torch", "neuralforecast", "numpy", "pandas", "numba",
         "scipy", "scikit-learn", "granite-tsfm", "transformers", "datasets", "mlflow",
     ):
         try:
             versions[name] = version(name)
         except PackageNotFoundError:
             versions[name] = "not-installed"
+    hardware = {"platform": platform.platform(), "machine": platform.machine(),
+                "torch_cuda": torch.version.cuda, "cudnn": None,
+                "deterministic_algorithms": torch.are_deterministic_algorithms_enabled(),
+                "cudnn_benchmark": torch.backends.cudnn.benchmark}
+    if settings.device == "cuda":
+        try:
+            hardware["cudnn"] = torch.backends.cudnn.version()
+        except RuntimeError as exc:
+            hardware["cudnn_metadata_error"] = str(exc)
+        hardware["gpus"] = [{"name": torch.cuda.get_device_properties(index).name,
+                             "total_memory": torch.cuda.get_device_properties(index).total_memory}
+                            for index in range(torch.cuda.device_count())]
+    progressive = bool(mode == "federated" and settings.arrival_period_hours
+                       and manifest["geometry"].get("split_mode") == "global")
     (output / "run.json").write_text(json.dumps({
         "mode": mode, "settings": asdict(settings),
         "manifest_sha256": file_digest(Path(settings.manifest)), "manifest": manifest,
         "model": model_metadata(manifest["geometry"], settings),
         "python": sys.version, "versions": versions,
         "granite_source": json.loads(distribution("granite-tsfm").read_text("direct_url.json") or "null"),
+        "neuralforecast_source": json.loads(distribution("neuralforecast").read_text("direct_url.json") or "null"),
         "application_sources": {path.name: file_digest(path) for path in sorted(Path(__file__).parent.glob("*.py"))},
         "execution": {"pid": os.getpid(), "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES")},
+        "hardware": hardware,
+        "development_lock_sha256": file_digest(Path("uv.lock")) if Path("uv.lock").is_file() else None,
+        "initialization": {"fold": "fresh", "trained_checkpoint_reused": False,
+                           "base": "pinned_pretrained" if settings.model in {"ttm-r3", "patchtst-fm-r2", "flowstate-r1"} else "seeded_random"},
+        "missing_data": {"policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
+                         "target_policy": "observed_only", "window_policy": manifest["geometry"].get("window_policy", "strict"),
+                         "training_threshold": settings.training_data_availability_threshold,
+                         "model_thresholds": json.loads(settings.training_availability),
+                         "normalization": settings.normalization, "scaler_type": settings.scaler_type},
+        "probabilistic_protocol": {"crps": "quantile_integral_trapezoid_constant_tails_approximation",
+                                   "truth": "canonical_observed_original_units"},
+        "arrival_protocol": {"period_hours": settings.arrival_period_hours if progressive else 0,
+                              "history": "new-only" if progressive else None,
+                              "training_targets": "current_block_only" if progressive else "full_fold_training",
+                              "block_schedule": "initial_prefix_then_calendar_increments" if progressive else None,
+                              "validation": "after_final_arrival" if progressive else "each_stage",
+                              "weight_continuity": "within_fold_rounds_only"},
+        "metric_protocol": {"implementation": "masked_seasonal_errors_v1",
+                             "reference": manifest["geometry"].get("error_scale_reference", "pre-evaluation"),
+                             "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
         "training_budget": {
             "stages": 0 if mode == "zero-shot" else settings.num_server_rounds,
             "epochs_per_stage": settings.local_epochs,

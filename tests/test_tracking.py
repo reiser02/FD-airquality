@@ -5,7 +5,7 @@ from mlflow import MlflowClient
 
 from fd_airquality.baselines import run_baseline
 from fd_airquality.settings import RunSettings
-from fd_airquality.tracking import tracking_uri
+from fd_airquality.tracking import tracking_uri, write_run
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -44,3 +44,24 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
 def test_relative_sqlite_uri_is_resolved_before_flower_changes_directory(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert tracking_uri(RunSettings(mlflow_tracking_uri="sqlite:///mlflow.db")) == f"sqlite:///{tmp_path / 'mlflow.db'}"
+
+
+def test_cpu_run_metadata_never_initializes_cuda_or_cudnn(prepared, tmp_path, monkeypatch):
+    path, manifest = prepared
+
+    def unexpected_probe(*_, **__):
+        pytest.fail("CPU metadata must not probe CUDA or initialize cuDNN")
+
+    monkeypatch.setattr("torch.backends.cudnn.version", unexpected_probe)
+    for name in ("is_available", "device_count", "get_device_properties", "init", "_lazy_init"):
+        monkeypatch.setattr(f"torch.cuda.{name}", unexpected_probe)
+    settings = RunSettings(manifest=str(path), device="cpu", mlflow_tracking_uri="disabled")
+
+    write_run(tmp_path, settings, manifest, "centralized")
+
+    run = json.loads((tmp_path / "run.json").read_text())
+    hardware = run["hardware"]
+    assert hardware["cudnn"] is None
+    assert "gpus" not in hardware
+    assert run["arrival_protocol"]["period_hours"] == 0
+    assert run["arrival_protocol"]["training_targets"] == "full_fold_training"

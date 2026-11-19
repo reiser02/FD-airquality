@@ -124,11 +124,11 @@ def test_no_eligible_station_still_writes_exclusions(tmp_path, geometry):
     raw = tmp_path / "raw" / "short"
     raw.mkdir(parents=True)
     pd.DataFrame(
-        {"NO2": np.arange(12, dtype=float)},
+        {"PM25": np.arange(12, dtype=float)},
         index=pd.date_range("2025-01-01", periods=12, freq="5min"),
-    ).to_csv(raw / "short_NO2.csv")
+    ).to_csv(raw / "short_PM25.csv")
     with pytest.raises(ValueError, match="Ninguna estación"):
-        prepare(raw.parent, tmp_path / "prepared", "NO2", geometry)
+        prepare(raw.parent, tmp_path / "prepared", "PM25", geometry)
     reports = list((tmp_path / "prepared").glob("*/excluded_stations.csv"))
     assert len(reports) == 1
     assert pd.read_csv(reports[0]).station.to_list() == ["short"]
@@ -141,8 +141,8 @@ def test_preparation_preserves_frozen_and_negative_intervals(tmp_path, geometry)
     values = 10 + np.sin(np.arange(len(index)) / 30)
     values[:12] = 50.0  # a frozen sensor, not twelve valid observations
     values[24:36] = -1.0  # below the pollutant detection limit
-    pd.DataFrame({"NO2": values}, index=index).to_csv(raw / "station_NO2.csv")
-    path = prepare(raw.parent, tmp_path / "prepared", "NO2", geometry)
+    pd.DataFrame({"PM25": values}, index=index).to_csv(raw / "station_PM25.csv")
+    path = prepare(raw.parent, tmp_path / "prepared", "PM25", geometry)
     _, artifact = load_client_data(str(path), 0)
     assert np.isnan(artifact["values"][0])
     assert np.isnan(artifact["values"][2])
@@ -154,13 +154,13 @@ def test_special_upct_format_preserves_station_identity(tmp_path, geometry):
     raw.mkdir(parents=True)
     index = pd.date_range("2025-01-01 00:00:03", periods=120 * 12, freq="5min")
     frame = pd.DataFrame({
-        "Datetime": index, "NO2 (ug/m3)": 10 + np.sin(np.arange(len(index)) / 30),
-        "Flag NO2": 0,
+        "Datetime": index, "PM25 (ug/m3)": 10 + np.sin(np.arange(len(index)) / 30),
+        "Flag PM25": 0,
     })
-    path = raw / "UPCT_NO2.csv"
+    path = raw / "UPCT_PM25.csv"
     path.write_text("UPCT export\n" + frame.to_csv(index=False, sep=";", decimal=","))
-    manifest_path = prepare(raw.parent, tmp_path / "prepared", "NO2", geometry)
+    manifest_path = prepare(raw.parent, tmp_path / "prepared", "PM25", geometry)
     manifest, artifact = load_client_data(str(manifest_path), 0)
-    assert manifest["clients"][0]["station"] == "UPCT_NO2"
+    assert manifest["clients"][0]["station"] == "UPCT_PM25"
     assert len(manifest["clients"]) == 1
     assert len(artifact["values"]) == 120

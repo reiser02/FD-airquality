@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import numpy as np
 import pandas as pd
 
-DETECTION_LIMITS = {"CO": 0.0, "NO2": 0.0, "O3": 0.0}
+from fd_airquality.loaders import POLLUTANT, normalize_pollutant
+
+DETECTION_LIMITS = {POLLUTANT: 0.0}
 MIN_RUN = 6
 MIN_USEFUL = 1
 ZERO_RUN_HOURS = 24
@@ -16,6 +19,10 @@ def ensure_datetime_series(series: pd.Series, freq: str, name: str) -> pd.Series
     if not isinstance(series.index, pd.DatetimeIndex):
         raise TypeError(f"La serie '{name}' debe tener DatetimeIndex")
     out = series.sort_index().copy()
+    if out.index.hasnans:
+        raise ValueError(f"La serie {name} contiene timestamps inválidos.")
+    if len(out) and not out.index.equals(out.index.floor(freq)):
+        raise ValueError(f"La serie {name} contiene timestamps fuera de la rejilla {freq}; alínea la fuente explícitamente.")
     out = out[~out.index.duplicated(keep="last")]
     out = out.asfreq(freq)
     out.name = str(series.name) if series.name is not None else name
@@ -43,15 +50,30 @@ def hourly_mean(
     min_useful: int = MIN_USEFUL,
     quality_mode: str = "retrospective",
 ) -> pd.DataFrame:
+    pollutant = normalize_pollutant(pollutant)
     col = df.columns[0]
     series = ensure_datetime_series(df[col], freq="5min", name=col)
     hour = series.index.floor("h")
-    is_useful = (series >= DETECTION_LIMITS[pollutant]) & ~frozen_mask(series, min_run=min_run, quality_mode=quality_mode)
+    frozen = frozen_mask(series, min_run=min_run, quality_mode=quality_mode)
+    is_useful = np.isfinite(series) & (series >= DETECTION_LIMITS[pollutant]) & ~frozen
     n_useful = is_useful.groupby(hour).sum()
     mean_useful = series.where(is_useful).groupby(hour).mean()
     value = mean_useful.where(n_useful >= min_useful)
     value.index = pd.DatetimeIndex(value.index)
-    return value.asfreq("h").rename(col).to_frame()
+    result = value.asfreq("h").rename(col).to_frame()
+    result.attrs["useful_readings"] = n_useful.reindex(result.index, fill_value=0).to_numpy(dtype=np.int16)
+    flags = np.zeros(len(result), dtype=np.uint16)
+    for bit, condition in ((1, ~np.isfinite(series)), (2, series < DETECTION_LIMITS[pollutant]), (4, frozen)):
+        flags[condition.groupby(hour).any().reindex(result.index, fill_value=False).to_numpy()] |= bit
+    flags[n_useful.reindex(result.index, fill_value=0).to_numpy() < min_useful] |= 8
+    result.attrs["quality_flags"] = flags
+    result.attrs["quality_counts"] = {
+        "five_minute_slots": len(series), "finite_readings": int(np.isfinite(series).sum()),
+        "negative_readings": int((series < DETECTION_LIMITS[pollutant]).sum()),
+        "frozen_readings": int(frozen.sum()), "useful_readings": int(is_useful.sum()),
+        "insufficient_hourly_coverage": int((n_useful < min_useful).sum()),
+    }
+    return result
 
 
 def preprocess(
@@ -62,7 +84,9 @@ def preprocess(
     min_useful: int = MIN_USEFUL,
     zero_run_hours: int = ZERO_RUN_HOURS,
     quality_mode: str = "retrospective",
+    hourly_repeat_filter: int = 1,
 ) -> tuple[list[pd.DataFrame], list[int]]:
+    pollutant = normalize_pollutant(pollutant)
     if not isinstance(zero_run_hours, int) or isinstance(zero_run_hours, bool) or zero_run_hours < 1:
         raise ValueError("zero_run_hours debe ser un entero positivo.")
     processed, frozen_counts = [], []
@@ -76,9 +100,18 @@ def preprocess(
         zero_length = (zero.groupby(groups).cumsum() if quality_mode == "causal"
                        else zero.groupby(groups).transform("sum"))
         # Causal detection preserves the first zero_run_hours-1 observed zero hours.
-        is_frozen = (col.ne(0) & col.eq(col.shift())) | (zero & zero_length.ge(zero_run_hours))
+        repeated = col.ne(0) & col.eq(col.shift()) if hourly_repeat_filter else pd.Series(False, index=col.index)
+        is_frozen = repeated | (zero & zero_length.ge(zero_run_hours))
         frozen_counts.append(int(is_frozen.sum()))
         hourly.loc[is_frozen, hourly.columns[0]] = pd.NA
+        flags = hourly.attrs["quality_flags"].copy()
+        flags[(zero & zero_length.ge(zero_run_hours)).to_numpy()] |= 16
+        flags[repeated.to_numpy()] |= 32
+        hourly.attrs["quality_flags"] = flags
+        hourly.attrs["quality_counts"] = hourly.attrs["quality_counts"] | {
+            "zero_frozen_hours": int((zero & zero_length.ge(zero_run_hours)).sum()),
+            "equal_mean_hours_removed": int(repeated.sum()),
+        }
         processed.append(hourly)
     return processed, frozen_counts
 

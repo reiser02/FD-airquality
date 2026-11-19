@@ -7,6 +7,12 @@ from pathlib import Path
 from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict
 from flwr.clientapp import ClientApp
 
+from fd_airquality.arrival import (
+    arrival_metrics,
+    audit_normalization,
+    normalization_artifact,
+    training_view,
+)
 from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.data import WindowDataset, load_client_data
 from fd_airquality.federated_adapters import tensor_bytes
@@ -37,18 +43,33 @@ def _execute_task(message, settings, partition, training):
     geometry = manifest["geometry"]
     round_number = int(message.content["config"].get("server-round", 0))
     seed = settings.seed + 100_003 * round_number + partition
+    artifact = normalization_artifact(artifact, geometry, settings)
+    log_dir = message.content["config"].get("log-dir")
+    audit_normalization(artifact, settings, partition, Path(log_dir) if log_dir else None)
     device = configure_torch(settings, seed)
     model = make_model(geometry, settings)
     load_shared_state(model, message.content["arrays"].to_torch_state_dict())
+    # Upstream constructors seed their initialization. Restore the round/client
+    # RNG for any stochastic training layers, independently of model loading.
+    configure_torch(settings, seed)
     split = "train" if training else str(message.content["config"].get("split", "validation"))
     if split not in {"train", "validation", "test"} or (not training and split == "train"):
         raise ValueError(f"Split no permitido: {split}")
-    dataset = WindowDataset(artifact, split, geometry["context"], geometry["horizon"])
+    dataset = (training_view(artifact, geometry, settings, round_number) if training else
+               WindowDataset(artifact, split, geometry["context"], geometry["horizon"]))
     if training:
         metrics = train_local(
             model, dataset, settings, device, seed,
             proximal_mu=float(message.content["config"].get("proximal-mu", 0.0)),
-        )
+        ) if len(dataset) else {
+            "num-examples": 0, "num-targets": 0, "train-mse-normalized": 0.,
+            "train-seconds": 0., "optimizer-steps": 0,
+        }
+        metrics.update(arrival_metrics(dataset), **{"idle-client": int(not len(dataset))})
+        if message.content["config"].get("available-through-ns") != metrics.get("available-through-ns"):
+            raise ValueError("El reloj de llegada del cliente no coincide con el del servidor.")
+        if message.content["config"].get("available-from-ns") != metrics.get("available-from-ns"):
+            raise ValueError("El bloque de llegada del cliente no coincide con el del servidor.")
         state = {key: value.detach().cpu() for key, value in shared_state(model).items() if not key.startswith("history.")}
         metrics["uplink-tensor-bytes"] = tensor_bytes(state)
         metrics["downlink-tensor-bytes"] = tensor_bytes(message.content["arrays"].to_torch_state_dict())

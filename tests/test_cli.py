@@ -11,10 +11,15 @@ from fd_airquality.cli import _parser, launch_simulation, main
 from fd_airquality.settings import RunSettings
 
 
-def test_flower_and_cli_defaults_are_identical():
-    with Path("pyproject.toml").open("rb") as stream:
-        config = tomllib.load(stream)
-    assert RunSettings.from_mapping(config["tool"]["flwr"]["app"]["config"]) == RunSettings()
+@pytest.mark.parametrize("command", ["simulate", "baseline", "benchmark", "backtest"])
+def test_cli_defaults_and_flower_mapping_use_shared_settings(command):
+    parser, _ = _parser()
+    args = parser.parse_args([command])
+    settings = RunSettings()
+    for name, value in asdict(settings).items():
+        if name not in {"manifest", "output_dir"}:
+            assert getattr(args, name) == value
+    assert RunSettings.from_mapping(settings.flower_config()) == settings
 
 
 @pytest.mark.parametrize("command", ["simulate", "benchmark"])
@@ -52,7 +57,7 @@ def test_models_lists_granite_without_downloading(capsys, monkeypatch):
     monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: pytest.fail("No debe descargar"))
     main(["models"])
     output = capsys.readouterr().out
-    for name in ("autoencoder", "darts-nlinear", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"):
+    for name in ("autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"):
         assert name in output
 
 

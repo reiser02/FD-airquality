@@ -1,9 +1,21 @@
 # FD-airquality
 
-Simulación de predicción de calidad del aire con Flower (`flwr`): una estación
+Simulación de predicción de PM2.5 (`PM25`) con Flower (`flwr`): una estación
 por cliente y un servidor que agrega pesos, sin recibir las series de los clientes.
 Es independiente: contiene su propio tratamiento de datos y lee una copia local
 de los CSV, sin importar código ni configuración de otro proyecto.
+
+**Protocolo actual:** ventanas con ausencias conservadas, tratamiento del contexto
+por modelo, targets enmascarados, MASE/RMSSE y CRPS aproximado desde cuantiles.
+MLP/NLinear/NHITS usan el paquete **NeuralForecast 3.1.4**, no copias locales.
+La evaluación temporal separa desarrollo y holdout y, en federado, libera datos
+**periódicamente dentro de cada fold**. Consulta [la guía de evaluación temporal](TEMPORAL_EVALUATION.md)
+para comandos, garantías, comparación estricta, cuantiles y limitaciones.
+
+**Cada fold reinicia el modelo y su normalización fija.** El histórico de datos
+puede ser expansivo o deslizante, pero nunca se heredan pesos ni adaptadores
+entrenados en otro fold. La evaluación final también se ajusta desde su estado
+inicial; solo se mantiene aprendizaje entre rondas dentro del fold federado.
 
 ## Ejecutar
 
@@ -20,14 +32,23 @@ uv run pytest
 uv run ruff check src tests
 ```
 
+La configuración raíz utiliza todas las estaciones y tres semillas en las matrices.
+Para una prueba acotada usa `--config experiments/smoke.toml`; sus manifests se
+deben indicar explícitamente. El benchmark completo no se ejecuta al instalar.
+
 Ejecuta los comandos desde la raíz de este repositorio. La CLI carga automáticamente
-[`fd-airquality.toml`](fd-airquality.toml): NO₂, contexto común de **90 horas**, horizonte
+[`fd-airquality.toml`](fd-airquality.toml): PM2.5, contexto común de **90 horas**, horizonte
 de 12 y stride de evaluación de 6 horas. Entrenamiento anterior a **2026-03-01**;
 validación `[2026-03-01, 2026-03-29)` y test `[2026-03-29, 2026-04-26)`.
 Los extremos derechos son exclusivos. Se conserva el calendario sin zona de los
 CSV, sin presumir que sea UTC. No se lee configuración de otro proyecto.
 
-`simulate` usa la preparación más reciente, calcula automáticamente cuántas
+`PM25` es el único contaminante admitido; también se acepta `pm25` en CLI y TOML.
+Se leen únicamente los CSV de PM25, sin modificar los archivos de otros contaminantes.
+Los manifests históricos de otros contaminantes no se usan para nuevas ejecuciones:
+vuelve a ejecutar `prepare` o `prepare-backtest` para generar los de PM25.
+
+`simulate` usa la preparación de PM25 más reciente, calcula automáticamente cuántas
 estaciones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
 Ray y la API de mensajes de Flower 1.40. Por defecto ejecuta cinco rondas,
 una época local y un cliente simultáneo por GPU utilizable, hasta el número de
@@ -50,8 +71,11 @@ Edita `fd-airquality.toml` para no repetir argumentos. La prioridad es:
 **argumento explícito en CLI > sección del comando > `[run]` > valor interno**.
 
 - `[prepare]`: fuentes, filtrado y geometría temporal.
-- `[run]`: opciones compartidas por `simulate`, `baseline` y `benchmark`.
-- `[simulate]`, `[baseline]`, `[benchmark]`: opciones específicas y overrides de `[run]`.
+- `[run]`: opciones compartidas por `simulate`, `baseline`, `benchmark` y `backtest`.
+- `[simulate]`, `[baseline]`, `[benchmark]`, `[backtest]`: opciones específicas y overrides de `[run]`.
+- `[prepare-backtest]`: folds e historial; hereda `[prepare]` salvo el directorio de salida.
+- `[missing]`: políticas de tratamiento del contexto por modelo.
+- `[availability]`: umbrales de entrenamiento por modelo, sin modificar el scoring.
 - `[inspect]` y `[compare]`: también admiten sus opciones (`manifest`, `runs`, `output`).
 
 Las claves coinciden con los argumentos, sin `--`; las listas son arrays TOML.
@@ -63,7 +87,7 @@ selection-metric = "macro-mase"
 num-server-rounds = 10
 
 [benchmark]
-models = ["mlp", "autoencoder", "darts-nlinear"]
+models = ["mlp", "autoencoder", "nlinear", "nhits"]
 modes = ["local", "centralized", "federated"]
 ```
 
@@ -71,7 +95,7 @@ modes = ["local", "centralized", "federated"]
 # Usa el archivo predeterminado; este argumento prevalece sobre sus valores:
 uv run fd-airquality benchmark --num-server-rounds 2
 # Usa solo este otro archivo, sin heredar fd-airquality.toml:
-uv run fd-airquality benchmark --config experimentos/no2.toml
+uv run fd-airquality benchmark --config experiments/smoke.toml
 ```
 
 `--config` funciona antes o después del subcomando. Las rutas relativas se resuelven
@@ -93,22 +117,24 @@ uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.j
 ### Prueba pequeña con datos reales
 
 ```bash
-uv run fd-airquality prepare --pollutant NO2 --max-train-windows 128 \
+uv run fd-airquality prepare --pollutant PM25 --max-train-windows 128 \
   --station 'AQN1 - Puerto' --station 'AQN3 - Paseo Alfonso XIII'
 uv run fd-airquality simulate --num-server-rounds 2
 ```
 
 El límite de ventanas es **solo para pruebas rápidas**. Vuelve a ejecutar
 `prepare` sin ese límite para preparar el experimento completo. También admite
-`--pollutant O3` o `CO`, `--raw-root`, `--context`, `--horizon`,
+`--raw-root`, `--context`, `--horizon`,
 `--validation-start`, `--test-start`, `--test-end`, `--train-stride` y mínimos
-`--min-train-windows`, `--min-validation-windows`, `--min-test-windows` (1/7/15).
+`--min-train-windows`, `--min-validation-windows`, `--min-test-windows`
+(valores internos 1/7/15; el TOML raíz exige 16/7/15).
 `--error-scale-hours 672` fija la referencia de MASE/RMSSE a cuatro semanas;
 no recorta el entrenamiento ni cambia el contexto de entrada.
 `--zero-run-hours 24` controla el congelado de ceros: rachas cortas se conservan;
 al acumular 24 horas observadas a cero se marca el fallo. Los huecos pausan el
 contador, no lo reinician ni cuentan como ceros. Solo una hora válida no nula lo reinicia.
-No se exige una racha para todo el test: cada ventana necesita 90 + 12 horas.
+No se exige una racha para todo el test: cada ventana abarca 90 + 12 horas de
+calendario y, con `masked`, puede contener valores ausentes.
 Consulta `uv run fd-airquality prepare --help` y `uv run fd-airquality simulate --help`.
 
 ## Comparar modelos con y sin federación
@@ -117,9 +143,10 @@ Modelos disponibles con `--model`:
 
 | Nombre | Implementación y entrenamiento |
 | --- | --- |
-| `mlp` | MLP residual PyTorch; referencia original |
+| `mlp` | MLP del paquete NeuralForecast |
 | `autoencoder` | Encoder con cuello de botella, decoder de reconstrucción y cabeza de forecasting |
-| `darts-nlinear` | Módulo **NLinear real de Darts**, entrenado con las ventanas auditadas |
+| `nlinear` | NLinear del paquete NeuralForecast |
+| `nhits` | NHITS del paquete NeuralForecast, con su tratamiento de máscara en los residuos |
 | `ttm-r3` | Granite TTM-R3, checkpoint `90-30-dec-90-r3`, adaptación interna |
 | `patchtst-fm-r2` | Granite PatchTST-FM-R2, adaptación interna |
 | `flowstate-r1` | Granite FlowState-R1/1.0, adaptación interna experimental |
@@ -144,9 +171,11 @@ uv run fd-airquality benchmark --num-server-rounds 5
 
 `benchmark` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
 (LoRA, FFA-LoRA, FLoRA y LoRA-FAIR), y controles local/centralizado con LoRA y A
-congelada. Son **27 configuraciones de foundations**, más nueve controles clásicos:
-**36 ejecuciones** con una semilla y rango. Zero-shot no se duplica por semilla/rango;
-los clásicos no se duplican por rango. FLoRA y LoRA-FAIR no tienen modalidades
+congelada. Son **27 configuraciones de foundations**, más doce controles clásicos:
+**39 ejecuciones** con una semilla y rango. Zero-shot no se duplica por semilla/rango;
+los clásicos no se duplican por rango. Las tres semillas del TOML raíz producen
+111 ejecuciones por fold. La CV por defecto utiliza dos folds de desarrollo y
+reserva el tercero para la configuración seleccionada. FLoRA y LoRA-FAIR no tienen modalidades
 centralizadas nativas ni se cruzan automáticamente con FedProx.
 
 ### Modos secuenciales y candidatos paralelos por GPU
@@ -208,7 +237,7 @@ Puedes limitar la matriz, sin cambiar el soporte temporal:
 
 ```bash
 uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
-  --models mlp autoencoder darts-nlinear --modes local centralized federated
+  --models mlp autoencoder nlinear nhits --modes local centralized federated
 ```
 
 O ejecutar un caso individual:
@@ -226,34 +255,44 @@ uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
 - **Local:** un modelo independiente por estación, sin intercambio ni agregación;
   cada estación elige su checkpoint por su propia validación.
 - **Centralizado:** un modelo entrenado con las ventanas de todas las estaciones;
-  es un control **sin privacidad federada**. Conserva el escalado por estación y
+  es un control **sin privacidad federada**. Conserva el escalado configurado y
   no concatena series raw a través de huecos o estaciones.
 - **Federado:** modelo compartido; LoRA promedia factores, FFA agrega B, FLoRA
   apila actualizaciones y LoRA-FAIR refina la agregación.
 - **Zero-shot:** inferencia del checkpoint Granite sin adaptación con estos datos.
 
-Los tres métodos entrenados usan `num-server-rounds × local-epochs` pasadas por
-sus ventanas; centralizado y local reinician AdamW en cada etapa, igual que los
-clientes FL. Igualar pasadas **no iguala trayectorias de optimización ni tiempo**.
-Todos evalúan el test una vez después de seleccionar exclusivamente con validación.
+Local y centralizado visitan su entrenamiento en cada etapa. En federado,
+`arrival-period-hours` controla el reloj: primera ronda con el histórico inicial y siguientes
+rondas solo con su bloque nuevo de targets, conservando los pesos globales
+agregados. El contexto sí puede utilizar el pasado. No se vuelve a ajustar todo
+el histórico en cada ronda. No hay selector de histórico entre rondas:
+el modo acumulativo y el deslizante se han eliminado.
+Los horizontes de targets deben caber enteros en el bloque de la ronda.
+Esta separación es interna al fold: el siguiente fold reinicia el modelo.
+AdamW se reinicia por etapa/ronda.
+Igualar rondas **no iguala ejemplos utilizados, optimización ni tiempo**.
+Todos evalúan el test una vez por fold después de seleccionar exclusivamente con validación.
 
 Se selecciona por **MASE macro de validación**. MASE/RMSSE usan diferencias a
-24 horas sobre los **28 días naturales anteriores al inicio del periodo evaluado**:
-febrero para validación y del 1 al 28 de marzo para test con las fechas por defecto.
+24 horas. El TOML raíz elige los **28 días anteriores al corte de entrenamiento**
+para ambos splits (`error-scale-reference = "training"`).
+La alternativa explícita `pre-evaluation` usa la referencia anterior a cada split.
 El denominador es fijo por estación durante cada periodo y común a todos los modelos.
 Solo se exigen los dos extremos observados; un hueco intermedio no invalida el par.
 Se conservan las horas ausentes, sin compactar ni ampliar la referencia para compensarlas.
-`inspect` muestra los pares disponibles; una escala nula o sin pares queda indefinida.
+`inspect` muestra los pares disponibles; con `unfloored`, una escala nula o con
+pares insuficientes queda indefinida. El TOML raíz exige al menos 24 pares;
+`epsilon` aplica suelos ε y ε² sin inventar pares.
 Antes de entrenar, `simulate`, `baseline` y `benchmark` descartan las estaciones
 cuya **métrica de selección de validación** no esté definida. La regla es común a
 local, centralizado, federado y zero-shot: no se deja una estación en unos candidatos
 y fuera de otros. Cada descarte aparece en el log y en `excluded_stations.csv`, con
 estación, motivo, métrica, intervalo de referencia y número de pares. Se distingue
-entre ausencia de pares y una escala cero con pares disponibles.
+entre ausencia de pares, cobertura insuficiente y escala cero con pares disponibles.
 Si todas quedan descartadas, se guarda el informe y se aborta antes de entrenar.
 La preparación original y sus NPZ no se alteran; se genera un `runtime_manifest.json`
 con el panel efectivo y las identidades originales. La matriz lo fija una sola vez.
-Puedes elegir explícitamente `--selection-metric mae` para conservar las estaciones
+Puedes elegir explícitamente `--selection-metric mae` o `macro-mae` para conservar las estaciones
 sin referencia escalada: solo cambia la selección del checkpoint, no el MASE/RMSSE
 reportado ni su denominador. No hay cambio automático de métrica ni ampliación de
 referencia. Los fallos de integridad o de entrenamiento siguen abortando, sin cambiar
@@ -271,13 +310,15 @@ solo impide atribuir la diferencia exclusivamente a la adaptación si no hay un
 zero-shot con la misma escala. La escala y revisión se incluyen en `comparison.csv`.
 Los campos `robust-*` resumen estaciones con tres días de validación y siete de
 test; no cambian el entrenamiento ni seleccionan el checkpoint.
-`compare` rechaza manifests distintos o paneles incompletos y avisa si cambian
-entornos o presupuestos. No ejecuta tests estadísticos sobre targets solapados.
+`compare` rechaza por defecto manifests distintos y siempre rechaza paneles
+incompletos. `--allow-training-differences` permite únicamente preparaciones con
+firma de evaluación idéntica. Avisa si cambian entornos o presupuestos. Los
+intervalos por bloques son exploratorios, no tests IID sobre targets solapados.
 
 ### Prueba de integración pequeña para los seis modelos
 
 ```bash
-uv run fd-airquality prepare --context 90 --max-train-windows 8 \
+uv run fd-airquality prepare --context 90 --max-train-windows 8 --min-train-windows 1 \
   --station 'AQN1 - Puerto' --station 'AQN2 - San Francisco' --output data/benchmark_smoke
 uv run fd-airquality benchmark --manifest data/benchmark_smoke/<preparacion>/manifest.json \
   --num-server-rounds 1 --batch-size 8
@@ -305,14 +346,27 @@ Pruebas con los checkpoints reales, incluidos gradientes y restauración:
 FD_AIRQUALITY_REAL_MODELS=1 uv run pytest -q
 ```
 
-Sin esa variable se omiten explícitamente las 12 pruebas reales; las unitarias e
+Sin esa variable se omiten explícitamente las 15 pruebas reales; las unitarias e
 integraciones de Flower con transporte local sí se ejecutan.
 La suite usa CPU y oculta las GPU físicas; las comprobaciones de CUDA usan dobles
 de prueba. MLflow solo se activa en sus pruebas específicas, con una base SQLite
-aislada por prueba y el esquema migrado una vez por sesión. No se fuerza el modo
-determinista de PyTorch; se conservan las semillas del experimento.
+aislada por prueba y el esquema migrado una vez por sesión. Por defecto no se
+fuerza el modo determinista de PyTorch; `--deterministic 1` permite activarlo
+explícitamente. Se conservan las semillas del experimento.
 
 Para medir los casos más lentos: `uv run pytest -q --durations=20`.
+
+Validación histórica, anterior a la migración a NeuralForecast (03-11-2026):
+**374 pruebas aprobadas**, incluidas
+las 15 con checkpoints reales; lint correcto. La CLI completó nueve candidatos
+clásicos y otros 18 en dos folds `streaming/new-only`, con Flower/Ray real en los
+casos federados. TTM-R3/FLoRA completó otros dos folds y conservó su historial
+acumulado de rondas 1–2 a 1–4; ambos checkpoints se restauraron y predijeron con
+contexto incompleto. Se comprobaron hashes heredados, escaladores fijos y soporte
+de evaluación común. Las rutas y limitaciones están en
+`reports/masked_temporal_validation.json` (informe local, no versionado).
+Es validación de integración en CPU, **no una comparación de precisión** ni una
+validación de CUDA. No es evidencia de ejecución del nuevo protocolo.
 
 Validación histórica del protocolo anterior: **164 pruebas**, matriz smoke de **36/36 configuraciones**
 con Flower/Ray real, 36 runs MLflow finalizados y **60 checkpoints restaurados**.
@@ -320,7 +374,8 @@ El presupuesto smoke es deliberadamente mínimo: dos estaciones, dos ventanas de
 entrenamiento por estación, un origen de validación y otro de test, dos rondas y
 cinco iteraciones de refinamiento FAIR. No constituye una comparación de precisión.
 El resultado y las rutas auditables están en `reports/final_adapter_validation.json`.
-Estos resultados históricos no validan el nuevo periodo de referencia de MASE/RMSSE;
+Estos resultados históricos tampoco validan el reinicio obligatorio entre folds.
+No validan las ventanas enmascaradas ni el nuevo periodo de referencia de MASE/RMSSE;
 para él se deben regenerar las preparaciones y volver a evaluar.
 
 ## Logs y progreso en vivo
@@ -394,7 +449,7 @@ Para elegir almacenamiento, experimento o servidor existente:
 
 ```bash
 uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
-  --mlflow-tracking-uri sqlite:///reports/mlflow.db --mlflow-experiment comparacion-no2
+  --mlflow-tracking-uri sqlite:///reports/mlflow.db --mlflow-experiment comparacion-pm25
 uv run fd-airquality simulate --mlflow-tracking-uri http://127.0.0.1:5000
 ```
 
@@ -419,14 +474,16 @@ Cada preparación crea un directorio nuevo bajo `data/federated/`:
 - `retention.json`: ventanas y horas únicas retenidas respecto al entrenamiento
   disponible antes del corte, antes de cualquier límite de prueba.
 
-Los manifests nuevos usan `schema_version=4` y hashes del código local de
+Los manifests con ventanas enmascaradas usan `schema_version=5`; la referencia
+estricta conserva el esquema 4. Ambos registran hashes del código local de
 preparación. Guardan límites y recuentos de pares de referencia para validación y
 test; los denominadores permanecen en los NPZ locales, separados por split.
 Las preparaciones antiguas deben regenerarse con `prepare`; no se
 modifican ni se sobrescriben. Los resultados históricos se conservan.
 
-Preparación histórica verificada el 29-10-2026, contexto 90, calendario global y calidad
-causal predeterminados, sin límite de entrenamiento:
+Preparación histórica de otros contaminantes (ya no admitidos), verificada el
+29-10-2026, contexto 90, calendario global y calidad causal predeterminados, sin
+límite de entrenamiento. Estos recuentos no corresponden a PM25:
 
 | Contaminante | Estaciones elegibles | Ventanas de entrenamiento | Retención de ventanas anteriores al corte |
 | --- | ---: | ---: | ---: |
@@ -486,8 +543,10 @@ volver a preparar allí los artefactos, que contienen rutas absolutas.
 
 Se conserva el pin `torch==2.11.0+cu128` y su índice de uv.
 Todos los clientes de una ejecución comparten arquitectura y agregan pesos PyTorch.
-Para Darts se adapta su módulo NLinear, no el objeto forecaster ni un Trainer de
-Lightning; su interfaz interna queda acotada a Darts 0.48.x y cubierta por tests.
+MLP/NLinear/NHITS llaman a las arquitecturas, normalización, parser y pérdidas
+del paquete NeuralForecast fijado a un commit. La conexión con Flower usa ventanas
+externas auditadas y AdamW propio, no un Trainer de Lightning anidado.
+Las pruebas contrastan también pronósticos contra `NeuralForecast.cross_validation`.
 No se promedian escaladores ni optimizadores. Para TTM-R3 se instala `granite-tsfm`
 desde un commit fijado, porque la versión PyPI 0.3.10 aún no implementa R3.
 
@@ -500,9 +559,11 @@ salte a otra versión mayor al evaluar los mismos resultados.
 
 ## Restricciones importantes
 
-- **Nunca se juntan bloques separados por `NaN` u horas ausentes.** No hay interpolación automática.
+- **Nunca se compacta el calendario ni se pegan fragmentos.** El protocolo `masked`
+  conserva los huecos y el adaptador trata el contexto; los targets nunca se imputan.
 - Todas las estaciones mantienen su identidad y su distribución natural; no hay particionado IID.
-- El escalador se ajusta exclusivamente con entrenamiento local.
+- `window` calcula estadísticas solo con el contexto observado de cada origen.
+  `fixed` usa únicamente el prefijo inicial autorizado y verifica su identidad.
 - El servidor recibe pesos, errores agregados y recuentos, **no series ni predicciones individuales**.
 - Es una simulación con aislamiento lógico en un mismo sistema de archivos: **no garantiza privacidad formal**.
 - El protocolo predeterminado impide futuro cruzado entre estaciones mediante
@@ -514,8 +575,9 @@ salte a otra versión mayor al evaluar los mismos resultados.
 - El modo histórico exige `--split-mode station --quality-mode retrospective`;
   `--validation-hours` y `--test-hours` determinan el holdout solo en ese modo.
 
-El detalle metodológico, incluidos solapamientos y limitaciones, está en
-[PROTOCOL.md](PROTOCOL.md).
+El protocolo enmascarado y temporal está en [TEMPORAL_EVALUATION.md](TEMPORAL_EVALUATION.md).
+[PROTOCOL.md](PROTOCOL.md) conserva los detalles de la referencia estricta y de
+los algoritmos federados; sus restricciones de continuidad no definen `masked`.
 
 ## Paquetes adicionales útiles
 

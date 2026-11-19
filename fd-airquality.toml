@@ -7,8 +7,7 @@
 raw-root = "data/raw/datos_estaciones_5m"
 # Raíz donde se guardan las preparaciones inmutables, inventarios y manifests.
 output = "data/federated"
-# Contaminante que se lee de los CSV; opciones admitidas: NO2, O3 o CO.
-pollutant = "NO2"
+pollutant = "PM25"
 # Horas históricas que recibe el modelo en cada ventana de entrada.
 context = 90
 # Horas futuras que predice cada ventana.
@@ -18,7 +17,7 @@ stride = 6
 # Separación en horas entre ventanas de entrenamiento; un valor mayor reduce solapamiento.
 train-stride = 6
 # Mínimo de ventanas de entrenamiento para incluir una estación en el manifest.
-min-train-windows = 1
+min-train-windows = 16
 # Mínimo de ventanas de validación para incluir una estación.
 min-validation-windows = 7
 # Mínimo de ventanas de test para incluir una estación.
@@ -26,18 +25,33 @@ min-test-windows = 15
 # Límite opcional de ventanas de entrenamiento por estación; útil para pruebas rápidas.
 # Si se omite, se conservan todas las ventanas disponibles.
 # max-train-windows = 128  # Solo para pruebas; omitir para usar todas las ventanas.
-# Estaciones a preparar, por nombre exacto de su directorio; si se omite, se usan todas.
-station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+# Todas las estaciones. Para una prueba pequeña usa experiments/smoke.toml.
+# station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
+# Conserva las ausencias en calendario; cada modelo trata su propio contexto.
+window-policy = "masked"
+min-context-observed = 1
+min-target-observed = 1
 # Periodicidad estacional en horas (24 = ciclo diario), usada para MASE/RMSSE.
 seasonality = 24
 # Horas de referencia previas a cada periodo evaluado para calcular la escala de MASE/RMSSE.
 # No limita el entrenamiento ni cambia context.
 error-scale-hours = 672
+# Diferencias estacionales en horas reales: sin suelo o con suelo epsilon.
+error-scale-policy = "unfloored"
+error-scale-reference = "training"
+error-scale-epsilon = 0.01
+min-scale-pairs = 24
 # Número de lecturas consecutivas e iguales de 5 minutos para marcar una racha no nula congelada.
 # En modo causal se conservan las primeras min-run - 1 lecturas.
 min-run = 6
 # Mínimo de lecturas de 5 minutos válidas y no congeladas necesarias para calcular la media horaria.
-min-useful = 1
+min-useful = 9
+# No interpretar dos medias iguales como prueba suficiente de congelación.
+# El filtro de congelación de cinco minutos sigue activo.
+hourly-repeat-filter = 0
+grid-tolerance-seconds = 30
+# Configurar únicamente tras confirmar el significado de los flags del proveedor.
+upct-valid-flags = ""
 # Horas observadas con media cero acumuladas antes de marcarlas como congeladas.
 # Las horas ausentes pausan el contador; una hora no nula lo reinicia.
 zero-run-hours = 24
@@ -58,7 +72,7 @@ validation-hours = 48
 # Duración horaria del holdout de test; solo se usa con split-mode = "station".
 test-hours = 96
 
-# Opciones compartidas por simulate, baseline y benchmark. Las opciones de la sección
+# Opciones compartidas por simulate, baseline, benchmark y backtest. Las opciones de la sección
 # específica del comando prevalecen sobre estas si se repite una clave.
 [run]
 # Manifest de una preparación concreta; si se omite, se selecciona la preparación más reciente.
@@ -86,7 +100,7 @@ seed = 42
 device = "cuda"
 # Hilos internos de PyTorch (también limita OMP/MKL en los procesos lanzados).
 torch-threads = 1
-# Modelo predeterminado; opciones: mlp, autoencoder, darts-nlinear, ttm-r3,
+# Modelo predeterminado; opciones: mlp, autoencoder, nlinear, nhits, ttm-r3,
 # patchtst-fm-r2 y flowstate-r1. benchmark usa su lista [benchmark].models.
 model = "mlp"
 # Dimensión del cuello de botella latente del autoencoder.
@@ -123,12 +137,35 @@ fair-learning-rate = 0.01
 # Peso de la regularización L2 del refinamiento LoRA-FAIR.
 fair-lambda = 1.0
 # Métrica de validación para elegir el mejor checkpoint; menor es mejor.
-# macro-mase/macro-rmsse ponderan por igual las estaciones; también se admite mae.
+# macro-mase/macro-rmsse/macro-mae ponderan por igual las estaciones; mae agrupa targets.
 selection-metric = "macro-mase"
 # Intervalo en segundos entre mensajes de progreso durante trabajos largos.
 heartbeat-seconds = 60.0
 # Nivel de detalle de los logs: DEBUG, INFO, WARNING o ERROR.
 log-level = "INFO"
+# auto resuelve la política mediante [missing]; --missing-policy fuerza una concreta.
+missing-policy = "auto"
+# Activación explícita; no se promete reproducibilidad bit a bit entre dispositivos.
+deterministic = 0
+# Entrena cuantiles en NeuralForecast; evalúa cuantiles nativos en Granite si existen.
+probabilistic = 1
+# TemporalNorm del paquete: cada contexto observado, nunca sus targets futuros.
+normalization = "window"
+scaler-type = "standard"
+training-data-availability-threshold = [0.0, 0.0]
+# Llegada horaria de calendario dentro del entrenamiento de cada fold federado.
+arrival-period-hours = 24
+# Primera ronda: histórico inicial. Después: solo targets del bloque nuevo,
+# conservando los pesos agregados. No vuelve a entrenar con bloques anteriores.
+
+[missing]
+mlp = "native"
+autoencoder = "ffill"
+nlinear = "native"
+nhits = "native"
+ttm-r3 = "native"
+patchtst-fm-r2 = "native"
+flowstate-r1 = "native"
 
 [simulate]
 # Directorio base para los resultados de las simulaciones Flower.
@@ -147,8 +184,8 @@ mode = "local"
 [benchmark]
 # Directorio base; cada matriz se guarda en una subcarpeta con fecha y hora.
 output-dir = "reports/benchmarks"
-# Modelos candidatos: MLP, autoencoder, NLinear de Darts y checkpoints Granite indicados.
-models = ["mlp", "autoencoder", "darts-nlinear", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
+# MLP/NLinear/NHITS del paquete NeuralForecast; autoencoder propio y Granite.
+models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
 # Métodos comparados: entrenamiento local por estación, centralizado, federado y zero-shot.
 # Zero-shot solo se genera para los modelos Granite.
 modes = ["local", "centralized", "federated", "zero-shot"]
@@ -158,7 +195,7 @@ modes = ["local", "centralized", "federated", "zero-shot"]
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
 # En federado se usa un cliente simultáneo por GPU utilizable; en CPU, secuencial.
 # Semillas a comparar; si se omite, se usa [run].seed. Zero-shot no se duplica por semilla.
-# seeds = [42, 43, 44]
+seeds = [42, 43, 44]
 # Rangos LoRA a comparar en Granite; si se omite, se usa [run].lora-rank.
 # lora-ranks = [4, 8]
 # Estrategias federadas a comparar (FedAvg/FedProx); FLoRA y LoRA-FAIR requieren FedAvg.
@@ -167,3 +204,22 @@ adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
 # Límite de candidatos simultáneos en modos no federados; si se omite, uno por GPU utilizable.
 # En CPU se ejecutan secuencialmente; no limita los clientes simultáneos de una federación.
 # max-parallel-models = 2
+
+[prepare-backtest]
+# Hereda [prepare] salvo output. Sus fechas son las del ÚLTIMO fold.
+output = "data/backtests"
+folds = 3
+step-hours = 672
+# Todos los folds reinician modelos y escaladores; solo se reutilizan datos.
+# expanding conserva todo el pasado; sliding conserva history-hours de targets.
+train-history = "expanding"
+history-hours = 672
+
+[backtest]
+output-dir = "reports/backtests"
+# Desarrollo no consulta el último fold. Para final: --stage final --selection <selection.json>.
+stage = "development"
+models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
+modes = ["local", "centralized", "federated", "zero-shot"]
+adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
+seeds = [42, 43, 44]

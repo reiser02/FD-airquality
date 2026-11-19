@@ -18,6 +18,7 @@ from pathlib import Path
 from fd_airquality.configuration import parse_configured_args
 from fd_airquality.data import DataConfig, prepare, read_manifest
 from fd_airquality.execution import usable_gpu_slots
+from fd_airquality.loaders import POLLUTANT
 from fd_airquality.models import (
     GRANITE,
     MODEL_NAMES,
@@ -39,15 +40,22 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
                         help="Archivo TOML; por defecto fd-airquality.toml en el directorio actual.")
     commands = parser.add_subparsers(dest="command", required=True)
     data = commands.add_parser("prepare", help="Preprocesar y auditar cada estación por separado.")
-    data.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"),
-                      help="Por defecto: data/raw/datos_estaciones_5m, dentro de este proyecto.")
-    data.add_argument("--output", type=Path, default=Path("data/federated"))
-    data.add_argument("--pollutant", choices=["NO2", "O3", "CO"], default="NO2")
-    data.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
-    for field in fields(DataConfig):
-        data.add_argument(f"--{field.name.replace('_', '-')}", type=str if isinstance(getattr(DataConfig(), field.name), str) else int)
-    data.add_argument("--heartbeat-seconds", type=float, default=60.0)
-    data.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    temporal_data = commands.add_parser("prepare-backtest", help="Preparar folds globales con datos progresivos.")
+    for command in (data, temporal_data):
+        command.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"))
+        command.add_argument("--output", type=Path, default=Path("data/backtests" if command is temporal_data else "data/federated"))
+        command.add_argument("--pollutant", choices=[POLLUTANT, POLLUTANT.lower()], default=POLLUTANT,
+                             help="Único contaminante admitido: PM25 (PM2.5).")
+        command.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
+        for field in fields(DataConfig):
+            value = getattr(DataConfig(), field.name)
+            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value) if value is not None else int)
+        command.add_argument("--heartbeat-seconds", type=float, default=60.0)
+        command.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    temporal_data.add_argument("--folds", type=int, default=3)
+    temporal_data.add_argument("--step-hours", type=int, default=672)
+    temporal_data.add_argument("--train-history", choices=["expanding", "sliding"], default="expanding")
+    temporal_data.add_argument("--history-hours", type=int, default=672)
     audit = commands.add_parser("inspect", help="Resumen del soporte y las exclusiones, sin entrenar.")
     audit.add_argument("--manifest")
     simulation = commands.add_parser("simulate", help="Ejecutar flwr run en el simulador local oficial.")
@@ -60,21 +68,28 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     baseline.add_argument("--manifest")
     baseline.add_argument("--output-dir", default="reports/non_federated")
     benchmark = commands.add_parser("benchmark", help="Matriz de modelos y métodos sobre un único manifest.")
-    benchmark.add_argument("--manifest")
-    benchmark.add_argument("--output-dir", default="reports/benchmarks")
-    benchmark.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
-    benchmark.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
+    backtest = commands.add_parser("backtest", help="CV temporal: reiniciar los modelos en cada fold.")
+    backtest.add_argument("--stage", choices=["development", "final", "all"], default="development",
+                          help="Desarrollo sin holdout; final exige selección congelada; all es exploratorio.")
+    backtest.add_argument("--selection", type=Path, help="selection.json del desarrollo para consultar el holdout.")
+    for command in (benchmark, backtest):
+        command.add_argument("--manifest")
+        command.add_argument("--output-dir", default="reports/backtests" if command is backtest else "reports/benchmarks")
+        command.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
+        command.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
                            default=["local", "centralized", "federated", "zero-shot"])
-    benchmark.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
-                           default=["lora", "ffa-lora", "flora", "lora-fair"])
-    benchmark.add_argument("--seeds", nargs="+", type=int)
-    benchmark.add_argument("--lora-ranks", nargs="+", type=int)
-    benchmark.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
-    benchmark.add_argument("--max-parallel-models", type=int,
-                           help="Límite de candidatos por modo no federado; por defecto uno por GPU. CPU: secuencial.")
+        command.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
+                            default=["lora", "ffa-lora", "flora", "lora-fair"])
+        command.add_argument("--seeds", nargs="+", type=int)
+        command.add_argument("--lora-ranks", nargs="+", type=int)
+        command.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
+        command.add_argument("--max-parallel-models", type=int,
+                            help="Límite de candidatos por modo no federado; por defecto uno por GPU. CPU: secuencial.")
     comparison = commands.add_parser("compare", help="Comparar resultados completos del mismo manifest.")
     comparison.add_argument("runs", nargs="*", type=Path)
     comparison.add_argument("--output", type=Path)
+    comparison.add_argument("--allow-training-differences", action="store_true",
+                            help="Permitir distinto entrenamiento solo con firma de evaluación idéntica.")
     commands.add_parser("models", help="Listar modelos, adaptación y requisitos sin descargarlos.")
     for command in commands.choices.values():
         command.add_argument("--config", type=Path, default=argparse.SUPPRESS,
@@ -84,7 +99,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
         if field.name in {"manifest", "output_dir"}:
             continue
         value = getattr(defaults, field.name)
-        for command in (simulation, baseline, benchmark):
+        for command in (simulation, baseline, benchmark, backtest):
             command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value), default=value)
     return parser, commands.choices
 
@@ -224,7 +239,8 @@ def build_benchmark_matrix(models: list[str], modes: list[str], adaptations: lis
 def run_benchmark(settings: RunSettings, models: list[str], modes: list[str],
                   adaptations: list[str] | None = None, seeds: list[int] | None = None,
                   lora_ranks: list[int] | None = None, strategies: list[str] | None = None,
-                  max_parallel_models: int | None = None) -> Path:
+                  max_parallel_models: int | None = None, *,
+                  allow_single: bool = False) -> Path:
     from fd_airquality.baselines import run_baseline
     from fd_airquality.comparison import compare_runs
     from fd_airquality.execution import execute_plan
@@ -241,7 +257,7 @@ def run_benchmark(settings: RunSettings, models: list[str], modes: list[str],
         for seed in seeds[:1] if case["mode"] == "zero-shot" else seeds:
             for rank in ranks if case["model"] in GRANITE and case["mode"] != "zero-shot" else ranks[:1]:
                 plan.append(case | {"seed": seed, "lora_rank": rank})
-    if len(plan) < 2:
+    if len(plan) < (1 if allow_single else 2):
         raise ValueError("benchmark requiere al menos dos combinaciones válidas.")
     for case in plan:
         current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
@@ -268,7 +284,7 @@ def run_benchmark(settings: RunSettings, models: list[str], modes: list[str],
                              max_parallel_models=max_parallel_models, baseline=run_baseline,
                              launch=launch_simulation, progress_log=progress_log)
         report_progress("comparison", f"completed_candidates={len(paths)}")
-        return compare_runs(paths, root / "comparison")
+        return compare_runs(paths, root / "comparison", **({"allow_single": True} if allow_single else {}))
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -277,7 +293,7 @@ def main(argv: list[str] | None = None) -> None:
         args = parse_configured_args(parser, commands, argv)
         if getattr(args, "config", None) is not None:
             print(f"Configuración: {args.config}", flush=True)
-        if args.command == "prepare":
+        if args.command in {"prepare", "prepare-backtest"}:
             overrides = {
                 field.name: getattr(args, field.name)
                 for field in fields(DataConfig) if getattr(args, field.name) is not None
@@ -286,11 +302,16 @@ def main(argv: list[str] | None = None) -> None:
             with RunLogging(log_dir, f"prepare pollutant={args.pollutant}", level=args.log_level,
                             heartbeat_seconds=args.heartbeat_seconds) as log:
                 report_progress("prepare", f"raw_root={args.raw_root} pollutant={args.pollutant}")
-                manifest = prepare(
-                    args.raw_root.expanduser().resolve(),
-                    args.output, args.pollutant, DataConfig(**overrides),
-                    set(args.station) if args.station else None,
-                )
+                parameters = (args.raw_root.expanduser().resolve(), args.output, args.pollutant,
+                              DataConfig(**overrides), set(args.station) if args.station else None)
+                if args.command == "prepare-backtest":
+                    from fd_airquality.backtesting import prepare_backtest
+
+                    manifest = prepare_backtest(*parameters, folds=args.folds, step_hours=args.step_hours,
+                                               train_history=args.train_history,
+                                               history_hours=args.history_hours)
+                else:
+                    manifest = prepare(*parameters)
                 report_progress("prepare", f"manifest={manifest}")
             if manifest.is_file():
                 shutil.copyfile(log.path, manifest.parent / "prepare.log")
@@ -307,9 +328,10 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "compare":
             from fd_airquality.comparison import compare_runs
 
-            compare_runs(args.runs, args.output or Path("reports/comparisons") / f"comparison_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}")
+            compare_runs(args.runs, args.output or Path("reports/comparisons") / f"comparison_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}",
+                         allow_training_differences=args.allow_training_differences)
         else:
-            manifest = resolve_manifest(args.manifest)
+            manifest = resolve_manifest(args.manifest, backtest=args.command == "backtest")
             settings = RunSettings(**{
                 field.name: (
                     str(manifest) if field.name == "manifest"
@@ -324,6 +346,14 @@ def main(argv: list[str] | None = None) -> None:
                 from fd_airquality.baselines import run_baseline
 
                 run_baseline(settings, args.mode)
+            elif args.command == "backtest":
+                from fd_airquality.backtesting import run_backtest
+
+                result = run_backtest(settings, args.models, args.modes, adaptations=args.adaptations,
+                                       seeds=args.seeds, lora_ranks=args.lora_ranks, strategies=args.strategies,
+                                       max_parallel_models=args.max_parallel_models,
+                                       stage=args.stage, selection=args.selection)
+                print(f"Resultados temporales: {result}")
             else:
                 run_benchmark(settings, args.models, args.modes,
                                args.adaptations, args.seeds, args.lora_ranks, args.strategies,
@@ -333,6 +363,12 @@ def main(argv: list[str] | None = None) -> None:
 
 
 def _inspect(path: Path) -> None:
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if "folds" in document:
+        print(f"Protocolo temporal: {document['protocol']}; historial={document['train_history']}")
+        for entry in document["folds"]:
+            print(f"  Fold {entry['fold']}: train < {entry['validation_start']}; test [{entry['test_start']}, {entry['test_end']})")
+        return
     manifest = read_manifest(path)
     print(f"{manifest['pollutant']}: {len(manifest['clients'])} estaciones elegibles")
     print(f"Geometría: {manifest['geometry']}")
@@ -342,12 +378,12 @@ def _inspect(path: Path) -> None:
             f"train={client['num_train_windows']}, validation={client['num_validation_windows']}, "
             f"test={client['num_test_windows']} ventanas"
         )
-        if manifest["schema_version"] == 4:
+        if manifest["schema_version"] >= 4:
             print(f"       Pares para MASE/RMSSE: validation={client['validation_scale_pairs']}, "
                   f"test={client['test_scale_pairs']}")
             undefined = [name for name in ("validation", "test") if not client[f"{name}_mase_defined"]]
             if undefined:
-                print(f"       AVISO: MASE/RMSSE indefinidas en {', '.join(undefined)} (escala cero o sin pares).")
+                print(f"       AVISO: MASE/RMSSE indefinidas en {', '.join(undefined)} (escala cero o pares insuficientes).")
     print(f"Inventario y exclusiones: {path.parent}")
     if (path.parent / "retention.json").is_file():
         print(f"Retención: {json.loads((path.parent / 'retention.json').read_text())}")
