@@ -435,7 +435,12 @@ def restore_checkpoint(checkpoint: str | Path | dict) -> nn.Module:
     payload = torch.load(checkpoint, map_location="cpu", weights_only=True) if not isinstance(checkpoint, dict) else checkpoint
     if payload.get("checkpoint_version") != 2:
         raise ValueError("Checkpoint antiguo incompatible con la adaptación interna.")
-    settings = RunSettings.from_mapping(payload["settings"])
+    config = payload["settings"]
+    # Historical checkpoints remain usable for inference: their selection score
+    # never affects the model architecture, weights, or forward pass.
+    if config.get("selection-metric") in {"mae", "macro-mae"}:
+        config = config | {"selection-metric": "macro-mase"}
+    settings = RunSettings.from_mapping(config)
     if payload["model"] != model_metadata(payload["geometry"], settings):
         raise ValueError("Metadatos/capas/revisión del checkpoint incompatibles.")
     model = make_model(payload["geometry"], settings)

@@ -84,7 +84,7 @@ test-hours = 96
 num-server-rounds = 5
 # Pasadas locales por los datos de cada cliente en cada ronda.
 local-epochs = 50
-# Máximo de épocas por ajuste local; parada por MAE observado de validación interna.
+# Máximo de épocas por ajuste local; parada por MSE observado de validación interna.
 early-stopping = 1
 early-stopping-patience = 5
 early-stopping-min-delta = 0.0
@@ -151,7 +151,7 @@ fair-learning-rate = 0.01
 # Peso de la regularización L2 del refinamiento LoRA-FAIR.
 fair-lambda = 1.0
 # Métrica de validación para elegir el mejor checkpoint; menor es mejor.
-# macro-mase/macro-rmsse/macro-mae ponderan por igual las estaciones; mae agrupa targets.
+# macro-mase y macro-rmsse ponderan por igual las estaciones con escala definida.
 selection-metric = "macro-mase"
 # Intervalo en segundos entre mensajes de progreso durante trabajos largos.
 heartbeat-seconds = 60.0

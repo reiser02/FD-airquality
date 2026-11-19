@@ -16,9 +16,12 @@ from matplotlib.lines import Line2D
 METRICS = {
     "macro-mase": "MASE macro",
     "macro-rmsse": "RMSSE macro",
-    "mae": "MAE",
-    "rmse": "RMSE",
 }
+IDENTITY_COLUMNS = ("run", "model", "mode", "adaptation", "strategy", "seed")
+CONTEXT_COLUMNS = (
+    "lora_rank", "revision", "flowstate_scale_factor", "missing_policy", "selection_metric",
+    "selected_round", "num-clients", "num-examples", "num-targets", "target-coverage",
+)
 MODELS = {
     "mlp": "MLP", "autoencoder": "Autoencoder", "nlinear": "NLinear", "nhits": "NHITS",
     "darts-nlinear": "NLinear (Darts)", "ttm-r3": "TTM-R3",
@@ -49,10 +52,11 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
     if not metadata.get("manifest_sha256"):
         raise ValueError("Falta la identidad del manifest en comparison.json; usa compare primero.")
     rows = pd.read_csv(source / "comparison.csv")
-    required = {"run", "model", "mode", "adaptation", "strategy", "seed", "mae", "rmse"}
-    if missing := required - set(rows):
+    if missing := set(IDENTITY_COLUMNS) - set(rows):
         raise ValueError(f"Faltan columnas en comparison.csv: {sorted(missing)}")
-    rows = rows.loc[rows["mode"].isin(["federated", "centralized"])].copy()
+    # Older reports can contain non-scaled metrics. Never include them in new exports.
+    columns = [key for key in (*IDENTITY_COLUMNS, *CONTEXT_COLUMNS, *METRICS) if key in rows]
+    rows = rows.loc[rows["mode"].isin(["federated", "centralized"]), columns].copy()
     if set(rows["mode"]) != {"federated", "centralized"}:
         raise ValueError("Se necesitan resultados federados y centralizados en la misma comparación.")
     if rows["run"].duplicated().any():
@@ -62,6 +66,8 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
         rows[metric] = pd.to_numeric(rows[metric], errors="raise") if metric in rows else np.nan
         if np.isinf(rows[metric]).any() or (rows[metric].dropna() < 0).any():
             raise ValueError(f"Error negativo o infinito en {metric}.")
+    if not rows[list(METRICS)].notna().any().any():
+        raise ValueError("No hay resultados definidos de MASE macro ni de RMSSE macro para graficar.")
     # Never pool seeds, ranks, revisions or strategies into an implicit mean.
     labels = []
     for _, row in rows.iterrows():
@@ -77,7 +83,7 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
     rows["label"] = labels
     duplicate = rows.duplicated(["mode", "label"], keep=False)
     rows.loc[duplicate, "label"] += " [" + rows.loc[duplicate, "run"].str.rsplit("/", n=1).str[-1] + "]"
-    return source, rows.sort_values(["macro-mase", "mae"], na_position="last"), metadata
+    return source, rows.sort_values([*METRICS, "run"], na_position="last"), metadata
 
 
 def matched_pairs(rows: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -136,12 +142,12 @@ def cross_pairs(rows: pd.DataFrame) -> pd.DataFrame:
 def _panels(count: int, title: str, subtitle: str) -> tuple[Figure, np.ndarray]:
     figure = Figure(figsize=(22, max(8, count * .55 + 4)), facecolor="white")
     FigureCanvasAgg(figure)
-    axes = figure.subplots(2, 2)
+    axes = figure.subplots(ncols=len(METRICS), squeeze=False)
     figure.suptitle(title, x=.02, y=.98, ha="left", fontsize=21, weight="bold")
     figure.text(.02, .93, subtitle, fontsize=11, color="#475569")
     figure.text(.02, .018, NOTE, fontsize=10, color="#475569")
     figure.subplots_adjust(left=.23, right=.95, top=.84, bottom=.17 if count < 6 else .12,
-                           wspace=1.05, hspace=.48)
+                           wspace=1.05)
     for axis in axes.flat:
         axis.set_axisbelow(True)
         axis.grid(axis="x", alpha=.18)
@@ -151,15 +157,15 @@ def _panels(count: int, title: str, subtitle: str) -> tuple[Figure, np.ndarray]:
 
 
 def _overview(rows: pd.DataFrame, title: str, subtitle: str) -> Figure:
-    figure, axes = _panels(len(rows), title, subtitle + " | Orden por MASE macro y MAE de test")
+    figure, axes = _panels(len(rows), title, subtitle + " | Orden por MASE macro y RMSSE macro de test")
     positions = np.arange(len(rows))
     for axis, (metric, name) in zip(axes.flat, METRICS.items(), strict=True):
-        bars = axis.barh(positions, rows[metric], height=.68,
+        bars = axis.barh(positions, rows[metric].fillna(0), height=.68,
                          color=[COLORS.get(value, "#64748b") for value in rows["adaptation"]])
         axis.set_yticks(positions, rows["label"])
         axis.invert_yaxis()
         axis.set_title(f"{name} ↓", loc="left", weight="bold", pad=12)
-        axis.set_xlabel("Error (escala original)" if metric in {"mae", "rmse"} else "Error escalado")
+        axis.set_xlabel("Error escalado")
         axis.bar_label(bars, labels=[f"{v:.4f}" if pd.notna(v) else "N/D" for v in rows[metric]],
                        padding=4, fontsize=9)
         maximum = rows[metric].max()
@@ -296,13 +302,13 @@ def plot_comparison(source: Path, output: Path | None = None) -> Path:
         f'<h1>Rendimiento predictivo: federado y centralizado</h1><p>{html.escape(subtitle)}</p>'
         f'<p>{NOTE} No se muestran intervalos de confianza: las estaciones no son semillas '
         f'y los targets rolling se solapan.</p><p>{CONTROL_NOTE}</p>'
-        '<p>MAE/RMSE: error global en escala original; MASE/RMSSE macro: igual peso por estación. '
+        '<p>MASE y RMSSE macro: igual peso por estación con escala definida. '
         'Las variantes se muestran por separado, sin seleccionar la mejor sobre test. '
         'La matriz cruza todos los candidatos, también modelos y configuraciones diferentes; '
         'sus diferencias no se atribuyen exclusivamente a federar.</p>'
         '<p>Tablas: <a href="plotted_metrics.csv">métricas</a> · '
         '<a href="matched_pairs.csv">parejas del mismo modelo</a> · '
-        '<a href="cross_model_pairs.csv">todos los cruces (cuatro métricas)</a></p>'
+        '<a href="cross_model_pairs.csv">todos los cruces (MASE y RMSSE macro)</a></p>'
         f'<ul>{warning_html}</ul>{sections}</html>'
     )
     (output / "index.html").write_text(page, encoding="utf-8")

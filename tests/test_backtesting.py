@@ -9,7 +9,7 @@ import torch
 from fd_airquality.backtesting import fold_configurations, prepare_backtest, run_backtest
 from fd_airquality.data import load_client_data
 from fd_airquality.settings import RunSettings
-from fd_airquality.uncertainty import paired_block_interval
+from fd_airquality.uncertainty import compare_calendar_blocks, paired_block_interval
 
 
 def test_fold_calendar_and_fold_local_normalization(temporal_family, tmp_path):
@@ -168,6 +168,22 @@ def test_joint_block_interval_is_paired_and_deterministic():
         paired_block_interval(a, b[:-1], counts)
     with pytest.raises(ValueError, match="dos bloques"):
         paired_block_interval(a[:3], b[:3], counts[:3])
+
+
+def test_calendar_bootstrap_uses_pooled_scaled_errors_and_common_support(tmp_path):
+    dates = pd.date_range("2025-01-01", periods=14)
+    a, b = {"run": "a"}, {"run": "b"}
+    for count, day in enumerate(dates, start=1):
+        prefix = f"block-{day:%Y%m%d}-mase"
+        a.update({f"{prefix}-scaled-error-sum": count * 2., f"{prefix}-target-count": count})
+        b.update({f"{prefix}-scaled-error-sum": count * 3., f"{prefix}-target-count": count})
+    compare_calendar_blocks([a, b], tmp_path)
+    row = pd.read_csv(tmp_path / "block_bootstrap_comparison.csv").iloc[0]
+    assert row.metric == "pooled-mase"
+    assert row.delta_a_minus_b == row.ci95_lower == row.ci95_upper == -1.
+    b["block-20250101-mase-target-count"] = 2
+    with pytest.raises(ValueError, match="Máscaras de targets distintas"):
+        compare_calendar_blocks([a, b], tmp_path)
 
 
 def test_backtest_can_follow_a_single_federated_candidate(temporal_family, tmp_path, in_process_federation):

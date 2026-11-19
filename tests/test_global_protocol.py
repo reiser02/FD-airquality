@@ -127,7 +127,7 @@ def test_constant_reference_scale_is_not_replaced_by_a_fake_error_denominator():
     from fd_airquality.task import selection_value
 
     with pytest.raises(ValueError, match="indefinida"):
-        selection_value({"mae": 1.0}, RunSettings())
+        selection_value({"macro-rmsse": 1.0}, RunSettings())
 
 
 def test_seasonal_error_scales_use_observed_endpoints_despite_intermediate_gap():

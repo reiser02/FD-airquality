@@ -142,13 +142,13 @@ Se publican por configuración y semilla:
 - `temporal_comparison.csv`: resultados de cada fold.
 - **`cv_fold_mean.csv`: media aritmética y desviación descriptiva entre folds**,
   con el mismo peso por fold. Es el resumen principal de `evaluation`.
-- `cv_summary.csv`: agregación por sumas de errores y conteos observados.
-- `cv_station_summary.csv`: reducción por estación.
+- `cv_summary.csv`: agregación por sumas de errores escalados y conteos observados.
+  La reducción por estación solo se usa internamente para las métricas macro.
 
-No hay una única media universal: con dos folds de MAE `0` y `10`, uno con un
-target observado y otro con nueve, la media simple es `5` y el MAE agrupado es
-`9`. Para RMSE tampoco es equivalente promediar las raíces y extraer la raíz
-después de agrupar cuadrados. Se conservan ambas lecturas con nombres explícitos.
+No hay una única media universal: con dos folds de MASE `0` y `10`, uno con un
+target observado y otro con nueve, la media simple es `5` y el MASE agrupado es
+`9`. Para RMSSE tampoco es equivalente promediar las raíces y extraer la raíz
+después de agrupar cuadrados escalados. Se conservan ambas lecturas con nombres explícitos.
 Una métrica indefinida en un fold no se elimina silenciosamente de su media
 simple: se registra el número de folds definidos y la media queda indefinida.
 Las semillas siguen siendo réplicas, no candidatos que seleccionar.
@@ -185,7 +185,7 @@ La configuración principal utiliza:
 local-epochs = 50                 # máximo, no número garantizado de épocas
 early-stopping = 1
 early-stopping-patience = 5
-early-stopping-min-delta = 0.0     # mejora absoluta mínima, en unidades de MAE
+early-stopping-min-delta = 0.0     # mejora absoluta mínima de MSE, en unidades cuadradas
 lr-scheduler = "plateau"           # ReduceLROnPlateau de PyTorch
 lr-scheduler-patience = 2
 lr-scheduler-factor = 0.5
@@ -193,8 +193,10 @@ min-learning-rate = 0.000001
 round-validation-hours = 24
 ```
 
-Tras cada época se monitoriza **MAE por targets originales observados en
-unidades físicas**. Se suman errores y conteos; no se promedian medias de lotes.
+Tras cada época se monitoriza **MSE por targets originales observados, en
+unidades físicas al cuadrado**. Se suman errores cuadrados y conteos; no se
+promedian medias de lotes ni se extrae la raíz. El cambio de MAE a MSE puede
+cambiar qué época se elige y cuándo se reduce el LR.
 En centralizado se invierte la escala correspondiente a cada estación.
 No se utiliza el error externo de CV ni el test para parar o ajustar el LR.
 La pérdida optimizada puede ser MSE o multicuantil normalizada y no es esa métrica.
@@ -247,8 +249,8 @@ completa del fold se mantiene al final del flujo federado; la evaluación extern
 mantiene los pesos fijos. La reserva, los mejores pesos y todos los controles
 reinician entre folds.
 
-`station_metrics.csv`, `round_metrics.csv` y los logs registran épocas realizadas,
-paradas, mejor época, LR inicial/final, reducciones y MAE de monitorización.
+La auditoría local (`station_metrics.csv`, `round_metrics.csv` y logs) conserva
+los diagnósticos de épocas, paradas, LR y `training-validation-mse`.
 `num-targets` usado para agregar clientes mide el soporte medio por época; un
 cliente no gana peso por ejecutar más épocas o completar un lote corto.
 

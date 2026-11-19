@@ -114,7 +114,9 @@ def test_masked_artifacts_and_evaluation_use_real_target_counts(masked_prepared)
     assert stats["num-targets"] == manifest["clients"][0]["num_test_targets"]
     assert stats["missing-context-values"] > 0
     assert sum(stats[f"lead-{i:02d}-count"] for i in range(1, 4)) == stats["num-targets"]
-    assert stats["seasonal-baseline-mae"] >= 0
+    assert stats["mase"] >= 0 and stats["rmsse"] >= 0
+    assert sum(value for key, value in stats.items()
+               if key.startswith("block-") and key.endswith("-mase-target-count")) == stats["num-targets"]
 
 
 @pytest.mark.parametrize("microbatch", [1, 3])
@@ -164,8 +166,11 @@ def test_evaluation_scores_canonical_labels_and_counts_all_negative_forecasts():
     observed = np.isfinite(truth)
     errors = 1e8 - truth[observed]
     assert stats["num-targets"] == 5
-    assert stats["mae"] == np.abs(errors).mean()
-    assert stats["mse"] == np.square(errors).mean()
+    assert stats["mase"] == pytest.approx(np.abs(errors).mean() / 2.)
+    assert stats["rmsse"] == pytest.approx(np.sqrt(np.square(errors).mean() / 5.))
+    assert not {"mae", "rmse", "mse", "absolute-error-sum", "squared-error-sum"} & stats.keys()
+    assert not any(key.startswith(("baseline-", "seasonal-baseline-")) or key.endswith(("-mae", "-rmse")) for key in stats)
+    assert stats["lead-03-mase-target-count"] == 1
 
     artifact = artifact | {"mean": np.array(0.), "scale": np.array(1.)}
     torch.nn.init.constant_(model.bias, -1.)
@@ -209,16 +214,16 @@ def test_explicit_upct_flags_are_respected_without_guessing_their_meaning(tmp_pa
     assert filtered.attrs["source_quality"]["invalid_flags"] == 1
 
 
-def test_missing_toml_mapping_and_macro_mae_are_configurable(tmp_path, monkeypatch):
+def test_missing_toml_mapping_and_macro_rmsse_are_configurable(tmp_path, monkeypatch):
     from fd_airquality.cli import _parser
     from fd_airquality.configuration import parse_configured_args
 
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "fd-airquality.toml").write_text('[missing]\nmlp = "mean"\n[run]\nselection-metric = "macro-mae"\n')
+    (tmp_path / "fd-airquality.toml").write_text('[missing]\nmlp = "mean"\n[run]\nselection-metric = "macro-rmsse"\n')
     parser, commands = _parser()
     args = parse_configured_args(parser, commands, ["backtest"])
     assert json.loads(args.missing_policies) == {"mlp": "mean"}
-    assert args.selection_metric == "macro-mae"
+    assert args.selection_metric == "macro-rmsse"
 
 
 def test_prepared_windows_and_evaluation_do_not_depend_on_epoch_budget(masked_prepared, tmp_path, masked_geometry):

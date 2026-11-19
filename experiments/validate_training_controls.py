@@ -178,7 +178,7 @@ def audit(output: Path) -> dict:
                                     "padded_context_slots": local["padded-context-slots"].astype(int).tolist(),
                                     "padded_target_slots": local["padded-target-slots"].astype(int).tolist()})
             runs.append({"run": str(path), "mode": run["mode"], "model": settings.model})
-    assert all(np.isfinite(means[name]).all() for name in ("mae", "rmse"))
+    assert all(np.isfinite(means[name]).all() for name in ("mase", "rmsse"))
     return {"runs": runs, "federated_streams": streams, "fold_mean_rows": len(means)}
 
 

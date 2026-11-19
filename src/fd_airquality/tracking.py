@@ -13,7 +13,6 @@ import sys
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
-from hashlib import sha256
 from importlib.metadata import PackageNotFoundError, distribution, version
 from pathlib import Path
 
@@ -33,6 +32,22 @@ MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "fe
 ADAPTATION_LABELS = {
     "full": "completo", "none": "sin adaptación", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
     "flora": "FLoRA", "lora-fair": "LoRA-FAIR",
+}
+
+_EVALUATION_METRICS = (
+    "macro-mase", "macro-rmsse", "crps", "wis", "target-coverage",
+    "robust-num-clients", "robust-macro-mase", "robust-macro-rmsse",
+)
+_TRACKED_METRICS = {
+    "train": (
+        "train-seconds", "peak-cuda-allocated-mib", "trainable-parameters",
+        "uplink-tensor-bytes", "downlink-tensor-bytes", "global-state-tensor-bytes",
+        "server-aggregation-seconds", "server-aggregation-cuda",
+    ),
+    "validation": _EVALUATION_METRICS,
+    "test": _EVALUATION_METRICS,
+    "selection": ("round", "validation_score"),
+    "runtime": ("wall-seconds",),
 }
 
 
@@ -144,7 +159,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                               "block_schedule": "initial_prefix_then_calendar_increments" if progressive else None,
                               "validation": "after_final_arrival" if progressive else "each_stage",
                               "weight_continuity": "within_fold_rounds_only"},
-        "metric_protocol": {"implementation": "masked_seasonal_errors_v1",
+        "metric_protocol": {"implementation": "masked_seasonal_errors_v2",
                              "reference": manifest["geometry"].get("error_scale_reference", "pre-evaluation"),
                              "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
         "training_budget": {
@@ -154,7 +169,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         },
         "training_controls": {
             "scope": "local_epochs_per_stage_or_round",
-            "monitor": "pooled_observed_mae_original_units",
+            "monitor": "pooled_observed_mse_original_units",
             "early_stopping": settings.early_stopping,
             "patience": settings.early_stopping_patience,
             "min_delta": settings.early_stopping_min_delta,
@@ -195,7 +210,8 @@ class RunTracker:
             )
         else:
             experiment_id = experiment.experiment_id
-        adaptation = model_metadata(self.manifest["geometry"], self.settings).get("adaptation", "full")
+        metadata = model_metadata(self.manifest["geometry"], self.settings)
+        adaptation = metadata.get("adaptation", "full")
         run = self.client.create_run(experiment_id, tags={
             "model": self.settings.model, "mode": self.mode,
             "pollutant": self.manifest["pollutant"], "protocol": self.manifest["protocol"],
@@ -205,7 +221,7 @@ class RunTracker:
         })
         self.run_id = run.info.run_id
         try:
-            self._log_params()
+            self._log_params(metadata)
         except Exception:
             self.client.set_terminated(self.run_id, "FAILED")
             raise
@@ -214,29 +230,46 @@ class RunTracker:
         }, indent=2) + "\n", encoding="utf-8")
         return self
 
-    def _log_params(self):
-        for key, value in asdict(self.settings).items():
+    def _log_params(self, metadata):
+        settings = self.settings
+        geometry = self.manifest["geometry"]
+        adaptation = metadata.get("adaptation", "full")
+        keys = ["seed", "device", "output_dir", "selection_metric", "probabilistic", "normalization"]
+        if settings.normalization != "none":
+            keys.append("scaler_type")
+        if self.mode != "zero-shot":
+            keys.extend(("num_server_rounds", "local_epochs", "batch_size", "learning_rate", "weight_decay"))
+        if self.mode == "federated":
+            keys.append("strategy")
+            if settings.strategy == "fedprox":
+                keys.append("proximal_mu")
+        if adaptation in {"lora", "ffa-lora", "flora", "lora-fair"}:
+            keys.extend(("lora_rank", "lora_alpha", "lora_dropout", "lora_targets"))
+        if adaptation == "lora-fair":
+            keys.extend(("fair_iterations", "fair_learning_rate", "fair_lambda"))
+        if settings.model == "flowstate-r1":
+            keys.append("flowstate_scale_factor")
+        params = {key: getattr(settings, key) for key in keys} | {
+            "data.context": geometry["context"], "data.horizon": geometry["horizon"],
+            "num_clients": len(self.manifest["clients"]),
+            "missing_policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
+        }
+        if "revision" in metadata:
+            params["model.revision"] = metadata["revision"]
+        for key, value in params.items():
             self.client.log_param(self.run_id, key, value)
-        for key, value in self.manifest["geometry"].items():
-            self.client.log_param(self.run_id, f"data.{key}", value)
-        for key, value in model_metadata(self.manifest["geometry"], self.settings).items():
-            serialized = json.dumps(value, sort_keys=True) if isinstance(value, (dict, list)) else str(value)
-            if len(serialized) > 5000:
-                self.client.log_param(self.run_id, f"model.{key}.sha256", sha256(serialized.encode()).hexdigest())
-            else:
-                self.client.log_param(self.run_id, f"model.{key}", serialized)
-        self.client.log_param(self.run_id, "num_clients", len(self.manifest["clients"]))
 
-    def log_metrics(self, split: str, metrics: dict, step: int, *, partition: int | None = None) -> None:
+    def log_metrics(self, split: str, metrics: dict, step: int) -> None:
         if self.client is None:
             return
         from mlflow.entities import Metric
 
-        prefix = split if partition is None else f"station_{partition:03d}/{split}"
         timestamp = int(time.time() * 1000)
-        records = [Metric(f"{prefix}/{key}", float(value), timestamp, step)
-                   for key, value in metrics.items() if isinstance(value, (int, float)) and math.isfinite(value)]
-        self.client.log_batch(self.run_id, metrics=records)
+        records = [Metric(f"{split}/{key}", float(value), timestamp, step)
+                   for key in _TRACKED_METRICS.get(split, ())
+                   if isinstance(value := metrics.get(key), (int, float)) and math.isfinite(value)]
+        if records:
+            self.client.log_batch(self.run_id, metrics=records)
 
     def __exit__(self, exc_type, exc_value, traceback):
         logging.getLogger(__name__).info("Tracking finalize status=%s", "FAILED" if exc_type else "FINISHED")
@@ -255,7 +288,7 @@ class RunTracker:
             try:
                 self.log_metrics("runtime", resources, 0)
                 # Allowlist: never recursively log the project, data, NPZ or scalers.
-                for name in ("run.json", "round_metrics.csv", "station_metrics.csv", "test_metrics.json", "resource_metrics.json", "excluded_stations.csv", "run.log"):
+                for name in ("run.json", "round_metrics.csv", "test_metrics.json", "resource_metrics.json", "excluded_stations.csv", "run.log"):
                     if (self.output / name).is_file():
                         self.client.log_artifact(self.run_id, str(self.output / name))
                 if self.settings.mlflow_log_models:

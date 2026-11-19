@@ -283,6 +283,18 @@ def test_models_restore_internal_adapters_and_never_mutate_cached_backbone(algor
         torch.testing.assert_close(template.state_dict()[key], value, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("metric", ["mae", "macro-mae"])
+def test_restore_preserves_historical_checkpoints_with_unscaled_selection(metric, mock_granite):
+    config = settings("lora", lora_targets="proj")
+    geometry = {"context": 90, "horizon": 12}
+    model = make_model(geometry, config).eval()
+    payload = checkpoint_payload(geometry, config, shared_state(model), 1)
+    payload["settings"]["selection-metric"] = metric
+    inputs = torch.randn(2, 90)
+    torch.testing.assert_close(restore_checkpoint(payload)(inputs), model(inputs), rtol=0, atol=0)
+    assert payload["settings"]["selection-metric"] == metric
+
+
 def test_unknown_or_empty_target_selection_fails_without_silent_fallback(mock_granite):
     with pytest.raises(ValueError, match="capas|target"):
         make_model({"context": 90, "horizon": 12}, settings("lora", lora_targets="absent"))

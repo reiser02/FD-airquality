@@ -17,29 +17,27 @@ def test_external_cv_pools_counts_not_fold_means_and_roots_after_pooling(tmp_pat
         records.append({
             "temporal_configuration": "a", "seed": 42, "model": "mlp", "mode": "local",
             "adaptation": "full", "strategy": "fedavg", "station": "a", "fold": fold,
-            "num-targets": count, "absolute-error-sum": count * error,
-            "squared-error-sum": count * error**2,
+            "num-targets": count,
             "mase-scaled-error-sum": count * error / 2, "mase-target-count": count,
             "rmsse-scaled-error-sum": count * error**2 / 4, "rmsse-target-count": count,
             "crps-sum": count * error / 3, "crps-count": count,
         })
     summary = summarize_cv(records, records, tmp_path).iloc[0]
-    assert summary.mae == summary["macro-mae"] == 9.
-    assert summary.rmse == pytest.approx(np.sqrt(90))
     assert summary.mase == summary["macro-mase"] == 4.5
     assert summary.rmsse == pytest.approx(np.sqrt(90 / 4))
     assert summary.crps == 3.
     means = pd.read_csv(tmp_path / "cv_fold_mean.csv").iloc[0]
-    assert means.mae == 5. and means.rmse == 5.
-    assert means["mae-defined-folds"] == 2
+    assert means.mase == means.rmsse == 2.5
+    assert means["mase-defined-folds"] == 2
+    assert not (tmp_path / "cv_station_summary.csv").exists()
 
 
 def test_seed_is_not_selected_as_a_hyperparameter():
     frame = pd.DataFrame({"temporal_configuration": ["a", "a", "b", "b"],
-                          "seed": [42, 43, 42, 43], "mae": [0., 20., 5., 5.]})
-    assert select_configuration(frame, "mae") == "b"
+                          "seed": [42, 43, 42, 43], "macro-mase": [0., 20., 5., 5.]})
+    assert select_configuration(frame, "macro-mase") == "b"
     with pytest.raises(ValueError, match="indefinida"):
-        select_configuration(frame.assign(mae=np.nan), "mae")
+        select_configuration(frame.assign(**{"macro-mase": np.nan}), "macro-mase")
 
 
 @pytest.mark.parametrize("folds", [1, 3])

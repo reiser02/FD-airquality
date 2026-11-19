@@ -13,7 +13,7 @@ from fd_airquality.data import WindowDataset, load_client_data
 from fd_airquality.models import restore_checkpoint
 from fd_airquality.server_app import run_server
 from fd_airquality.settings import RunSettings
-from fd_airquality.strategy import AuditedStrategy, aggregate_evaluation
+from fd_airquality.strategy import AuditedStrategy, aggregate_evaluation, coverage_metrics
 from fd_airquality.task import configure_torch, make_model, train_local
 
 
@@ -63,11 +63,11 @@ def test_flower_tests_once_with_weights_from_best_validation_round(prepared, tmp
         if split in {"validation", "test"}:
             evaluations.append((split, stage, message.content["arrays"].to_torch_state_dict()))
         if split == "validation":
-            # Make the MASE winner round 1, even though MAE prefers round 2.
+            # The selection criterion prefers round 1 while RMSSE favors round 2.
             record = reply.content["metrics"]
-            mase, mae = ((2., 3.), (1., 2.), (3., 1.))[stage]
+            mase, rmsse = ((2., 3.), (1., 2.), (3., 1.))[stage]
             record.update({"mase": mase, "mase-sum": mase * record["mase-count"],
-                           "mae": mae, "absolute-error-sum": mae * record["num-targets"]})
+                           "rmsse": rmsse, "rmsse-sum": rmsse * record["rmsse-count"]})
         return reply
 
     grid.app = respond
@@ -89,12 +89,13 @@ def test_flower_tests_once_with_weights_from_best_validation_round(prepared, tmp
         torch.testing.assert_close(state, expected, rtol=0, atol=0)
 
 
-def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_path, mlflow_uri, flower_grid):
+def test_server_tracks_one_run_with_aggregate_fair_metrics(prepared, tmp_path, mlflow_uri, flower_grid, mock_granite):
     from mlflow import MlflowClient
 
     path, manifest = prepared
-    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                           num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=mlflow_uri)
+    settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), model="flowstate-r1",
+                           adaptation="lora-fair", lora_targets="proj", fair_iterations=3,
+                           num_server_rounds=1, mlflow_tracking_uri=mlflow_uri)
     output = run_server(flower_grid(settings, len(manifest["clients"])), settings)
     metadata = json.loads((output / "mlflow.json").read_text())
     client = MlflowClient(tracking_uri=mlflow_uri)
@@ -102,10 +103,19 @@ def test_server_tracks_one_run_with_global_and_station_metrics(prepared, tmp_pat
     assert run.info.run_id == metadata["run_id"]
     assert run.info.status == "FINISHED"
     assert run.data.params["num_clients"] == "2"
-    assert run.data.tags["candidate"] == "MLP | federado | completo | FedAvg"
-    assert run.info.run_name.startswith("MLP | federado | completo | FedAvg | PM25 | ")
+    candidate = "FlowState-R1 | federado | LoRA-FAIR | FedAvg"
+    assert run.data.tags["candidate"] == candidate
+    assert run.info.run_name.startswith(f"{candidate} | PM25 | ")
     assert "benchmark" not in run.data.tags
-    assert {"test/mae", "station_000/test/mae", "station_001/test/mae"} <= run.data.metrics.keys()
+    assert run.data.params["fair_iterations"] == "3"
+    assert run.data.params["strategy"] == "fedavg"
+    assert "proximal_mu" not in run.data.params
+    assert {"test/macro-mase", "test/macro-rmsse", "train/server-aggregation-seconds"} <= run.data.metrics.keys()
+    history = client.get_metric_history(run.info.run_id, "train/server-aggregation-seconds")
+    assert [(point.step, point.value > 0) for point in history] == [(1, True)]
+    assert run.data.metrics["train/server-aggregation-cuda"] == 0
+    assert not any(key.startswith("station_") or "refinement-objective" in key for key in run.data.metrics)
+    assert "refinement-objective-final" in pd.read_csv(output / "round_metrics.csv")
     assert "run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)}
 
 
@@ -180,20 +190,18 @@ def test_federation_uses_fractional_sampled_target_support_before_replacement(
         strategy.aggregate_train(2, replies)
 
 
-def test_global_rmse_is_pooled_not_mean_client_rmse():
+def test_pooled_rmsse_weights_observed_targets_and_takes_root_after_pooling():
     contents = []
-    for count, mae, mse in ((1, 1.0, 1.0), (3, 3.0, 9.0)):
+    for count, score in ((1, 1.0), (3, 3.0)):
         contents.append(RecordDict({"metrics": MetricRecord({
-            "num-examples": count, "num-targets": count, "mae": mae, "mse": mse,
-            "absolute-error-sum": mae * count, "squared-error-sum": mse * count,
-            "baseline-absolute-error-sum": 2.0 * count,
-            "baseline-squared-error-sum": 4.0 * count,
-            "mase-sum": 0.0, "mase-count": 0, "rmsse-sum": 0.0, "rmsse-count": 0,
+            "num-examples": count, "num-targets": count,
+            "mase-sum": 0.0, "mase-count": 0, "rmsse-sum": score * count, "rmsse-count": count,
+            "rmsse-scaled-error-sum": count * score**2, "rmsse-target-count": count,
         })}))
     metrics = aggregate_evaluation(contents, "num-examples")
-    assert metrics["mae"] == 2.5
-    assert metrics["rmse"] == pytest.approx(np.sqrt(7))
-    assert metrics["macro-rmse"] == 2.0
+    assert metrics["mean-rmsse"] == 2.5
+    assert metrics["pooled-rmsse"] == pytest.approx(np.sqrt(7))
+    assert metrics["macro-rmsse"] == 2.0
     assert "mean-mase" not in metrics
     assert metrics["mase-count"] == 0
 
@@ -202,15 +210,32 @@ def test_macro_scaled_errors_weight_stations_not_origins():
     contents = []
     for origins, scaled in ((1, 1.), (9, 3.)):
         contents.append(RecordDict({"metrics": MetricRecord({
-            "num-examples": origins, "num-targets": origins, "mae": scaled, "mse": scaled**2,
-            "absolute-error-sum": origins * scaled, "squared-error-sum": origins * scaled**2,
-            "baseline-absolute-error-sum": origins * scaled, "baseline-squared-error-sum": origins * scaled**2,
+            "num-examples": origins, "num-targets": origins,
             "mase-sum": origins * scaled, "mase-count": origins, "mase": scaled,
             "rmsse-sum": origins * scaled, "rmsse-count": origins, "rmsse": scaled,
         })}))
     metrics = aggregate_evaluation(contents, "num-examples")
     assert metrics["mean-mase"] == 2.8
     assert metrics["macro-mase"] == metrics["macro-rmsse"] == 2.
+    for flags, expected in (((False, False), {"robust-num-clients": 0}),
+                            ((True, True), {"robust-num-clients": 2})):
+        assert coverage_metrics(contents, {"clients": [{"robust_evaluation": flag} for flag in flags]}) == expected
+    subset = coverage_metrics(contents, {"clients": [{"robust_evaluation": True}, {}]})
+    assert subset["robust-num-clients"] == subset["robust-macro-mase"] == 1.
+
+
+def test_scaled_lead_scores_do_not_include_stations_without_a_defined_scale():
+    shared = {"mase-sum": 0., "mase-count": 0, "rmsse-sum": 0., "rmsse-count": 0}
+    contents = [RecordDict({"metrics": MetricRecord(shared | record)}) for record in (
+        {"num-examples": 1, "num-targets": 1, "lead-01-count": 1,
+         "lead-01-mase-scaled-error-sum": 2., "lead-01-mase-target-count": 1,
+         "lead-01-rmsse-scaled-error-sum": 9., "lead-01-rmsse-target-count": 1},
+        {"num-examples": 9, "num-targets": 9, "lead-01-count": 9},
+    )]
+    metrics = aggregate_evaluation(contents, "num-examples")
+    assert metrics["lead-01-count"] == 10
+    assert metrics["lead-01-mase"] == 2.
+    assert metrics["lead-01-rmsse"] == 3.
 
 
 def test_local_training_is_reproducible_and_proximal_penalty_changes_updates(prepared):

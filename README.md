@@ -288,7 +288,8 @@ Igualar rondas **no iguala ejemplos utilizados, optimización ni tiempo**.
 Todos evalúan el test una vez por fold después de seleccionar exclusivamente con validación.
 
 La configuración principal añade early stopping con paciencia y
-`ReduceLROnPlateau` en las épocas locales. En federado se monitoriza una reserva
+`ReduceLROnPlateau` en las épocas locales, con MSE observado en unidades cuadradas.
+En federado se monitoriza una reserva
 de pasado anterior a la primera ronda, sin consultar validación futura ni omitir
 las siguientes llegadas. Consulta [muestreo, padding, folds y controles de
 entrenamiento](TRAINING_CONTROLS.md) para las reglas y opciones.
@@ -312,28 +313,28 @@ entre ausencia de pares, cobertura insuficiente y escala cero con pares disponib
 Si todas quedan descartadas, se guarda el informe y se aborta antes de entrenar.
 La preparación original y sus NPZ no se alteran; se genera un `runtime_manifest.json`
 con el panel efectivo y las identidades originales. La matriz lo fija una sola vez.
-Puedes elegir explícitamente `--selection-metric mae` o `macro-mae` para conservar las estaciones
-sin referencia escalada: solo cambia la selección del checkpoint, no el MASE/RMSSE
-reportado ni su denominador. No hay cambio automático de métrica ni ampliación de
-referencia. Los fallos de integridad o de entrenamiento siguen abortando, sin cambiar
-el panel a mitad del experimento.
+La alternativa explícita es `--selection-metric macro-rmsse`. No hay cambio
+automático de métrica ni ampliación de referencia. Los fallos de integridad o de
+entrenamiento siguen abortando, sin cambiar el panel a mitad del experimento.
 La normalización de entrada sigue ajustándose únicamente con entrenamiento.
-MAE/RMSE se desnormalizan por estación.
-`comparison.csv` incluye mejoras frente a persistencia y al zero-shot de la misma
-revisión y configuración de inferencia, cuando hay una única referencia compatible;
-`station_comparison.csv` conserva el detalle. `pairwise_comparison.csv` y
-`station_pairwise_comparison.csv` comparan **todos contra todos**, en ambas direcciones,
-para MAE/RMSE y MASE/RMSSE (macro en la tabla global). Delta = A − B: negativo
-favorece A; mejora (%) = `100 × (1 − A/B)`: positiva favorece A y queda vacía si B=0.
+Las evaluaciones nuevas calculan MASE/RMSSE sobre los targets observados en
+unidades originales, sin calcular MAE/RMSE no escalados ni evaluar persistencia
+con esas métricas. `comparison.csv` compara candidatos agregados e incluye mejoras
+frente a un único zero-shot con revisión y configuración de inferencia compatibles.
+`pairwise_comparison.csv` compara **todos contra todos**, en ambas direcciones,
+para macro-MASE, macro-RMSSE y CRPS cuando se dispone de cuantiles. Delta = A − B:
+negativo favorece A; mejora (%) = `100 × (1 − A/B)`: positiva favorece A y queda vacía si B=0.
 Cambiar la escala de FlowState no excluye ningún candidato de esas comparaciones;
 solo impide atribuir la diferencia exclusivamente a la adaptación si no hay un
 zero-shot con la misma escala. La escala y revisión se incluyen en `comparison.csv`.
-Los campos `robust-*` resumen estaciones con tres días de validación y siete de
-test; no cambian el entrenamiento ni seleccionan el checkpoint.
+`robust-num-clients` cuenta estaciones con tres días de validación y siete de test.
+Solo se publican sus métricas separadas cuando forman un subconjunto no vacío y
+distinto del panel completo; no cambian el entrenamiento ni seleccionan el checkpoint.
 `compare` rechaza por defecto manifests distintos y siempre rechaza paneles
 incompletos. `--allow-training-differences` permite únicamente preparaciones con
 firma de evaluación idéntica. Avisa si cambian entornos o presupuestos. Los
-intervalos por bloques son exploratorios, no tests IID sobre targets solapados.
+intervalos por bloques usan diferencias de MASE agrupado y son exploratorios,
+no tests IID sobre targets solapados.
 
 ### Gráficas de test sin reentrenar
 
@@ -346,9 +347,10 @@ uv run fd-airquality plot reports/benchmarks/<benchmark>/comparison --output rep
 Abre `index.html` en el directorio de salida (por defecto, `<comparación>/plots`).
 `plot` lee una comparación ya auditada, también la de un fold individual, y
 genera PNG, PDF y tablas CSV. No reentrena ni sobrescribe resultados o gráficas
-existentes. Presenta MAE, RMSE, MASE macro y RMSSE macro de test sin promediar
-semillas o rangos ni elegir candidatos por su puntuación de test. Las métricas
-escaladas no definidas se muestran como N/D.
+existentes. Presenta MASE macro y RMSSE macro de test sin promediar semillas o
+rangos ni elegir candidatos por su puntuación de test. Puede leer comparaciones
+históricas, pero no grafica ni exporta MAE/RMSE. Las métricas escaladas no definidas
+se muestran como N/D; si ninguna está definida, no se generan gráficos.
 
 Los cruces del mismo modelo emparejan configuraciones compatibles si hay un único
 control; comprueban semilla, rango, revisión, escala de FlowState, política de
@@ -495,16 +497,26 @@ candidatos de una matriz añaden `benchmark` (contaminante y hora de inicio UTC)
 tags.benchmark = 'PM25 | 2026-11-04 09:18:36 UTC' AND tags.candidate = 'PatchTST-FM-R2 | federado | LoRA-FAIR | FedAvg'
 ```
 
-Usa `params.seed` y `params.lora_rank` para distinguir variantes del mismo método.
-No se renombran directorios ni se reetiquetan ejecuciones históricas.
+Usa `params.seed` y, para adaptadores LoRA, `params.lora_rank` para distinguir
+variantes del mismo método. También puedes filtrar por las etiquetas `model`,
+`mode`, `adaptation` y el parámetro `output_dir`.
 
-Se registran configuración, geometría,
-hash del manifest, revisión del modelo, métricas por etapa/split y estación,
-selección del checkpoint, CSV/JSON y pesos. No hay autologging ni se suben NPZ,
-series, predicciones individuales o estadísticas de normalización.
-También registra capas, rango, parámetros, tiempos, RSS y payload comunicado.
-RSS es un máximo de vida del proceso, no memoria exclusiva del modelo; los bytes
-no incluyen cabeceras Flower ni tráfico de red. MLflow está fijado a **3.17.2**.
+Compara `test/macro-mase`, `test/macro-rmsse` y `runtime/wall-seconds`.
+Se conserva el historial agregado de validación, CRPS/WIS si hay cuantiles, la
+selección del checkpoint global cuando corresponde, y el coste de entrenamiento
+y agregación. Para FAIR se registran `train/server-aggregation-seconds` y
+`train/server-aggregation-cuda` por ronda de agregación.
+
+Solo se indexan parámetros relevantes y aplicables al candidato. La configuración
+completa se conserva en `run.json`, y los diagnósticos globales en
+`round_metrics.csv` y `resource_metrics.json`. La auditoría por estación
+(`station_metrics.csv`) se queda local para verificar el panel y sumar entre
+folds: no se adjunta ni se crean métricas `station_…` en MLflow. No hay autologging
+ni se suben NPZ, series, predicciones individuales o escaladores. No se renombran
+directorios ni se modifican ejecuciones históricas.
+
+RSS es un máximo de vida del proceso, no memoria exclusiva del modelo; el payload
+no incluye cabeceras Flower ni tráfico de red. MLflow está fijado a **3.17.2**.
 Los contadores de payload corresponden al entrenamiento, no a distribuciones de
 evaluación ni descargas Hugging Face. El tiempo del coordinador cubre el bloque
 de ejecución, no la preparación ni la carga inicial de metadatos previa.
@@ -567,10 +579,11 @@ Cada simulación escribe un directorio nuevo bajo `reports/federated/`:
 - `flower.log`, `clients/client_000.log`, etc.: flujo de Flower y logs de clientes en simulaciones.
 - `excluded_stations.csv`: descartes en ejecución y sus motivos; vacío con cabecera si no hay ninguno.
 - `runtime_manifest.json`: panel efectivo cuando hay descartes, sin copiar ni modificar los NPZ.
-- `round_metrics.csv`, `station_metrics.csv`: métricas globales y por estación.
+- `round_metrics.csv`: métricas y diagnósticos agregados por ronda.
+- `station_metrics.csv`: auditoría local del soporte y de la agregación temporal.
 - `best_model.pt`: pesos elegidos por la métrica de validación declarada; puede ser la ronda cero.
 - `last_model.pt`: pesos de la última ronda de entrenamiento.
-- `test_metrics.json`: evaluación final del checkpoint elegido y baseline de persistencia.
+- `test_metrics.json`: evaluación final agregada del checkpoint elegido por validación.
 - `mlflow.json`: URI, experimento e ID de seguimiento, salvo que esté desactivado.
 - `resource_metrics.json`: tiempo del coordinador y máximo RSS de su proceso.
 

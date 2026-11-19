@@ -21,14 +21,13 @@ def completed_run(tmp_path):
             "model": {"adaptation": adaptation, "revision": f"revision-{model}",
                       "point_forecast": "median" if model == "flowstate-r1" else "upstream_point_prediction"},
         }
-        metrics = {"mae": score, "rmse": score, "macro-mase": score, "macro-rmsse": score,
-                   "baseline-mae": 5., "num-clients": 2, "num-targets": 48,
+        metrics = {"macro-mase": score, "macro-rmsse": score, "num-clients": 2, "num-targets": 48,
                    "macro-mase-stations": 2, "macro-rmsse-stations": 2}
         (path / "run.json").write_text(json.dumps(run))
         (path / "test_metrics.json").write_text(json.dumps({"test": metrics, "selected_round": 0}))
         pd.DataFrame([{"split": "test", "partition-id": i, "station": f"station-{i}",
                        "num-examples": 2, "num-targets": 24,
-                       "mae": score, "rmse": score, "mase": score, "rmsse": score}
+                       "mase": score, "rmsse": score}
                       for i in (1, 0)]).to_csv(path / "station_metrics.csv", index=False)
         return path
     return make
@@ -47,16 +46,15 @@ def test_all_systems_and_hyperparameters_are_compared_in_both_directions(complet
     pairs = pd.read_csv(output / "pairwise_comparison.csv")
     assert len(rows) == 5
     assert set(zip(pairs.run_a, pairs.run_b)) == set(permutations(rows.run, 2))
-    assert len(pairs) == 5 * 4 * 4
+    assert len(pairs) == 5 * 4 * 2
+    assert set(pairs.metric) == {"macro-mase", "macro-rmsse"}
     assert not pairs.delta_a_minus_b.isna().any()
     a = rows.loc[rows.model == "flowstate-r1", "run"].item()
     b = rows.loc[rows.model == "mlp", "run"].item()
     match = pairs.loc[(pairs.run_a == a) & (pairs.run_b == b) & (pairs.metric == "macro-mase")].iloc[0]
     assert match.delta_a_minus_b == -4.
     assert match.improvement_a_vs_b_pct == 80.
-    stations = pd.read_csv(output / "station_pairwise_comparison.csv")
-    assert len(stations) == len(pairs) * 2
-    assert set(stations["partition-id"]) == {0, 1}
+    assert not list(output.glob("station_*"))
     assert rows.loc[rows.model == "flowstate-r1", "flowstate_scale_factor"].item() == 2.
 
 
@@ -68,9 +66,7 @@ def test_zero_shot_reference_matches_inference_scale_without_filtering_other_pai
     rows = pd.read_csv(output / "comparison.csv")
     assert set(rows["adaptation"]) == {"lora", "none"}
     assert rows.loc[rows.adaptation == "lora", "macro_mase_improvement_vs_zero_shot_pct"].item() == 50.
-    stations = pd.read_csv(output / "station_comparison.csv")
-    assert stations.loc[stations.adaptation == "lora", "mae_improvement_vs_zero_shot_pct"].tolist() == [50., 50.]
-    assert len(pd.read_csv(output / "pairwise_comparison.csv")) == 3 * 2 * 4
+    assert len(pd.read_csv(output / "pairwise_comparison.csv")) == 3 * 2 * 2
 
 
 def test_comparison_requires_a_complete_station_panel(completed_run, tmp_path):
@@ -102,7 +98,7 @@ def test_mismatched_zero_shot_scale_only_disables_attribution_not_comparison(com
     output = compare_runs([zero, adapted], tmp_path / "comparison")
     rows = pd.read_csv(output / "comparison.csv")
     assert rows.loc[rows.adaptation == "lora", "macro_mase_improvement_vs_zero_shot_pct"].isna().all()
-    assert len(pd.read_csv(output / "pairwise_comparison.csv")) == 8
+    assert len(pd.read_csv(output / "pairwise_comparison.csv")) == 4
     assert any("misma configuración de inferencia" in message
                for message in json.loads((output / "comparison.json").read_text())["warnings"])
 
@@ -127,8 +123,8 @@ def test_seed_summary_averages_repeated_seeds_before_reporting_variability(compl
     assert len(summary) == 1
     assert summary.iloc[0]["num_seeds"] == 2
     assert summary.iloc[0]["num_runs"] == 3
-    assert summary.iloc[0]["mae-mean"] == 4.5
-    assert summary.iloc[0]["mae-std"] == pytest.approx(np.std([3., 6.], ddof=1))
+    assert summary.iloc[0]["macro-mase-mean"] == 4.5
+    assert summary.iloc[0]["macro-mase-std"] == pytest.approx(np.std([3., 6.], ddof=1))
 
 
 @pytest.mark.parametrize("changed", ["model", "application_sources", "versions"])
@@ -144,7 +140,26 @@ def test_seed_summary_never_pools_different_checkpoints_or_software(completed_ru
     summary = pd.read_csv(output / "seed_summary.csv")
     assert len(summary) == 2
     assert summary["num_seeds"].eq(1).all()
-    assert summary["mae-std"].isna().all()
+    assert summary["macro-mase-std"].isna().all()
+
+
+def test_compare_reads_historical_scores_without_republishing_raw_errors(completed_run, tmp_path):
+    legacy, current = completed_run("legacy", model="darts-nlinear"), completed_run("current")
+    old_result = legacy / "test_metrics.json"
+    old = json.loads(old_result.read_text())
+    old["test"].update({"mae": 5., "macro-mae": 5., "rmse": 8., "baseline-mae": 6.,
+                        "block-20250101-count": 48, "block-20250101-absolute-error-sum": 240.})
+    old_result.write_text(json.dumps(old))
+    new_result = current / "test_metrics.json"
+    new = json.loads(new_result.read_text())
+    new["test"].update({"block-20250101-mase-target-count": 48, "block-20250101-mase-scaled-error-sum": 96.})
+    new_result.write_text(json.dumps(new))
+    output = compare_runs([legacy, current], tmp_path / "comparison")
+    rows = pd.read_csv(output / "comparison.csv")
+    assert not {"mae", "rmse", "macro-mae", "baseline-mae"} & set(rows)
+    assert rows.loc[rows["model"] == "darts-nlinear", "missing_policy"].item() == "strict"
+    assert pd.read_csv(output / "block_bootstrap_comparison.csv").empty
+    assert json.loads(old_result.read_text()) == old
 
 
 @pytest.mark.parametrize("allow,matches", [(False, True), (True, False), (True, True)])

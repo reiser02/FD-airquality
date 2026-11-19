@@ -243,7 +243,7 @@ def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_pat
 def test_empty_early_round_is_explicit_and_not_averaged_as_an_update(arrival_prepared, tmp_path, flower_grid):
     path, _manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=3,
-                           arrival_period_hours=96, hidden_size=8, selection_metric="macro-mae",
+                            arrival_period_hours=96, hidden_size=8,
                            mlflow_tracking_uri="disabled")
     output = run_server(flower_grid(settings, 2), settings)
     history = pd.read_csv(output / "round_metrics.csv").query("split == 'train'")
@@ -307,21 +307,26 @@ def test_fixed_training_scale_reference_is_explicit_and_never_uses_validation():
     assert config == DataConfig(**asdict(config))
 
 
-def test_baselines_do_not_depend_on_the_candidate_normalization(arrival_prepared):
-    from fd_airquality.models import make_model
+def test_scaled_scores_compare_canonical_labels_across_normalizations(arrival_prepared, monkeypatch):
     from fd_airquality.task import evaluate_local
 
     path, manifest = arrival_prepared
     _, artifact = load_client_data(str(path), 0)
-    baseline_scores = []
+    scores = []
     for normalization in ("window", "fixed", "none"):
         settings = RunSettings(normalization=normalization, hidden_size=8, num_server_rounds=3)
         local = normalization_artifact(artifact, manifest["geometry"], settings)
         dataset = WindowDataset(local, "test", 6, 3)
-        stats = evaluate_local(make_model(manifest["geometry"], settings), dataset, settings,
-                               torch.device("cpu"), local, 3)
-        baseline_scores.append((stats["baseline-mae"], stats["seasonal-baseline-mae"]))
-    assert len(set(baseline_scores)) == 1
+        normalized_prediction = (10. - dataset.mean) / dataset.scale
+
+        def constant_forecast(_model, inputs, _settings, value=normalized_prediction):
+            return inputs.new_full((len(inputs), 3), value, dtype=torch.float64)
+
+        monkeypatch.setattr("fd_airquality.task.forecast", constant_forecast)
+        stats = evaluate_local(torch.nn.Identity(), dataset, settings, torch.device("cpu"), local, 3)
+        scores.append((stats["mase"], stats["rmsse"]))
+    for score in scores[1:]:
+        assert score == pytest.approx(scores[0])
 
 
 def test_pre_cutoff_inactivity_does_not_use_a_future_reappearance(tmp_path):

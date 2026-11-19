@@ -43,12 +43,10 @@ def test_runtime_distinguishes_zero_scale_from_missing_pairs(global_prepared, tm
     assert rows.reference_pairs.iloc[0] > 0
 
 
-def test_mae_does_not_require_a_scaled_validation_reference(selection_prepared, tmp_path):
-    path, _ = selection_prepared
-    settings, manifest = prepare_runtime_panel(RunSettings(manifest=str(path), selection_metric="mae"), tmp_path / "panel")
-    assert settings.manifest == str(path)
-    assert len(manifest["clients"]) == 2
-    assert pd.read_csv(tmp_path / "panel" / "excluded_stations.csv").empty
+@pytest.mark.parametrize("metric", ["mae", "macro-mae", "rmse", "macro-rmse"])
+def test_selection_rejects_unscaled_errors(metric):
+    with pytest.raises(ValueError, match="selection_metric debe ser macro-mase o macro-rmsse"):
+        RunSettings(selection_metric=metric)
 
 
 def test_no_surviving_station_still_writes_report_before_aborting(selection_prepared, tmp_path, caplog):
@@ -73,11 +71,11 @@ def test_effective_panel_is_deterministic_and_preserves_report_when_reused(selec
     assert reused == a
     assert (tmp_path / "a" / "excluded_stations.csv").read_bytes() == (tmp_path / "reused" / "excluded_stations.csv").read_bytes()
     with pytest.raises(ValueError, match="manifest original"):
-        prepare_runtime_panel(RunSettings(manifest=a.manifest, selection_metric="mae"), tmp_path / "other")
+        prepare_runtime_panel(RunSettings(manifest=a.manifest, selection_metric="macro-rmsse"), tmp_path / "other")
 
 
-def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_unfiltered_runs(
-    selection_prepared, tmp_path, mock_granite,
+def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_another_panel(
+    selection_prepared, prepared, tmp_path, mock_granite,
 ):
     path, _ = selection_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
@@ -96,16 +94,14 @@ def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_unfiltered
         assert pd.read_csv(run / "excluded_stations.csv").station.tolist() == ["station-a"]
 
     output = compare_runs([local, central, zero], tmp_path / "comparison")
-    comparison = pd.read_csv(output / "station_comparison.csv")
-    assert sorted(zip(comparison["mode"], comparison["station"], strict=True)) == [
-        ("centralized", "station-b"), ("local", "station-b"), ("zero-shot", "station-b"),
-    ]
+    comparison = pd.read_csv(output / "comparison.csv")
+    assert set(comparison["mode"]) == {"centralized", "local", "zero-shot"}
+    assert comparison["num-clients"].eq(1).all()
     assert comparison.loc[comparison["mode"] == "centralized",
-                          "mae_improvement_vs_zero_shot_pct"].notna().item()
-    unfiltered = run_baseline(replace(foundation, selection_metric="mae"), "zero-shot")
-    assert json.loads((unfiltered / "run.json").read_text())["manifest_sha256"] == original_hash
+                          "macro_mase_improvement_vs_zero_shot_pct"].notna().item()
+    other = run_baseline(replace(foundation, manifest=str(prepared[0])), "zero-shot")
     with pytest.raises(ValueError, match="manifests/paneles"):
-        compare_runs([central, unfiltered], tmp_path / "invalid")
+        compare_runs([central, other], tmp_path / "invalid")
 
 
 def test_flower_launcher_uses_retained_station_count_and_saves_audit(selection_prepared, tmp_path, monkeypatch, capsys):
