@@ -96,6 +96,9 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     comparison.add_argument("--output", type=Path)
     comparison.add_argument("--allow-training-differences", action="store_true",
                             help="Permitir distinto entrenamiento solo con firma de evaluación idéntica.")
+    plots = commands.add_parser("plot", help="Graficar resultados de test federados y centralizados sin entrenar.")
+    plots.add_argument("source", type=Path, help="Directorio del benchmark o de la comparación, o comparison.csv.")
+    plots.add_argument("--output", type=Path, help="Directorio nuevo; por defecto <comparación>/plots.")
     commands.add_parser("models", help="Listar modelos, adaptación y requisitos sin descargarlos.")
     for command in commands.choices.values():
         command.add_argument("--config", type=Path, default=argparse.SUPPRESS,
@@ -336,6 +339,10 @@ def main(argv: list[str] | None = None) -> None:
 
             compare_runs(args.runs, args.output or Path("reports/comparisons") / f"comparison_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}",
                          allow_training_differences=args.allow_training_differences)
+        elif args.command == "plot":
+            from fd_airquality.plotting import plot_comparison
+
+            plot_comparison(args.source, args.output)
         else:
             manifest = resolve_manifest(args.manifest, backtest=args.command == "backtest")
             settings = RunSettings(**{

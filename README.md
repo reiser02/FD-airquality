@@ -335,6 +335,30 @@ incompletos. `--allow-training-differences` permite únicamente preparaciones co
 firma de evaluación idéntica. Avisa si cambian entornos o presupuestos. Los
 intervalos por bloques son exploratorios, no tests IID sobre targets solapados.
 
+### Gráficas de test sin reentrenar
+
+```bash
+uv run fd-airquality plot reports/benchmarks/<benchmark>
+# También acepta el directorio comparison o el archivo comparison.csv:
+uv run fd-airquality plot reports/benchmarks/<benchmark>/comparison --output reports/graficas-pm25
+```
+
+Abre `index.html` en el directorio de salida (por defecto, `<comparación>/plots`).
+`plot` lee una comparación ya auditada, también la de un fold individual, y
+genera PNG, PDF y tablas CSV. No reentrena ni sobrescribe resultados o gráficas
+existentes. Presenta MAE, RMSE, MASE macro y RMSSE macro de test sin promediar
+semillas o rangos ni elegir candidatos por su puntuación de test. Las métricas
+escaladas no definidas se muestran como N/D.
+
+Los cruces del mismo modelo emparejan configuraciones compatibles si hay un único
+control; comprueban semilla, rango, revisión, escala de FlowState, política de
+faltantes y métrica de selección cuando constan en la tabla. FLoRA y LoRA-FAIR se
+comparan con **LoRA centralizado** (marcado con `*`), no con un equivalente
+centralizado de su adaptación. La mejora `100 × (1 − federado / centralizado)`
+favorece a federado si es positiva; queda indefinida si el denominador es cero.
+`plots.json` conserva la procedencia y los avisos de `compare`. Los cruces entre
+modelos son descriptivos: no aíslan el efecto de federar.
+
 ### Prueba de integración pequeña para los seis modelos
 
 ```bash
