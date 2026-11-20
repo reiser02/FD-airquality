@@ -117,6 +117,35 @@ def initialize_tracking(settings: RunSettings, artifacts: Path) -> None:
         ))
 
 
+def log_leaderboard(settings: RunSettings, root: Path, pollutant: str, stage: str,
+                    plots: list[Path]) -> str | None:
+    """One run for the backtest's public aggregate tables and figures."""
+    if settings.mlflow_tracking_uri == "disabled":
+        return None
+    from mlflow import MlflowClient
+
+    client = MlflowClient(tracking_uri=tracking_uri(settings))
+    experiment = client.get_experiment_by_name(settings.mlflow_experiment)
+    if experiment is None:
+        raise RuntimeError("El experimento del backtest no está inicializado.")
+    tag = backtest_tags(root / "fold_001" / "runs" / "case_0001", pollutant).get("backtest", root.name)
+    run = client.create_run(experiment.experiment_id, tags={
+        "kind": "backtest-summary", "backtest": tag, "stage": stage, "pollutant": pollutant,
+        "mlflow.runName": f"Clasificación semanal | {tag}",
+        "scaled_crps": SCALED_CRPS_PROTOCOL,
+    })
+    status = "FAILED"
+    try:
+        client.log_artifact(run.info.run_id, str(root / "weekly_metrics.csv"))
+        for plot in plots:
+            # Only outputs produced by the weekly plotter; never log a directory recursively.
+            client.log_artifact(run.info.run_id, str(plot), artifact_path="leaderboard")
+        status = "FINISHED"
+    finally:
+        client.set_terminated(run.info.run_id, status)
+    return run.info.run_id
+
+
 def uncertainty_protocol(settings: RunSettings, metadata: dict) -> dict:
     native = metadata.get("quantiles", []) if settings.probabilistic else []
     calibrated = calibration_enabled(settings)

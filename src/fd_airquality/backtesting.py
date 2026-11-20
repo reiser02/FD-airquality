@@ -33,7 +33,7 @@ from fd_airquality.temporal_results import (
     summarize_cv,
     temporal_run_rows,
 )
-from fd_airquality.tracking import initialize_tracking, tracking_uri
+from fd_airquality.tracking import initialize_tracking, log_leaderboard, tracking_uri
 
 LOGGER = logging.getLogger(__name__)
 BACKTEST_SCHEMA_VERSION = 5
@@ -440,7 +440,7 @@ def _run_fold(settings: RunSettings, plan: list[dict], max_parallel_models: int 
 
 def run_backtest(settings: RunSettings, models: list[str], modes: list[str], *, adaptations=None,
                   seeds=None, lora_ranks=None, strategies=None, max_parallel_models=None,
-                  stage: str = "evaluation", selection: Path | None = None) -> Path:
+                  stage: str = "evaluation", selection: Path | None = None, weekly_leaderboard: bool = False) -> Path:
     family = json.loads(Path(settings.manifest).read_text(encoding="utf-8"))
     holdout_fold = family.get("potential_holdout_fold", family.get("final_holdout_fold"))
     normalize_pollutant(family.get("pollutant", ""))
@@ -507,12 +507,14 @@ def run_backtest(settings: RunSettings, models: list[str], modes: list[str], *, 
         return _run_prepared_backtest(
             settings, family, root, plan, stage=stage, recipe=recipe, source_hash=source_hash,
             holdout_fold=holdout_fold, max_parallel_models=max_parallel_models, log=log,
+            weekly_leaderboard=weekly_leaderboard,
         )
 
 
 def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan: list[dict], *,
                             stage: str, recipe: dict | None, source_hash: str, holdout_fold: int,
-                            max_parallel_models: int | None, log: RunLogging) -> Path:
+                            max_parallel_models: int | None, log: RunLogging,
+                            weekly_leaderboard: bool = False) -> Path:
     num_folds = len(family["folds"])
     indices = ([num_folds - 1] if stage == "final" else
                list(range(num_folds if stage in {"evaluation", "all"} else num_folds - 1)))
@@ -526,7 +528,7 @@ def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan
                           "configuration_selection": stage in {"development", "all"},
                           "primary_summary": "cv_fold_mean.csv" if stage == "evaluation" else "cv_summary.csv",
                           "exploratory": stage == "all"}
-    rows, summaries = [], []
+    rows, summaries, weekly = [], [], []
     cv_rows, cv_stations = [], []
     # Record access before running: a failed partial holdout is not untouched.
     if stage in {"evaluation", "final", "all"}:
@@ -558,6 +560,10 @@ def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan
             summary = pd.read_csv(comparison / "seed_summary.csv")
             summary.insert(0, "fold", index + 1)
             summaries.append(summary)
+            if (comparison / "weekly_metrics.csv").is_file():
+                weeks = pd.read_csv(comparison / "weekly_metrics.csv")
+                weeks.insert(0, "fold", index + 1)
+                weekly.append(weeks)
             entry.update(status="completed", comparison=str(comparison))
             if stage == "evaluation" or index + 1 != holdout_fold:
                 run_rows, station_rows = temporal_run_rows(run_paths, index + 1)
@@ -573,6 +579,12 @@ def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan
     report_progress("summary", f"Consolidando resultados de {len(indices)} folds.")
     pd.concat(rows, ignore_index=True).to_csv(root / "temporal_comparison.csv", index=False)
     pd.concat(summaries, ignore_index=True).to_csv(root / "temporal_seed_summary.csv", index=False)
+    if weekly:
+        # Never publish a historical or partially populated collection as a complete race.
+        if len(weekly) != len(indices):
+            LOGGER.warning("No todos los folds publicaron estadísticas semanales; no se mezclan.")
+        else:
+            pd.concat(weekly, ignore_index=True).to_csv(root / "weekly_metrics.csv", index=False)
     if cv_rows:
         summary = summarize_cv(cv_rows, cv_stations, root)
     if cv_rows and stage != "evaluation":
@@ -597,6 +609,16 @@ def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan
             "aggregation": "pool_observed_origin_target_errors_within_station_then_macro; mean_over_seeds",
             "holdout_was_scored": stage == "all",
         }, indent=2, allow_nan=False) + "\n")
+    if weekly_leaderboard and (root / "weekly_metrics.csv").is_file():
+        from fd_airquality.leaderboard import plot_weekly
+
+        report_progress("leaderboard", "Generando gráficas semanales sin reentrenar.")
+        output, artifacts = plot_weekly(root)
+        progress["weekly_leaderboard"] = str(output)
+        run_id = log_leaderboard(settings, root, family["pollutant"], stage, artifacts)
+        if run_id:
+            progress["weekly_leaderboard_mlflow_run_id"] = run_id
+        _write_progress(root, progress)
     return root
 
 

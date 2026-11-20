@@ -1,11 +1,13 @@
 import json
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
 from flwr.app import MetricRecord, RecordDict
+from mlflow import MlflowClient
 
 from fd_airquality.backtesting import _candidate_plan, prepare_backtest, run_backtest
 from fd_airquality.calibration import (
@@ -15,6 +17,7 @@ from fd_airquality.calibration import (
     validation_view,
 )
 from fd_airquality.data import load_client_data
+from fd_airquality.leaderboard import rank_weeks, station_weekly_scores
 from fd_airquality.models import make_model, model_metadata, validate_run_mode
 from fd_airquality.probabilistic import quantile_statistics
 from fd_airquality.settings import RunSettings
@@ -156,7 +159,39 @@ def test_calibration_and_selection_cannot_share_targets_or_read_test(global_prep
     np.testing.assert_array_equal(before.offsets, after.offsets)
 
 
-def test_light_models_backtest_publishes_calibrated_metrics(
+def test_weekly_scoring_respects_the_panel_and_uses_origin_week():
+    rows = [
+        {"partition-id": 0, "scaled-crps-eligible": 1,
+         "block-20261122-observed-target-count": 2, "block-20261122-scaled-crps-target-count": 2,
+         "block-20261122-scaled-crps-error-sum": 2,
+         "block-20261123-observed-target-count": 3, "block-20261123-scaled-crps-target-count": 2},
+        {"partition-id": 1, "scaled-crps-eligible": 1,
+         "block-20261122-observed-target-count": 10, "block-20261122-scaled-crps-target-count": 10,
+         "block-20261122-scaled-crps-error-sum": 30},
+    ]
+    scores = [row for row in station_weekly_scores(pd.DataFrame(rows)) if row["metric"] == "macro-scaled-crps"]
+    assert [r["week_start"] for r in scores] == ["2026-11-16", "2026-11-23"]
+    assert scores[0]["value"] == 2.
+    assert np.isnan(scores[1]["value"])
+
+
+def test_weekly_rank_uses_all_seeds_and_does_not_reward_missing_support():
+    records = []
+    for week in ("2026-11-16", "2026-11-23"):
+        for name, scores in (("A", [1., 3.]), ("B", [2., 2.]), ("missing", [0., np.nan])):
+            for seed, value in enumerate(scores):
+                records.append({"candidate_configuration": name, "model": name, "mode": "local",
+                                "adaptation": "full", "strategy": "none", "seed": seed, "lora_rank": 4,
+                                "metric": "macro-scaled-crps", "week_start": week, "value": value,
+                                "scored_targets": 100, "expected_targets": 100, "eligible_stations": 2,
+                                "support_sha256": "same"})
+    board, standings = rank_weeks(pd.DataFrame(records))
+    assert board.loc[board["configuration"] == "missing", "rank"].isna().all()
+    assert standings["total_points"].tolist() == [3., 3.]
+    assert standings["mean_rank"].tolist() == [1.5, 1.5]
+
+
+def test_light_models_backtest_publishes_calibrated_metrics_and_one_summary(
     temporal_family, in_process_federation, mlflow_uri, tmp_path,
 ):
     raw, config = temporal_family
@@ -168,10 +203,23 @@ def test_light_models_backtest_publishes_calibrated_metrics(
                            num_server_rounds=1, batch_size=8, probabilistic=1, calibrate_point_forecasts=1,
                            calibration_min_pairs=3, mlflow_tracking_uri=mlflow_uri, mlflow_log_models=0)
     output = run_backtest(settings, ["linear-6lags", "seasonal-naive", "holt", "nlinear-point", "mlp"],
-                          ["local", "centralized", "federated"])
+                          ["local", "centralized", "federated"], weekly_leaderboard=True)
+    progress = json.loads((output / "backtest.json").read_text())
     scores = pd.read_csv(output / "temporal_comparison.csv")
     assert len(scores) == 11
     assert scores["macro-scaled-crps"].notna().all()
     assert scores["macro-scaled-crps-stations"].eq(2).all()
     assert scores["interval-80-coverage"].between(0, 1).all()
     assert sorted(scores["quantile_levels"].map(json.loads).map(len).unique()) == [9, 19]
+    artifacts = Path(progress["weekly_leaderboard"])
+    assert (artifacts / "macro-scaled-crps_heatmap.png").is_file()
+    assert (artifacts / "standings.csv").is_file()
+    client = MlflowClient(tracking_uri=mlflow_uri)
+    run_id = progress["weekly_leaderboard_mlflow_run_id"]
+    summary = client.get_run(run_id)
+    assert summary.info.status == "FINISHED"
+    only, = client.search_runs([summary.info.experiment_id], filter_string="tags.kind = 'backtest-summary'")
+    assert only.info.run_id == run_id
+    paths = {item.path for item in client.list_artifacts(run_id, "leaderboard")}
+    assert "leaderboard/macro-scaled-crps_rank.png" in paths
+    assert not any("station" in path or "calibration" in path for path in paths)

@@ -288,6 +288,8 @@ history-hours = 672
 [backtest]
 # Directorio base; cada backtest se guarda en una subcarpeta con fecha y hora.
 output-dir = "reports/backtests"
+# Genera PNG/PDF y publica un único run resumen con estadísticas semanales.
+weekly-leaderboard = true
 # "evaluation" evalúa todos los folds sin elegir configuración.
 # "development" selecciona sin usar el último fold; "final" solo evalúa ese fold con la selección previa.
 # "all" selecciona como "development", pero también puntúa el último fold de forma exploratoria.

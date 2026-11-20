@@ -459,6 +459,21 @@ favorece a federado si es positiva; queda indefinida si el denominador es cero.
 `plots.json` conserva la procedencia y los avisos de `compare`. Los cruces entre
 modelos son descriptivos: no aíslan el efecto de federar.
 
+Para las gráficas al estilo Impermanent, usa `plot --weekly`:
+
+```bash
+uv run fd-airquality plot reports/backtests/<backtest> --weekly --output reports/clasificacion-pm25
+```
+
+Se generan curvas de error y posición, mapa de calor, puntos acumulados y tabla
+final para MASE/RMSSE y CRPS, según el soporte. Se agrupa por semana del
+**origen del pronóstico**, no por fecha de entrenamiento. Se promedian todas las
+semillas por configuración (no se elige la mejor en test). Solo se asignan
+puntos a un grupo fijo de candidatos con cobertura idéntica; las series sin
+soporte suficiente no se convierten en ceros. El TOML principal genera estas
+gráficas al terminar el backtest en `leaderboard/index.html`; se puede desactivar
+con `--no-weekly-leaderboard`. `plot --weekly` no reentrena ni requiere MLflow.
+
 ### Prueba de integración con pocas estaciones
 
 ```bash
@@ -627,6 +642,10 @@ completa se conserva en `run.json`, y los diagnósticos globales en
 folds: no se adjunta ni se crean métricas `station_…` en MLflow. No hay autologging
 ni se suben NPZ, series, predicciones individuales o escaladores. No se renombran
 directorios ni se modifican ejecuciones históricas.
+
+Al activar `weekly-leaderboard`, busca `tags.kind = 'backtest-summary'`: un
+único run guarda las figuras y los CSV agregados de todo el backtest. No
+publica pronósticos individuales ni tablas de calibración por estación.
 
 RSS es un máximo de vida del proceso, no memoria exclusiva del modelo; el payload
 no incluye cabeceras Flower ni tráfico de red. MLflow está fijado a **3.17.2**.

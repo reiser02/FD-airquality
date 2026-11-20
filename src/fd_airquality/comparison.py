@@ -10,7 +10,9 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from fd_airquality.leaderboard import WEEKLY_COLUMNS, WEEKLY_IDENTITY, station_weekly_scores
 from fd_airquality.missing import resolve_missing_policy
+from fd_airquality.temporal_results import candidate_identity
 
 _MACRO_ERRORS = ("macro-mase", "macro-rmsse")
 _COMPARISON_METRICS = (*_MACRO_ERRORS, "crps", "macro-scaled-crps")
@@ -75,7 +77,7 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
                   allow_single: bool = False) -> Path:
     if len(paths) < (1 if allow_single else 2) or len({path.resolve() for path in paths}) != len(paths):
         raise ValueError("Indica al menos dos ejecuciones diferentes y completas.")
-    runs, rows, blocks, warnings = [], [], [], []
+    runs, rows, blocks, weekly, warnings = [], [], [], [], []
     probabilistic_protocols = {}
     for path in paths:
         run = json.loads((path / "run.json").read_text(encoding="utf-8"))
@@ -151,6 +153,10 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
             "strategy": run["settings"]["strategy"] if mode == "federated" else "none",
             "selected_round": result["selected_round"], **scores,
         })
+        station_weeks = station_weekly_scores(stations)
+        if station_weeks:
+            identity = rows[-1] | {"temporal_configuration": candidate_identity(run)}
+            weekly.extend({key: identity[key] for key in WEEKLY_IDENTITY} | week for week in station_weeks)
         runs.append(run)
     grids = {row["quantile_levels"] for row in rows if "crps" in row and row["quantile_levels"]}
     if len(grids) > 1:
@@ -175,6 +181,8 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
     output.mkdir(parents=True, exist_ok=False)
     table = pd.DataFrame(rows)
     table.to_csv(output / "comparison.csv", index=False)
+    if weekly:
+        pd.DataFrame(weekly, columns=WEEKLY_COLUMNS).to_csv(output / "weekly_metrics.csv", index=False)
     _write_seed_summary(rows, output)
     _write_pairwise(rows, output)
     from fd_airquality.uncertainty import compare_calendar_blocks
