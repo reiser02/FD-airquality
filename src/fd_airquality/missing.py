@@ -8,7 +8,9 @@ import torch
 
 POLICIES = {"strict", "ffill", "linear", "mean", "zero", "native"}
 DEFAULT_POLICIES = {
-    "mlp": "native", "autoencoder": "ffill", "nlinear": "native", "nhits": "native",
+    "mlp": "native", "autoencoder": "ffill", "autoencoder-tiny": "ffill",
+    "nlinear": "native", "nhits": "native",
+    "nlinear-point": "native", "linear-6lags": "ffill", "seasonal-naive": "native", "holt": "native",
     "ttm-r3": "native", "patchtst-fm-r2": "native", "flowstate-r1": "native",
 }
 
@@ -19,10 +21,10 @@ def resolve_missing_policy(model: str, policy: str = "auto", overrides: str = "{
         raise ValueError("missing-policies debe asociar nombres de modelos conocidos a políticas.")
     if any(not isinstance(value, str) or value not in POLICIES for value in mapping.values()):
         raise ValueError(f"Políticas de ausencias admitidas: {sorted(POLICIES)}")
-    native_models = {"mlp", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"}
+    native_models = {name for name, default in DEFAULT_POLICIES.items() if default == "native"}
     if any(value == "native" and name not in native_models
            for name, value in mapping.items()):
-        raise ValueError("La política native requiere un modelo NeuralForecast o Granite.")
+        raise ValueError("La política native requiere un modelo con tratamiento nativo de ausencias.")
     resolved = mapping.get(model, DEFAULT_POLICIES[model]) if policy == "auto" else policy
     if not isinstance(resolved, str) or resolved not in POLICIES or (resolved == "native" and model not in native_models):
         raise ValueError(f"Política de ausencias {resolved!r} no soportada por {model}.")

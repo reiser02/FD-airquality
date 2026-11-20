@@ -67,7 +67,7 @@ def test_models_lists_granite_without_downloading(capsys, monkeypatch):
     monkeypatch.setattr("fd_airquality.models._load_granite", lambda *_: pytest.fail("No debe descargar"))
     main(["models"])
     output = capsys.readouterr().out
-    for name in ("autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"):
+    for name in ("autoencoder", "autoencoder-tiny", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"):
         assert name in output
     assert "patchtst-fm-r2:" in output and "fuera de las matrices predeterminadas" in output
 

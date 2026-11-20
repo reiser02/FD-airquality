@@ -19,13 +19,17 @@ from pathlib import Path
 import torch
 
 from fd_airquality.artifacts import file_digest
+from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.missing import resolve_missing_policy
-from fd_airquality.models import model_metadata
+from fd_airquality.models import GRANITE, model_metadata
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
 
 MODEL_LABELS = {
-    "mlp": "MLP", "autoencoder": "Autoencoder", "nlinear": "NLinear", "nhits": "NHITS",
+    "mlp": "MLP", "autoencoder": "Autoencoder", "autoencoder-tiny": "Autoencoder Tiny",
+    "nlinear": "NLinear", "nhits": "NHITS",
+    "nlinear-point": "NLinear puntual", "linear-6lags": "Regresión de 6 retardos",
+    "seasonal-naive": "SeasonalNaive", "holt": "Holt",
     "ttm-r3": "TTM-R3", "patchtst-fm-r2": "PatchTST-FM-R2", "flowstate-r1": "FlowState-R1",
 }
 MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "federado", "zero-shot": "zero-shot"}
@@ -127,10 +131,11 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                             for index in range(torch.cuda.device_count())]
     progressive = bool(mode == "federated" and settings.arrival_period_hours
                        and manifest["geometry"].get("split_mode") == "global")
+    metadata = model_metadata(manifest["geometry"], settings)
     (output / "run.json").write_text(json.dumps({
         "mode": mode, "settings": asdict(settings),
         "manifest_sha256": file_digest(Path(settings.manifest)), "manifest": manifest,
-        "model": model_metadata(manifest["geometry"], settings),
+        "model": metadata,
         "python": sys.version, "versions": versions,
         "granite_source": json.loads(distribution("granite-tsfm").read_text("direct_url.json") or "null"),
         "neuralforecast_source": json.loads(distribution("neuralforecast").read_text("direct_url.json") or "null"),
@@ -139,7 +144,8 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         "hardware": hardware,
         "development_lock_sha256": file_digest(Path("uv.lock")) if Path("uv.lock").is_file() else None,
         "initialization": {"fold": "fresh", "trained_checkpoint_reused": False,
-                           "base": "pinned_pretrained" if settings.model in {"ttm-r3", "patchtst-fm-r2", "flowstate-r1"} else "seeded_random"},
+                           "base": ("pinned_pretrained" if settings.model in GRANITE else
+                                    "station_control" if settings.model in STATION_CONTROLS else "seeded_random")},
         "missing_data": {"policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
                          "target_policy": "observed_only", "window_policy": manifest["geometry"].get("window_policy", "strict"),
                          "training_threshold": settings.training_data_availability_threshold,
@@ -166,7 +172,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                              "reference": manifest["geometry"].get("error_scale_reference", "pre-evaluation"),
                              "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
         "training_budget": {
-            "stages": 0 if mode == "zero-shot" else settings.num_server_rounds,
+            "stages": 0 if mode == "zero-shot" or settings.model in STATION_CONTROLS else settings.num_server_rounds,
             "epochs_per_stage": settings.local_epochs,
             "optimizer_reset_each_stage": True,
         },
@@ -240,7 +246,7 @@ class RunTracker:
         keys = ["seed", "device", "output_dir", "selection_metric", "probabilistic", "normalization"]
         if settings.normalization != "none":
             keys.append("scaler_type")
-        if self.mode != "zero-shot":
+        if self.mode != "zero-shot" and settings.model not in STATION_CONTROLS:
             keys.extend(("num_server_rounds", "local_epochs", "batch_size", "learning_rate", "weight_decay"))
         if self.mode == "federated":
             keys.append("strategy")
@@ -257,8 +263,9 @@ class RunTracker:
             "num_clients": len(self.manifest["clients"]),
             "missing_policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
         }
-        if "revision" in metadata:
-            params["model.revision"] = metadata["revision"]
+        for key in ("revision", "inference_parameters", "inference_macs"):
+            if key in metadata:
+                params[f"model.{key}"] = metadata[key]
         for key, value in params.items():
             self.client.log_param(self.run_id, key, value)
 

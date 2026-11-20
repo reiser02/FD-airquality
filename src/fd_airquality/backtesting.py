@@ -14,6 +14,7 @@ import pandas as pd
 from fd_airquality.artifacts import create_run_dir, file_digest
 from fd_airquality.data import DataConfig, _source_files, prepare, read_manifest
 from fd_airquality.execution import execute_plan
+from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.loaders import load_pollutant_file, normalize_pollutant
 from fd_airquality.models import (
     GRANITE,
@@ -371,6 +372,10 @@ def build_candidate_matrix(models: list[str], modes: list[str], adaptations: lis
     controls = (["lora"] if set(adaptations) - {"ffa-lora"} else []) + (["ffa-lora"] if "ffa-lora" in adaptations else [])
     for mode in modes:
         for model in models:
+            if model in STATION_CONTROLS:
+                if mode == "local":
+                    matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
+                continue
             foundation = model in GRANITE
             if mode == "zero-shot":
                 if foundation:
@@ -394,7 +399,8 @@ def _candidate_plan(settings: RunSettings, models, modes, adaptations, seeds, lo
         raise ValueError("No repitas semillas ni rangos.")
     plan = []
     for case in matrix:
-        for seed in seeds[:1] if case["mode"] == "zero-shot" else seeds:
+        once = case["mode"] == "zero-shot" or case["model"] in STATION_CONTROLS
+        for seed in seeds[:1] if once else seeds:
             for rank in ranks if case["model"] in GRANITE and case["mode"] != "zero-shot" else ranks[:1]:
                 plan.append(case | {"seed": seed, "lora_rank": rank})
     if not plan:

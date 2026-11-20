@@ -68,12 +68,13 @@ def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     assert arguments(["backtest", "--stage", "development"]).stage == "development"
 
 
-def test_default_matrix_requires_opt_in_for_patchtst():
+def test_default_matrix_includes_the_tiny_model_and_requires_opt_in_for_patchtst():
     root_config = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
     for config in ([], ["--config", str(root_config)]):
         args = arguments(["backtest", *config])
         assert args.models == [
-            "mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "flowstate-r1",
+            "mlp", "autoencoder", "autoencoder-tiny", "nlinear", "nlinear-point", "nhits",
+            "linear-6lags", "seasonal-naive", "holt", "ttm-r3", "flowstate-r1",
         ]
         assert arguments(["backtest", *config, "--models", "patchtst-fm-r2"]).models == ["patchtst-fm-r2"]
 

@@ -19,9 +19,9 @@ def test_full_foundation_matrix_has_12_federated_and_meaningful_controls():
 
 
 def test_classic_models_are_not_assigned_lora_or_zero_shot():
-    matrix = build_candidate_matrix(["mlp", "autoencoder", "nlinear"],
+    matrix = build_candidate_matrix(["mlp", "autoencoder", "autoencoder-tiny", "nlinear"],
                                     ["federated", "local", "centralized", "zero-shot"], ["lora", "ffa-lora", "flora", "lora-fair"])
-    assert len(matrix) == 9
+    assert len(matrix) == 12
     assert all(row["adaptation"] == "auto" and row["mode"] != "zero-shot" for row in matrix)
 
 

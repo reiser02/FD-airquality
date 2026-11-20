@@ -10,6 +10,7 @@ from fd_airquality.settings import RunSettings
 
 @pytest.mark.parametrize(("mode", "model"), [
     ("centralized", "mlp"), ("local", "autoencoder"), ("centralized", "nlinear"), ("local", "nhits"),
+    ("local", "autoencoder-tiny"), ("centralized", "autoencoder-tiny"),
 ])
 def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_path, mode, model):
     path, manifest = prepared

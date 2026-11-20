@@ -19,10 +19,12 @@ from fd_airquality.backtesting import DEFAULT_EVALUATION_HOURS, DEFAULT_MIN_STAT
 from fd_airquality.configuration import STANDALONE_PREPARE_FIELDS, parse_configured_args
 from fd_airquality.data import DataConfig, prepare, read_manifest
 from fd_airquality.execution import usable_gpu_slots
+from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.loaders import POLLUTANT
 from fd_airquality.models import (
     GRANITE,
     MODEL_NAMES,
+    TINY_AUTOENCODER_LATENT_SIZE,
     validate_model_geometry,
     validate_run_mode,
 )
@@ -266,6 +268,10 @@ def main(argv: list[str] | None = None) -> None:
                     details = "LoRA / FFA-LoRA / FLoRA / LoRA-FAIR internos; zero-shot disponible"
                     if name not in DEFAULT_MATRIX_MODELS:
                         details += "; fuera de las matrices predeterminadas"
+                elif name == "autoencoder-tiny":
+                    details = f"cuello de botella de {TINY_AUTOENCODER_LATENT_SIZE}; reconstrucción solo al entrenar"
+                elif name in STATION_CONTROLS:
+                    details = "referencia por estación; solo modo local"
                 else:
                     details = "entrenamiento completo"
                 print(f"{name}: {details}")

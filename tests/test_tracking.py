@@ -133,6 +133,7 @@ def test_backtest_tags_derive_the_group_and_fold_without_reading_paths(directory
 
 
 @pytest.mark.parametrize("model,mode,adaptation,strategy,candidate", [
+    ("autoencoder-tiny", "local", "full", "fedavg", "Autoencoder Tiny | local | completo"),
     ("patchtst-fm-r2", "federated", "lora-fair", "fedavg", "PatchTST-FM-R2 | federado | LoRA-FAIR | FedAvg"),
     ("nlinear", "federated", "full", "fedprox", "NLinear | federado | completo | FedProx"),
     ("nhits", "centralized", "full", "fedavg", "NHITS | centralizado | completo"),

@@ -16,6 +16,7 @@ from torch.utils.data import ConcatDataset
 from fd_airquality.arrival import audit_normalization, normalization_artifact, training_view
 from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.data import WindowDataset, load_client_data, read_manifest
+from fd_airquality.lightweight import HOLT_GRID, STATION_CONTROLS
 from fd_airquality.models import (
     GRANITE,
     checkpoint_payload,
@@ -120,11 +121,13 @@ def _run_baseline(settings, mode, manifest, output):
         artifact = normalization_artifact(artifact, geometry, settings)
         audit_normalization(artifact, settings, partition, output / "clients")
         artifacts.append(artifact)
-        datasets.append({split: WindowDataset(artifact, split, geometry["context"], geometry["horizon"])
-                         for split in ("train", "validation", "test")})
-        datasets[-1]["train"] = training_view(artifact, geometry, settings)
-        if mode != "zero-shot" and not len(datasets[-1]["train"]):
-            raise ValueError(f"Sin ventanas de entrenamiento para {manifest['clients'][partition]['station']} tras el umbral.")
+        data = {"validation": WindowDataset(artifact, "validation", geometry["context"], geometry["horizon"]),
+                "test": WindowDataset(artifact, "test", geometry["context"], geometry["horizon"])}
+        if mode != "zero-shot" and settings.model not in STATION_CONTROLS:
+            data["train"] = training_view(artifact, geometry, settings)
+            if not len(data["train"]):
+                raise ValueError(f"Sin ventanas de entrenamiento para {manifest['clients'][partition]['station']} tras el umbral.")
+        datasets.append(data)
     report_progress("loading-model", f"model={settings.model} device={settings.device}")
     write_run(output, settings, manifest, mode)
     with RunTracker(settings, output, mode, manifest) as tracker:
@@ -149,7 +152,19 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
     best_scores = [float("inf")] * len(models)
     best_rounds = [-1] * len(models)
     selected_states = [None] * len(models)
-    stages = 0 if mode == "zero-shot" else settings.num_server_rounds
+    stages = 0 if mode == "zero-shot" or settings.model in STATION_CONTROLS else settings.num_server_rounds
+    if settings.model == "holt":
+        for index, model in enumerate(models):
+            with _model_on_device(model, device, offload=offload):
+                best = (float("inf"), HOLT_GRID[0])
+                for alpha, beta in HOLT_GRID:
+                    model.set_coefficients(alpha, beta)
+                    record = evaluate_local(model, datasets[index]["validation"], settings, device,
+                                            artifacts[index], geometry["seasonality"])
+                    score = selection_value(record, settings, local=True)
+                    if score < best[0]:
+                        best = score, (alpha, beta)
+                model.set_coefficients(*best[1])
 
     def evaluate(split):
         records = []

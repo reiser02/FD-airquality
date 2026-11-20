@@ -200,8 +200,13 @@ Modelos disponibles con `--model`:
 | --- | --- |
 | `mlp` | MLP del paquete NeuralForecast |
 | `autoencoder` | Encoder con cuello de botella, decoder de reconstrucción y cabeza de forecasting |
+| `autoencoder-tiny` | Variante para inferencia embebida: cuello fijo de 4 unidades, dos capas densas en inferencia |
 | `nlinear` | NLinear del paquete NeuralForecast |
+| `nlinear-point` | NLinear con salida puntual y MSE |
 | `nhits` | NHITS del paquete NeuralForecast, con su tratamiento de máscara en los residuos |
+| `linear-6lags` | Regresión directa de 6 retardos (1, 2, 3, 24, 48 y 72 h); 84 parámetros para 12 salidas |
+| `seasonal-naive` | Referencia local sin entrenamiento: misma hora a 24, 48 o 72 h, o última lectura válida |
+| `holt` | Nivel y tendencia aditivos; coeficientes por estación elegidos en validación |
 | `ttm-r3` | Granite TTM-R3, checkpoint `90-30-dec-90-r3`, adaptación interna |
 | `patchtst-fm-r2` | Granite PatchTST-FM-R2, fuera de las matrices predeterminadas; solo por selección explícita |
 | `flowstate-r1` | Granite FlowState-R1/1.0, adaptación interna experimental |
@@ -227,13 +232,48 @@ uv run fd-airquality backtest --num-server-rounds 5
 En cada fold, `backtest` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
 (LoRA, FFA-LoRA, FLoRA y LoRA-FAIR), y controles local/centralizado con LoRA y A
 congelada. Con TTM-R3 y FlowState-R1 por defecto son **18 configuraciones de foundations**,
-**12 controles clásicos**: **30 ejecuciones por fold** con la semilla y el rango
-predeterminados. Zero-shot se ejecuta una sola vez por fold aunque se indiquen
-varias semillas; los clásicos no se duplican por rango. Por defecto el backtest
-evalúa todos los folds y publica su media, sin seleccionar una configuración.
+**21 controles entrenables** y **2 referencias locales** (SeasonalNaive y Holt):
+**41 ejecuciones por fold** con la semilla y el rango predeterminados. Zero-shot
+y las referencias se ejecutan una sola vez por fold aunque se indiquen varias
+semillas; los clásicos no se duplican por rango. Por defecto el backtest evalúa
+todos los folds y publica su media, sin seleccionar una configuración.
 El flujo de desarrollo/holdout requiere
 `--stage development` explícito. FLoRA y LoRA-FAIR no tienen modalidades
 centralizadas nativas ni se cruzan automáticamente con FedProx.
+
+### Inferencia en sistemas embebidos
+
+Con contexto de 90 horas y horizonte de 12, `autoencoder-tiny` entrena **874
+parámetros**. En inferencia solo usa `Dense(90, 4) → ReLU → Dense(4, 12)`, con una
+conexión residual desde el último valor del contexto preprocesado. El decoder que
+reconstruye el contexto se usa solo al entrenar. El predictor usa **424 parámetros**
+(1.696 bytes en FP32) y **408 multiplicaciones-acumulaciones** en las capas densas
+por pronóstico. Son cifras del núcleo, no del checkpoint completo ni de la RAM
+o la latencia del dispositivo. El predictor es puntual.
+
+Para un microcontrolador, no hace falta portar PyTorch, NeuralForecast ni Flower:
+se pueden implementar las dos capas en C con los tensores `encoder.0.*` y
+`forecast.*` del checkpoint. Hay que reproducir el preprocesado y la inversión
+de escala configurados: por defecto se normaliza solo el contexto observado, se
+rellenan huecos con `ffill` y se resta el último valor antes del encoder y se
+suma de nuevo a la salida. La implementación de inferencia debe validarse en el
+dispositivo; no se incluye un binario ni se han medido su latencia o memoria.
+
+Otros candidatos ligeros integrados:
+
+- **SeasonalNaive** no entrena ni participa en Flower; usa un ciclo de 24 h por defecto.
+- **Regresión de seis retardos** es el primer candidato entrenable que probaría
+  en un dispositivo muy limitado. Se compara en local, centralizado y federado.
+  Los 84 parámetros no incluyen el preprocesado; con `normalization = "window"`
+  la normalización observa todo el contexto disponible.
+- **`nlinear-point`** usa todas las horas de contexto (1.092 parámetros con la
+  geometría principal). También admite los tres modos de entrenamiento.
+- **Holt (nivel y tendencia)** conserva solo dos valores de estado mientras
+  procesa el contexto horario. No comprime el calendario si faltan lecturas.
+  Se compara una sola vez por fold, en local.
+
+Además de MASE/RMSSE en el mismo panel, conviene medir latencia con batch 1,
+pico de RAM y bytes de flash en el hardware objetivo.
 
 ### Modos secuenciales y candidatos paralelos por GPU
 
@@ -305,7 +345,7 @@ Puedes limitar la matriz, sin cambiar el soporte temporal:
 
 ```bash
 uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
-  --models mlp autoencoder nlinear nhits --modes local centralized federated
+  --models mlp autoencoder autoencoder-tiny nlinear nhits --modes local centralized federated
 ```
 
 O ejecutar un caso individual:

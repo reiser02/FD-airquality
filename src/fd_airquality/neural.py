@@ -15,8 +15,12 @@ from fd_airquality.availability import availability_threshold
 from fd_airquality.missing import impute_context
 
 NEURALFORECAST_REVISION = "69e431413b22cbb1a74d35db2fa7994092ce0ea4"
-NEURAL_MODELS = ("mlp", "nlinear", "nhits")
+NEURAL_MODELS = ("mlp", "nlinear", "nlinear-point", "nhits")
 QUANTILE_LEVELS = tuple(index / 20 for index in range(1, 20))
+
+
+def trained_quantiles(settings) -> bool:
+    return bool(settings.probabilistic and settings.model in NEURAL_MODELS and settings.model != "nlinear-point")
 
 
 class NeuralForecaster(nn.Module):
@@ -28,7 +32,7 @@ class NeuralForecaster(nn.Module):
         from neuralforecast.models import MLP, NHITS, NLinear
 
         self.context, self.horizon = context, horizon
-        self.quantile_levels = QUANTILE_LEVELS if settings.probabilistic else None
+        self.quantile_levels = QUANTILE_LEVELS if trained_quantiles(settings) else None
         loss = MQLoss(quantiles=list(QUANTILE_LEVELS)) if self.quantile_levels else MSE()
         options = {
             "h": horizon, "input_size": context, "loss": loss,
@@ -40,7 +44,7 @@ class NeuralForecaster(nn.Module):
         }
         if settings.model == "mlp":
             self.module = MLP(**options, hidden_size=settings.hidden_size)
-        elif settings.model == "nlinear":
+        elif settings.model in {"nlinear", "nlinear-point"}:
             self.module = NLinear(**options)
         elif settings.model == "nhits":
             self.module = NHITS(**options, mlp_units=3 * [[settings.hidden_size, settings.hidden_size]])

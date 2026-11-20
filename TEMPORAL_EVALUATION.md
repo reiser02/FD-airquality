@@ -5,7 +5,7 @@
 El proyecto instala **NeuralForecast 3.1.4**, commit
 `69e431413b22cbb1a74d35db2fa7994092ce0ea4`. No contiene copias de sus arquitecturas,
 normalizadores ni pérdidas. MLP, NLinear y NHITS son instancias del paquete;
-el autoencoder sigue siendo un control propio, porque no tiene un equivalente
+`autoencoder` y `autoencoder-tiny` son controles propios, sin equivalente
 directo en esa colección. No existe dependencia ni import de Darts.
 
 La investigación de partida se conserva, sin modificar, en
@@ -113,7 +113,7 @@ No se utiliza `NeuralForecast.local_scaler_type`: evitamos tanto su ajuste previ
 al corte de ventanas como la posible inclusión de placeholders finitos.
 Granite conserva su soporte nativo de ausencias y su normalización interna; la
 capa externa configurada usa también `TemporalNorm` y se invierte al pronosticar.
-El autoencoder utiliza el mismo normalizador del paquete.
+Ambos autoencoders utilizan el mismo normalizador del paquete.
 
 Pérdidas de entrenamiento en la escala normalizada; evaluación y baselines en
 unidades originales. No se agregan ni transmiten estadísticas de escalado. La

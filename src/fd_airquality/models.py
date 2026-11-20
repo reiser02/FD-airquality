@@ -18,6 +18,14 @@ from fd_airquality.adapters import (
     layer_seed,
     target_linears,
 )
+from fd_airquality.lightweight import (
+    HOLT_GRID,
+    LINEAR_LAGS,
+    STATION_CONTROLS,
+    Holt,
+    LagLinear,
+    SeasonalNaive,
+)
 from fd_airquality.settings import RunSettings
 
 # Immutable Hugging Face revisions; never silently substitute R2 for TTM-R3.
@@ -38,7 +46,10 @@ GRANITE = {
         "FlowStateForPrediction",
     ),
 }
-MODEL_NAMES = ("mlp", "autoencoder", "nlinear", "nhits", *GRANITE)
+AUTOENCODER_MODELS = ("autoencoder", "autoencoder-tiny")
+TINY_AUTOENCODER_LATENT_SIZE = 4
+MODEL_NAMES = ("mlp", *AUTOENCODER_MODELS, "nlinear", "nlinear-point", "nhits",
+               "linear-6lags", *STATION_CONTROLS, *GRANITE)
 
 
 class ForecastAutoencoder(nn.Module):
@@ -46,14 +57,19 @@ class ForecastAutoencoder(nn.Module):
 
     handles_missing_context = True
 
-    def __init__(self, context: int, horizon: int, hidden: int, latent: int,
+    def __init__(self, context: int, horizon: int, hidden: int | None, latent: int,
                  scaler_type: str = "identity"):
         super().__init__()
         from neuralforecast.common._scalers import TemporalNorm
 
         self.scaler = TemporalNorm(scaler_type=scaler_type, dim=1)
-        self.encoder = nn.Sequential(nn.Linear(context, hidden), nn.ReLU(), nn.Linear(hidden, latent))
-        self.reconstruction = nn.Sequential(nn.Linear(latent, hidden), nn.ReLU(), nn.Linear(hidden, context))
+        if hidden is None:
+            # The tiny variant needs only two dense projections for forecasting.
+            self.encoder = nn.Sequential(nn.Linear(context, latent), nn.ReLU())
+            self.reconstruction = nn.Linear(latent, context)
+        else:
+            self.encoder = nn.Sequential(nn.Linear(context, hidden), nn.ReLU(), nn.Linear(hidden, latent))
+            self.reconstruction = nn.Sequential(nn.Linear(latent, hidden), nn.ReLU(), nn.Linear(hidden, context))
         self.forecast = nn.Linear(latent, horizon)
         nn.init.zeros_(self.forecast.weight)
         nn.init.zeros_(self.forecast.bias)
@@ -91,6 +107,10 @@ class ForecastAutoencoder(nn.Module):
 
 def validate_model_geometry(geometry: dict, settings: RunSettings) -> None:
     context, horizon = geometry["context"], geometry["horizon"]
+    if settings.model == "linear-6lags" and context < max(LINEAR_LAGS):
+        raise ValueError("linear-6lags necesita al menos 72 horas de contexto.")
+    if settings.model == "seasonal-naive" and context < geometry.get("seasonality", 24):
+        raise ValueError("seasonal-naive requiere al menos un ciclo en el contexto.")
     if settings.model == "ttm-r3" and (context != 90 or horizon > 30):
         raise ValueError(
             "El checkpoint TTM-R3 fijado exige contexto 90 y horizonte <= 30. "
@@ -153,10 +173,16 @@ def _load_granite(name: str, revision: str) -> nn.Module:
 
 
 def effective_adaptation(settings: RunSettings) -> str:
+    if settings.model in STATION_CONTROLS:
+        return "none"
     return ("lora" if settings.model in GRANITE else "full") if settings.adaptation == "auto" else settings.adaptation
 
 
 def validate_run_mode(settings: RunSettings, mode: str) -> None:
+    if settings.model in STATION_CONTROLS:
+        if mode != "local" or settings.adaptation not in {"auto", "none"}:
+            raise ValueError(f"{settings.model} se evalúa solo en local, sin adaptación federada.")
+        return
     algorithm = effective_adaptation(settings)
     if settings.model not in GRANITE:
         if algorithm != "full" or mode == "zero-shot":
@@ -355,13 +381,22 @@ class GraniteForecaster(nn.Module):
 def make_model(geometry: dict, settings: RunSettings, *, pretrained: bool = True) -> nn.Module:
     validate_model_geometry(geometry, settings)
     context, horizon = geometry["context"], geometry["horizon"]
-    if settings.model in {"mlp", "nlinear", "nhits"}:
+    if settings.model in {"mlp", "nlinear", "nlinear-point", "nhits"}:
         from fd_airquality.neural import NeuralForecaster
 
         return NeuralForecaster(context, horizon, settings)
-    if settings.model == "autoencoder":
-        return ForecastAutoencoder(context, horizon, settings.hidden_size, settings.latent_size,
+    if settings.model in AUTOENCODER_MODELS:
+        tiny = settings.model == "autoencoder-tiny"
+        hidden = None if tiny else settings.hidden_size
+        latent = TINY_AUTOENCODER_LATENT_SIZE if tiny else settings.latent_size
+        return ForecastAutoencoder(context, horizon, hidden, latent,
                                    settings.scaler_type if settings.normalization == "window" else "identity")
+    if settings.model == "linear-6lags":
+        return LagLinear(horizon, settings.scaler_type if settings.normalization == "window" else "identity")
+    if settings.model == "seasonal-naive":
+        return SeasonalNaive(horizon, geometry.get("seasonality", 24))
+    if settings.model == "holt":
+        return Holt(horizon)
     return GraniteForecaster(geometry, settings, pretrained=pretrained)
 
 
@@ -379,21 +414,40 @@ def load_shared_state(model: nn.Module, state: dict[str, torch.Tensor]) -> None:
 
 
 def model_metadata(geometry: dict, settings: RunSettings) -> dict:
-    metadata = {"name": settings.model, "context": geometry["context"], "horizon": geometry["horizon"],
+    context, horizon = geometry["context"], geometry["horizon"]
+    metadata = {"name": settings.model, "context": context, "horizon": horizon,
                 "normalization": settings.normalization,
                 "scaler_type": settings.scaler_type if settings.normalization == "window" else "identity"}
-    if settings.model in {"mlp", "nlinear", "nhits"}:
+    if settings.model in {"mlp", "nlinear", "nlinear-point", "nhits"}:
         from importlib.metadata import version
 
-        from fd_airquality.neural import NEURALFORECAST_REVISION, QUANTILE_LEVELS
+        from fd_airquality.neural import NEURALFORECAST_REVISION, QUANTILE_LEVELS, trained_quantiles
 
+        probabilistic = trained_quantiles(settings)
         metadata.update(backend="neuralforecast", version=version("neuralforecast"),
-                        revision=NEURALFORECAST_REVISION, normalization=settings.normalization,
-                        scaler_type=settings.scaler_type if settings.normalization == "window" else "identity",
-                        quantiles=list(QUANTILE_LEVELS) if settings.probabilistic else [],
-                        point_forecast="median" if settings.probabilistic else "point",
-                        training_loss="mean_pinball" if settings.probabilistic else "masked_mse",
-                        window_interface="package_normalization_parse_forward_loss_v1")
+                         revision=NEURALFORECAST_REVISION, normalization=settings.normalization,
+                         scaler_type=settings.scaler_type if settings.normalization == "window" else "identity",
+                         quantiles=list(QUANTILE_LEVELS) if probabilistic else [],
+                         point_forecast="median" if probabilistic else "point",
+                         training_loss="mean_pinball" if probabilistic else "masked_mse",
+                         window_interface="package_normalization_parse_forward_loss_v1")
+    elif settings.model == "autoencoder-tiny":
+        latent = TINY_AUTOENCODER_LATENT_SIZE
+        macs = latent * (context + horizon)
+        inference = macs + latent + horizon  # Weights and biases, excluding the training decoder.
+        metadata.update(architecture="tiny-linear-relu-v1", latent_size=latent, point_forecast="point",
+                        inference_macs=macs, inference_parameters=inference,
+                        trainable_parameters=inference + context * (latent + 1))
+    elif settings.model == "linear-6lags":
+        metadata.update(lags_hours=list(LINEAR_LAGS), point_forecast="point", training_loss="masked_mse",
+                        inference_parameters=(len(LINEAR_LAGS) + 1) * horizon,
+                        inference_macs=len(LINEAR_LAGS) * horizon)
+    elif settings.model in STATION_CONTROLS:
+        metadata.update(adaptation="none", trainable_parameters=0, point_forecast="point")
+        if settings.model == "seasonal-naive":
+            metadata.update(season_length=geometry.get("seasonality", 24), fallback_cycles=[1, 2, 3])
+        else:
+            metadata.update(coefficient_grid=[list(pair) for pair in HOLT_GRID], inference_state_values=2)
     if settings.model in GRANITE:
         identifier, revision, _ = GRANITE[settings.model]
         metadata.update(

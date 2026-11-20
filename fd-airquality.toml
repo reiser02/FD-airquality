@@ -141,12 +141,12 @@ seed = 42
 device = "cuda"
 # Hilos internos de PyTorch (también limita OMP/MKL en los procesos lanzados).
 torch-threads = 1
-# Modelo predeterminado; opciones: mlp, autoencoder, nlinear, nhits,
+# Modelo predeterminado; opciones: mlp, autoencoder, autoencoder-tiny, nlinear, nhits,
 # ttm-r3, flowstate-r1 y patchtst-fm-r2. backtest usa su lista [backtest].models.
 model = "mlp"
-# Dimensión del cuello de botella latente del autoencoder.
+# Dimensión del cuello de botella del autoencoder estándar; tiny usa 4 fijas.
 latent-size = 16
-# Peso de la pérdida auxiliar de reconstrucción del autoencoder.
+# Peso de la pérdida auxiliar de reconstrucción de ambos autoencoders.
 reconstruction-weight = 0.1
 # SHA inmutable de 40 caracteres hexadecimales en minúscula para Granite en Hugging Face;
 # vacío conserva la revisión fijada por el proyecto.
@@ -194,7 +194,7 @@ missing-policy = "auto"
 # 1 activa el modo determinista de PyTorch; 0 no lo fuerza.
 # No se promete reproducibilidad bit a bit entre dispositivos.
 deterministic = 0
-# 1 entrena cuantiles de MLP/NHITS/NLinear y evalúa los nativos de Granite.
+# 1 entrena cuantiles de MLP/NHITS/NLinear (no nlinear-point) y evalúa los nativos de Granite.
 probabilistic = 1
 # "window": TemporalNorm sobre el contexto observado de cada ventana; "fixed": media y
 # desviación por estación con el histórico autorizado; "none": sin normalización externa.
@@ -223,7 +223,12 @@ arrival-period-hours = 24
 # "mean" usa la media del contexto y "zero" rellena con cero en la escala del modelo.
 mlp = "native"
 autoencoder = "ffill"
+autoencoder-tiny = "ffill"
 nlinear = "native"
+nlinear-point = "native"
+linear-6lags = "ffill"
+seasonal-naive = "native"
+holt = "native"
 nhits = "native"
 ttm-r3 = "native"
 patchtst-fm-r2 = "native"
@@ -287,7 +292,8 @@ stage = "evaluation"
 # Si se omite, se busca el último manifest bajo data/backtests/. Fíjalo si cambiaste output.
 # manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # Controles clásicos y Granite. PatchTST-FM-R2 queda fuera salvo selección explícita.
-models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "flowstate-r1"]
+models = ["mlp", "autoencoder", "autoencoder-tiny", "nlinear", "nlinear-point", "nhits",
+          "linear-6lags", "seasonal-naive", "holt", "ttm-r3", "flowstate-r1"]
 # Métodos comparados: entrenamiento local por estación, centralizado, federado y zero-shot.
 # Zero-shot solo se genera para los modelos Granite.
 modes = ["local", "centralized", "federated", "zero-shot"]
@@ -295,7 +301,7 @@ modes = ["local", "centralized", "federated", "zero-shot"]
 # (acumulación por apilado) y LoRA-FAIR (refinamiento en servidor); local/centralizado
 # usan LoRA y FFA-LoRA como controles. Los modelos clásicos se entrenan completos.
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
-# Semillas a comparar; si se omite, se usa [run].seed. Zero-shot no se duplica por semilla.
+# Semillas a comparar; si se omite, se usa [run].seed. Zero-shot, Holt y SeasonalNaive no se duplican.
 seeds = [42]
 # Rangos LoRA a comparar en Granite; si se omite, se usa [run].lora-rank.
 # lora-ranks = [4, 8]

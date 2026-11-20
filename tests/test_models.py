@@ -3,17 +3,21 @@ import torch
 from torch import nn
 
 from fd_airquality.models import (
+    AUTOENCODER_MODELS,
     GRANITE,
     ForecastAutoencoder,
+    checkpoint_payload,
     load_shared_state,
     make_model,
+    model_metadata,
+    restore_checkpoint,
     shared_state,
 )
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import configure_torch, train_local
 
 
-@pytest.mark.parametrize("name", ["mlp", "autoencoder", "nlinear", "nhits"])
+@pytest.mark.parametrize("name", ["mlp", *AUTOENCODER_MODELS, "nlinear", "nhits"])
 def test_trainable_models_have_forecast_shapes_and_gradients(name):
     settings = RunSettings(model=name, hidden_size=8, latent_size=3)
     configure_torch(settings, 17)
@@ -26,23 +30,52 @@ def test_trainable_models_have_forecast_shapes_and_gradients(name):
     clone = make_model({"context": 6, "horizon": 2}, settings)
     load_shared_state(clone, shared_state(model))
     torch.testing.assert_close(model(inputs), clone(inputs))
-    if name != "autoencoder":
+    if name not in AUTOENCODER_MODELS:
         assert type(model.module).__module__.startswith("neuralforecast.")
 
 
-def test_autoencoder_reconstruction_uses_context_only(prepared):
+@pytest.mark.parametrize("name", AUTOENCODER_MODELS)
+def test_autoencoder_reconstruction_uses_context_only(prepared, name):
     from fd_airquality.data import WindowDataset, load_client_data
 
     path, _ = prepared
     _, artifact = load_client_data(str(path), 0)
-    settings = RunSettings(model="autoencoder", hidden_size=8, latent_size=3)
+    settings = RunSettings(model=name, hidden_size=8, latent_size=3)
     device = configure_torch(settings, 19)
     model = make_model({"context": 6, "horizon": 2}, settings)
     assert isinstance(model, ForecastAutoencoder)
-    before = model.reconstruction[-1].weight.detach().clone()
+    before = [parameter.detach().clone() for parameter in model.reconstruction.parameters()]
     train_local(model, WindowDataset(artifact, "train", 6, 2), settings, device, 19)
-    assert not torch.equal(before, model.reconstruction[-1].weight)
-    assert model.encoder[-1].out_features == 3
+    assert any(not torch.equal(initial, parameter) for initial, parameter in
+               zip(before, model.reconstruction.parameters(), strict=True))
+    assert model.forecast.in_features == (4 if name == "autoencoder-tiny" else 3)
+
+
+def test_tiny_autoencoder_size_and_checkpoint_forecast_without_decoder(monkeypatch):
+    geometry = {"context": 90, "horizon": 12}
+    settings = RunSettings(model="autoencoder-tiny", hidden_size=256, latent_size=64)
+    model = make_model(geometry, settings)
+    metadata = model_metadata(geometry, settings)
+    assert metadata["latent_size"] == 4
+    assert metadata["inference_macs"] == 408
+    assert metadata["inference_parameters"] == 424 == sum(
+        parameter.numel() for module in (model.encoder, model.forecast) for parameter in module.parameters()
+    )
+    assert metadata["trainable_parameters"] == 874 == sum(p.numel() for p in model.parameters())
+
+    def no_decoder(*_, **__):
+        pytest.fail("La inferencia no necesita el decoder de reconstrucción.")
+
+    monkeypatch.setattr(model.reconstruction, "forward", no_decoder)
+    with torch.no_grad():
+        model.forecast.weight.fill_(.2)  # Exercise the encoder, not just the persistence skip.
+        inputs = torch.randn(3, 90)
+        inputs[:, ::5] = float("nan")
+        inputs[0, -1] = float("nan")
+        prediction = model(inputs)
+        restored = restore_checkpoint(checkpoint_payload(geometry, settings, shared_state(model), 1))
+        torch.testing.assert_close(restored(inputs), prediction, rtol=0, atol=0)
+    assert prediction.shape == (3, 12) and torch.isfinite(prediction).all()
 
 
 @pytest.mark.parametrize("name", list(GRANITE))

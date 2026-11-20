@@ -23,7 +23,10 @@ CONTEXT_COLUMNS = (
     "selected_round", "num-clients", "num-examples", "num-targets", "target-coverage",
 )
 MODELS = {
-    "mlp": "MLP", "autoencoder": "Autoencoder", "nlinear": "NLinear", "nhits": "NHITS",
+    "mlp": "MLP", "autoencoder": "Autoencoder", "autoencoder-tiny": "Autoencoder Tiny",
+    "nlinear": "NLinear", "nhits": "NHITS",
+    "nlinear-point": "NLinear puntual", "linear-6lags": "Regresión de 6 retardos",
+    "seasonal-naive": "SeasonalNaive", "holt": "Holt",
     "darts-nlinear": "NLinear (Darts)", "ttm-r3": "TTM-R3",
     "patchtst-fm-r2": "PatchTST-FM-R2", "flowstate-r1": "FlowState-R1",
 }

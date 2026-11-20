@@ -173,7 +173,8 @@ def test_monitoring_labels_are_not_reused_by_autoencoder_auxiliary_loss(arrival_
 
 @pytest.mark.parametrize(("mode", "model_name", "padding"), [
     ("local", "mlp", "none"), ("centralized", "nhits", "none"), ("centralized", "nlinear", "both"),
-    ("federated", "autoencoder", "both"), ("federated", "flowstate-r1", "right"),
+    ("federated", "autoencoder", "both"), ("federated", "autoencoder-tiny", "both"),
+    ("federated", "flowstate-r1", "right"),
 ])
 def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
     arrival_raw, tmp_path, flower_grid, mock_granite, mode, model_name, padding,
