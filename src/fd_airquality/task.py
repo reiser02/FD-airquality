@@ -91,13 +91,15 @@ def train_local(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     reference = [parameter.detach().clone() for parameter in parameters] if proximal_mu else []
+    restrict_reconstruction = (getattr(dataset, "arrival_lower", None) is not None
+                               or getattr(dataset, "monitoring_interval", None) is not None)
     loader_dataset = (ContextSupervisionDataset(dataset)
                       if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight
-                      and getattr(dataset, "monitoring_interval", None) is not None else dataset)
+                      and restrict_reconstruction else dataset)
     group_sizes = [len(child) for child in dataset.datasets] if isinstance(dataset, ConcatDataset) else None
     sampler = CompleteBatchSampler(
         len(dataset), settings.batch_size, torch.Generator().manual_seed(seed),
-        max_windows=max_train_windows, group_sizes=group_sizes,
+        max_windows=max_train_windows, group_sizes=group_sizes, pad_last_batch=bool(settings.pad_last_batch),
     )
     loader = DataLoader(loader_dataset, batch_sampler=sampler, num_workers=0,
                         generator=torch.Generator().manual_seed(seed))

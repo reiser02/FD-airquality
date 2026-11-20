@@ -13,6 +13,7 @@ from fd_airquality.arrival import (
     arrival_metrics,
     audit_normalization,
     normalization_artifact,
+    round_epoch_limit,
     round_validation_view,
     training_view,
 )
@@ -66,12 +67,13 @@ def _execute_task(message, settings, partition, training):
                    validation_view(artifact, geometry, settings) if split == "validation" else
                    WindowDataset(artifact, "test", geometry["context"], geometry["horizon"]))
         if training:
+            update = replace(settings, local_epochs=round_epoch_limit(geometry, settings, round_number))
             metrics = train_local(
-                model, dataset, settings, device, seed,
+                model, dataset, update, device, seed,
                 proximal_mu=float(message.content["config"].get("proximal-mu", 0.0)),
                 max_train_windows=geometry.get("max_train_windows"),
                 **({"validation_data": round_validation_view(artifact, geometry, settings)}
-                   if controls_enabled(settings) else {}),
+                    if controls_enabled(update) else {}),
             ) if len(dataset) else {
                 "num-examples": 0, "num-targets": 0, "train-mse-normalized": 0.,
                 "train-seconds": 0., "optimizer-steps": 0,

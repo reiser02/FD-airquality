@@ -35,30 +35,55 @@ def round_bounds(geometry: dict, settings, round_number: int):
     return lower, cutoff
 
 
-def round_validation_bounds(geometry: dict, settings):
+def round_epoch_limit(geometry: dict, settings, round_number: int) -> int:
+    """Only updates on new arrivals get the additional epoch cap."""
+    if (round_number > 1 and settings.federated_update_epochs
+            and round_cutoff(geometry, settings, round_number) is not None):
+        return min(settings.local_epochs, settings.federated_update_epochs)
+    return settings.local_epochs
+
+
+def _monitoring_starts(artifact, geometry, lower, cutoff):
+    times = artifact["timestamps"]
+    starts = artifact["train_starts"]
+    first, last = starts + geometry["context"], starts + geometry["context"] + geometry["horizon"] - 1
+    keep = (starts >= 0) & (last < len(times))
+    starts, first, last = starts[keep], first[keep], last[keep]
+    return starts[(times[first] >= lower.value) & (times[last] < cutoff.value)]
+
+
+def round_validation_bounds(geometry: dict, settings, artifact=None):
     """Fixed monitoring reserve, wholly available BEFORE round one."""
     if not controls_enabled(settings):
         return None
     end = round_cutoff(geometry, settings, 1)
     if end is None:
         return None
-    start = end - pd.Timedelta(hours=max(settings.round_validation_hours, geometry["horizon"]))
-    if geometry.get("train_start") and start < pd.Timestamp(geometry["train_start"]):
+    hours = max(settings.round_validation_hours, geometry["horizon"])
+    start = end - pd.Timedelta(hours=hours)
+    train_start = pd.Timestamp(geometry["train_start"]) if geometry.get("train_start") else None
+    if train_start is not None and start < train_start:
         raise ValueError("El histórico del fold no alcanza la reserva de monitorización de la primera ronda.")
+    if artifact is not None and settings.round_validation_max_hours > hours:
+        earliest = end - pd.Timedelta(hours=settings.round_validation_max_hours)
+        if train_start is not None:
+            earliest = max(earliest, train_start)
+        starts = _monitoring_starts(artifact, geometry, earliest, end)
+        if len(starts):
+            # Move the start just enough to include the nearest past horizon.
+            # The end is never allowed to cross the first arrival.
+            last_origin = artifact["timestamps"][starts[-1] + geometry["context"]]
+            start = min(start, pd.Timestamp(last_origin))
     return start, end
 
 
 def round_validation_view(artifact: dict, geometry: dict, settings):
-    bounds = round_validation_bounds(geometry, settings)
+    bounds = round_validation_bounds(geometry, settings, artifact)
     if bounds is None:
         return validation_view(artifact, geometry, settings)
     lower, cutoff = bounds
     times = artifact["timestamps"]
-    starts = artifact["train_starts"]
-    first, last = starts + geometry["context"], starts + geometry["context"] + geometry["horizon"] - 1
-    keep = (starts >= 0) & (last < len(times))
-    starts, first, last = starts[keep], first[keep], last[keep]
-    starts = starts[(times[first] >= lower.value) & (times[last] < cutoff.value)]
+    starts = _monitoring_starts(artifact, geometry, lower, cutoff)
     size = int(np.searchsorted(times, cutoff.value))
     local = artifact | {"validation_starts": starts, "values": artifact["values"][:size],
                         "timestamps": times[:size]}
@@ -74,20 +99,14 @@ def normalization_artifact(artifact: dict, geometry: dict, settings) -> dict:
     if settings.normalization != "fixed":
         result.update(mean=np.array(0.), scale=np.array(1.))
     elif geometry.get("split_mode") == "global":
-        reference_end = settings.normalization_reference_end
-        if not reference_end:
-            end = pd.Timestamp(geometry["validation_start"])
-            reference_end = str(end - pd.Timedelta(
-                hours=max(0, settings.num_server_rounds - 1) * settings.arrival_period_hours,
-            ))
-            bounds = round_validation_bounds(geometry, settings)
-            if bounds is not None:
-                reference_end = str(bounds[0])
-        cutoff = pd.Timestamp(reference_end)
         first_arrival = round_cutoff(geometry, settings, 1)
+        bounds = round_validation_bounds(geometry, settings, artifact)
+        reference_end = settings.normalization_reference_end or str(
+            bounds[0] if bounds is not None else first_arrival or pd.Timestamp(geometry["validation_start"]),
+        )
+        cutoff = pd.Timestamp(reference_end)
         if cutoff > (first_arrival or pd.Timestamp(geometry["validation_start"])):
             raise ValueError("La normalización fija utiliza datos aún no disponibles en la primera ronda.")
-        bounds = round_validation_bounds(geometry, settings)
         if bounds is not None and cutoff > bounds[0]:
             raise ValueError("La normalización fija invade la reserva de monitorización.")
         mask = np.isfinite(artifact["values"]) & (artifact["timestamps"] < cutoff.value)
@@ -130,6 +149,7 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
     padded = str(artifact.get("window_padding", "none")) != "none"
     monitoring_excluded = 0
     arrival_unobserved = 0
+    bounds = None
     target_end = int(artifact.get("train_target_end", len(artifact["values"])))
     if cutoff is not None:
         times = artifact["timestamps"]
@@ -140,7 +160,7 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
             # Only forecast targets must be new. Their context may precede the
             # block; a padded horizon can extend right, never back into old labels.
             starts = starts[times[starts + geometry["context"]] >= lower.value]
-        bounds = round_validation_bounds(geometry, settings)
+        bounds = round_validation_bounds(geometry, settings, artifact)
         if bounds is not None:
             first = times[starts + geometry["context"]]
             if padded:
@@ -172,7 +192,7 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
     dataset.arrival_lower = lower
     dataset.timestamps = local["timestamps"]
     dataset.monitoring_excluded_windows = monitoring_excluded
-    dataset.monitoring_interval = round_validation_bounds(geometry, settings) if cutoff is not None else None
+    dataset.monitoring_interval = bounds
     dataset.arrival_unobserved_windows = arrival_unobserved
     return dataset
 
@@ -188,6 +208,9 @@ def arrival_metrics(dataset) -> dict:
     }
     if dataset.available_through is not None:
         metrics["available-through-ns"] = dataset.available_through.value
+        if dataset.monitoring_interval is not None:
+            start, end = dataset.monitoring_interval
+            metrics.update({"monitoring-from-ns": start.value, "monitoring-through-ns": end.value})
         if dataset.arrival_lower is not None:
             metrics["available-from-ns"] = dataset.arrival_lower.value
     return metrics

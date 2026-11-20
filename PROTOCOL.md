@@ -207,10 +207,11 @@ igualdad bit a bit entre ejecuciones, hardware o versiones diferentes.
 PatchTST en CUDA usa microbatches de hasta 8 ventanas sin cambiar el batch efectivo
 configurado ni el orden de las ventanas. Cada pérdida se pondera por sus targets;
 se acumulan los gradientes antes de un único clipping y paso de AdamW por batch
-efectivo. El último batch corto de entrenamiento se completa con reemplazo del
-subconjunto sorteado en esa época; evaluación conserva su tamaño real. FedProx se añade una sola
-vez por batch lógico. No se recorta el contexto ni se cambia la arquitectura; el orden de suma y el
-dropout pueden introducir diferencias numéricas. En el control local CUDA los
+efectivo. La configuración principal conserva el último batch corto de entrenamiento
+sin reemplazo (`pad-last-batch = 0`); evaluación siempre conserva su tamaño real.
+FedProx se añade una sola vez por batch lógico. No se recorta el contexto ni se
+cambia la arquitectura; el orden de suma y el dropout pueden introducir
+diferencias numéricas. En el control local CUDA los
 modelos siguen siendo independientes, pero solo la estación activa reside en GPU;
 las restantes se conservan en CPU.
 En federado, los actores persistentes descargan el modelo a CPU al finalizar cada

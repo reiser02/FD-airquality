@@ -27,18 +27,20 @@ y luego se mezclan las selecciones en los lotes. El orden de operaciones es:
 1. Corte de llegada y exclusión de la reserva de monitorización.
 2. Mínimos de observaciones y umbrales de disponibilidad del modelo.
 3. Sorteo sin reemplazo de hasta `max-train-windows` distintas por estación.
-4. Formación de batches (`batch-size`), completando el último lote corto con
-   reemplazo **solo** de lo sorteado en esa época.
+4. Formación de batches (`batch-size`). Con `pad-last-batch=0` el último lote
+   conserva su tamaño real; con `1` se completa **solo** con lo sorteado en esa época.
 
-Por ejemplo, con 11 ventanas sorteadas y `batch-size=8`, hay dos lotes de
-ocho: 11 originales y 5 repeticiones. Los microbatches físicos pueden ser menores.
+Por ejemplo, con 11 ventanas sorteadas y `batch-size=8`, sin relleno salen un lote
+de ocho y otro de tres. Con relleno serían 11 originales y 5 repeticiones.
+Los microbatches físicos pueden ser menores.
 Validación y test no repiten ventanas ni cambian sus lotes. Un conjunto vacío no
 fabrica muestras: una ronda federada queda inactiva; un ajuste completo sin
 ventanas falla. El sorteo y el reemplazo son reproducibles con la semilla.
 
-El parámetro sigue en `[prepare]` o `--max-train-windows` en `prepare` y
-`prepare-backtest`. Queda registrado en el manifest y solo se aplica al entrenar.
-Para usar esta revisión con datos ya preparados, genera un manifest nuevo.
+La cuota se configura en `[prepare]`, `[prepare-backtest]` o con
+`--max-train-windows`. Queda registrada en el manifest y solo se aplica al
+entrenar. Si la cuota ya coincide, se puede reutilizar la preparación: `batch-size`
+y `pad-last-batch` se leen al arrancar el entrenamiento.
 
 ```toml
 [prepare]
@@ -46,6 +48,7 @@ max-train-windows = 1000
 
 [run]
 batch-size = 100
+pad-last-batch = 0
 ```
 
 Con al menos 1000 ventanas admisibles, cada estación local o federada hace diez
@@ -182,15 +185,18 @@ La configuración principal utiliza:
 
 ```toml
 [run]
-local-epochs = 50                 # máximo, no número garantizado de épocas
+local-epochs = 40                 # máximo, no número garantizado de épocas
+arrival-period-hours = 240        # tamaño de cada bloque nuevo (10 días)
+federated-update-epochs = 20      # tope adicional tras el ajuste inicial
 early-stopping = 1
-early-stopping-patience = 5
+early-stopping-patience = 7
 early-stopping-min-delta = 0.0     # mejora absoluta mínima de MSE, en unidades cuadradas
 lr-scheduler = "plateau"           # ReduceLROnPlateau de PyTorch
 lr-scheduler-patience = 2
 lr-scheduler-factor = 0.5
 min-learning-rate = 0.000001
 round-validation-hours = 24
+round-validation-max-hours = 336  # ampliación hacia atrás solo si falta cobertura
 ```
 
 Tras cada época se monitoriza **MSE por targets originales observados, en
@@ -217,7 +223,8 @@ La pérdida optimizada puede ser MSE o multicuantil normalizada y no es esa mét
 
 Con un presupuesto de una sola época no hay épocas posteriores que detener ni
 cuyo LR reducir; se ejecuta esa época sin crear una reserva adicional. El TOML
-principal permite 50; el smoke de integración mantiene una sola. Para desactivar
+principal permite 40 en el ajuste inicial y hasta 20 en las rondas de llegada
+posteriores; el smoke de integración mantiene una sola. Para desactivar
 explícitamente ambos controles: `early-stopping=0` y `lr-scheduler="none"`.
 
 ### Reserva causal para monitorizar rondas federadas
@@ -227,7 +234,10 @@ puede consultar desde rondas anteriores sin adelantar información.
 
 Para el control local de épocas se reserva un intervalo fijo, anterior al corte
 de la primera ronda: las últimas `max(round-validation-hours, H)` horas de ese
-prefijo. Por ejemplo:
+prefijo. Si no contienen una ventana de monitorización admisible y se configura
+`round-validation-max-hours`, se busca la más reciente antes de la primera
+llegada, dentro de ese límite. La reserva ampliada se fija para toda la
+ejecución de esa estación y nunca toma observaciones futuras. Por ejemplo:
 
 ```text
 Primera llegada: antes del 7 de enero
@@ -239,9 +249,10 @@ Ronda 3: ajustar solo [8 de enero, 9 de enero), monitorizar la misma reserva
 ```
 
 Los targets de la reserva nunca aportan gradientes de pronóstico, ni se ajusta
-con ellos el scaler fijo. El autoencoder tampoco los utiliza como etiquetas de
-su reconstrucción auxiliar cuando aparecen en contextos posteriores. Pueden
-aparecer como entradas conocidas, como permite el protocolo.
+con ellos el scaler fijo. En rondas posteriores, el autoencoder solo usa como
+etiquetas de reconstrucción las lecturas del bloque nuevo. Las lecturas
+antiguas y las de la reserva pueden aparecer como entradas conocidas, no como
+objetivos de entrenamiento.
 
 Si no existe una reserva con verdad observada, se informa el error: no se
 sustituye por validación futura ni por pérdida de entrenamiento. La validación

@@ -32,7 +32,7 @@ uv run pytest
 uv run ruff check src tests
 ```
 
-La configuración raíz prepara tres folds, usa todas las estaciones elegibles y
+La configuración raíz prepara cuatro folds, usa todas las estaciones elegibles y
 ejecuta el backtest con una sola semilla (`42`). Para una prueba acotada usa
 `--config experiments/smoke.toml`;
 indica explícitamente el manifest que imprime `prepare-backtest`. El backtest
@@ -40,7 +40,7 @@ no se ejecuta al instalar.
 
 Ejecuta los comandos desde la raíz de este repositorio. La CLI carga automáticamente
 [`fd-airquality.toml`](fd-airquality.toml): PM2.5, contexto común de **90 horas**, horizonte
-de 12 y stride de evaluación de 6 horas. `prepare-backtest` calcula el calendario a
+de 12 y ventanas cada **4 horas** en entrenamiento y evaluación. `prepare-backtest` calcula el calendario a
 partir de los CSV, incluso con un solo fold. Las fechas de `[prepare]` se usan solo
 para preparaciones individuales con `prepare`. Los extremos derechos son exclusivos.
 Se conserva el calendario sin zona de los CSV, sin presumir que sea UTC.
@@ -330,10 +330,11 @@ ruta BF16 y otras geometrías mantienen la operación del paquete.
 En CUDA, PatchTST divide entrenamiento y evaluación en microbatches de hasta 8
 ventanas. El DataLoader de entrenamiento conserva los batches originales: se
 acumulan gradientes ponderados por el número de targets, con un único clipping y
-paso de AdamW por batch efectivo. El último batch corto de entrenamiento se
-completa con reemplazo desde las ventanas sorteadas en esa época; evaluación no las repite. FedProx se aplica
-una vez por batch efectivo. No se modifica el batch del TOML, el checkpoint ni la
-arquitectura; puede haber pequeñas diferencias por el orden de suma o por dropout.
+paso de AdamW por batch efectivo. La configuración principal usa un máximo de
+32 ventanas por batch en todos los modos y conserva el último lote corto sin
+repetir ventanas. FedProx se aplica una vez por batch efectivo. No se modifica
+el batch del TOML, el checkpoint ni la arquitectura; puede haber pequeñas
+diferencias por el orden de suma o por dropout.
 Los logs y las métricas registran batch efectivo, microbatch y pasos del optimizador.
 En modo local CUDA solo el modelo de la estación activa permanece en GPU; los
 demás conservan sus estados independientes en CPU, también durante evaluación.
@@ -370,13 +371,13 @@ uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
   apila actualizaciones y LoRA-FAIR refina la agregación.
 - **Zero-shot:** inferencia del checkpoint Granite sin adaptación con estos datos.
 
-Local y centralizado visitan su entrenamiento en cada etapa. En federado,
-`arrival-period-hours` controla el reloj: primera ronda con el histórico inicial y siguientes
-rondas solo con su bloque nuevo de targets, conservando los pesos globales
-agregados. El contexto sí puede utilizar el pasado. No se vuelve a ajustar todo
-el histórico en cada ronda. No hay selector de histórico entre rondas:
-el modo acumulativo y el deslizante se han eliminado.
-Los horizontes de targets deben caber enteros en el bloque de la ronda.
+Local y centralizado disponen de su entrenamiento autorizado en cada etapa.
+En federado, la primera ronda ajusta con el histórico inicial (hasta **40
+épocas**). Las siguientes parten de los pesos globales agregados y ajustan solo
+el bloque que acaba de llegar (**10 días**, hasta **20 épocas**). Se sortean
+hasta **256 ventanas distintas por estación y época** en el backtest. Los
+targets fuera del bloque no se entrenan; las lecturas antiguas solo pueden
+servir de contexto. Si una estación no tiene ventanas nuevas, no actualiza.
 Esta separación es interna al fold: el siguiente fold reinicia el modelo.
 AdamW se reinicia por etapa/ronda.
 Igualar rondas **no iguala ejemplos utilizados, optimización ni tiempo**.

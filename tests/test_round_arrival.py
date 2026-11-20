@@ -13,6 +13,8 @@ from fd_airquality.arrival import (
     normalization_artifact,
     round_bounds,
     round_cutoff,
+    round_epoch_limit,
+    round_validation_bounds,
     training_view,
 )
 from fd_airquality.data import DataConfig, WindowDataset, load_client_data, prepare
@@ -85,6 +87,17 @@ def test_default_blocks_reuse_context_but_never_previous_targets():
     assert arrival_metrics(short)["available-from-ns"] == times[70]
 
 
+def test_epoch_limits_only_reduce_updates_with_new_arrivals(arrival_prepared):
+    _, manifest = arrival_prepared
+    geometry = manifest["geometry"]
+    s = RunSettings(local_epochs=40, federated_update_epochs=20)
+    assert [round_epoch_limit(geometry, s, r) for r in range(1, 6)] == [40, 20, 20, 20, 20]
+    assert round_epoch_limit(geometry, replace(s, arrival_period_hours=0), 2) == 40
+    assert round_epoch_limit(geometry | {"split_mode": "station"}, s, 2) == 40
+    assert round_epoch_limit(geometry, replace(s, federated_update_epochs=0), 2) == 40
+    assert round_epoch_limit(geometry, replace(s, local_epochs=1), 2) == 1
+
+
 def test_availability_filters_full_round_pool_before_epoch_budget(arrival_prepared):
     path, manifest = arrival_prepared
     _, artifact = load_client_data(str(path), 0)
@@ -132,21 +145,27 @@ def test_actual_flower_strategy_uses_declared_round_blocks_and_no_early_validati
 ):
     path, manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                           model=model, strategy=strategy, num_server_rounds=3, hidden_size=8,
-                           batch_size=16, probabilistic=int(model != "autoencoder"),
-                           mlflow_tracking_uri="disabled")
+                            model=model, strategy=strategy, num_server_rounds=3, hidden_size=8,
+                            batch_size=32, pad_last_batch=0, probabilistic=int(model != "autoencoder"),
+                            arrival_period_hours=48, local_epochs=4, federated_update_epochs=2,
+                            early_stopping=0, lr_scheduler="none",
+                            mlflow_tracking_uri="disabled")
     grid = flower_grid(settings, len(manifest["clients"]))
     output = run_server(grid, settings)
     history = pd.read_csv(output / "station_metrics.csv")
     train = history.loc[history.split == "train"]
     for _, station in train.groupby("station"):
         assert station.iloc[0]["num-examples"] > station.iloc[1:]["num-examples"].max()
-        assert station.iloc[1:]["num-examples"].le(8).all()
+        assert station.iloc[1:]["num-examples"].le(16).all()
         assert (station.iloc[1:]["available-from-ns"].to_numpy()
                 == station.iloc[:-1]["available-through-ns"].to_numpy()).all()
         assert (station.iloc[1:]["train-first-target-ns"] >= station.iloc[1:]["available-from-ns"]).all()
-        assert np.all(np.diff(station["available-through-ns"]) == pd.Timedelta(hours=24).value)
+        assert np.all(np.diff(station["available-through-ns"]) == pd.Timedelta(hours=48).value)
         assert (station["train-last-target-ns"] < station["available-through-ns"]).all()
+        assert station["effective-batch-size"].eq(32).all()
+        assert station["epochs-completed"].tolist() == [4, 2, 2]
+        assert station.iloc[1:]["optimizer-steps"].tolist() == [2, 2]
+        assert station["replacement-window-occurrences"].eq(0).all()
     validations = [config for kind, config in grid.requests if config.get("split") == "validation"]
     assert len(validations) == 2 and all(config["server-round"] == 3 for config in validations)
     result = json.loads((output / "test_metrics.json").read_text())
@@ -158,10 +177,13 @@ def test_actual_flower_strategy_uses_declared_round_blocks_and_no_early_validati
     last = torch.load(output / "last_model.pt", weights_only=True)
     assert last["state_role"] == "training"
     assert last["information_cutoff"] == manifest["geometry"]["validation_start"]
-    arrival = json.loads((output / "run.json").read_text())["arrival_protocol"]
+    metadata = json.loads((output / "run.json").read_text())
+    arrival = metadata["arrival_protocol"]
     assert arrival["training_targets"] == "current_block_only"
     assert arrival["history"] == "new-only"
     assert arrival["block_schedule"] == "initial_prefix_then_calendar_increments"
+    assert metadata["training_budget"]["federated_update_epochs"] == 2
+    assert metadata["window_protocol"]["short_training_batch"] == "keep_without_replacement"
 
 
 @pytest.mark.parametrize("model_name", ["mlp", "flowstate-r1"])
@@ -240,6 +262,24 @@ def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_pat
         strategy.aggregate_train(2, replies)
 
 
+def test_server_checks_expanded_monitoring_reserve(arrival_prepared, tmp_path):
+    _, manifest = arrival_prepared
+    geometry = manifest["geometry"]
+    settings = RunSettings(local_epochs=4, num_server_rounds=3, round_validation_max_hours=48)
+    strategy = AuditedStrategy(settings, manifest, tmp_path)
+    start, end = round_validation_bounds(geometry, settings)
+    expanded = start - pd.Timedelta(hours=6)
+    metrics = {"monitoring-from-ns": expanded.value, "monitoring-through-ns": end.value,
+               "num-examples": 1, "train-last-target-ns": expanded.value - 1}
+    strategy._check_monitoring_interval(metrics, geometry, 1, 0)
+    with pytest.raises(ValueError, match="no respeta el histórico"):
+        strategy._check_monitoring_interval(metrics | {"monitoring-through-ns": end.value + 1}, geometry, 1, 0)
+    with pytest.raises(ValueError, match="cambió entre rondas"):
+        strategy._check_monitoring_interval(metrics | {"monitoring-from-ns": start.value}, geometry, 2, 0)
+    with pytest.raises(ValueError, match="utiliza targets de monitorización"):
+        strategy._check_monitoring_interval(metrics | {"train-last-target-ns": expanded.value}, geometry, 1, 0)
+
+
 def test_empty_early_round_is_explicit_and_not_averaged_as_an_update(arrival_prepared, tmp_path, flower_grid):
     path, _manifest = arrival_prepared
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=3,
@@ -269,7 +309,7 @@ def test_empty_new_block_keeps_weights_instead_of_replaying_old_data(arrival_raw
 
     monkeypatch.setattr(AuditedStrategy, "_save", record)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=3,
-                           hidden_size=8, batch_size=16, mlflow_tracking_uri="disabled")
+                           hidden_size=8, batch_size=32, pad_last_batch=0, mlflow_tracking_uri="disabled")
     output = run_server(flower_grid(settings, 2), settings)
     rounds = pd.read_csv(output / "round_metrics.csv").query("split == 'train'").set_index("round")
     assert rounds.loc[2, "num-targets"] > 0

@@ -73,7 +73,8 @@ def test_sampler_rejects_invalid_epoch_budget(cap):
         CompleteBatchSampler(13, 8, torch.Generator(), max_windows=cap)
 
 
-def test_centralized_training_draws_a_quota_per_station_and_mixes_batches():
+@pytest.mark.parametrize("pad_last_batch", [0, 1])
+def test_centralized_training_draws_a_quota_per_station_and_mixes_batches(pad_last_batch):
     inputs = torch.arange(23, dtype=torch.float32).reshape(-1, 1)
     actual = torch.ones(23, 1)
     boundaries = (0, 2, 8, 23)
@@ -81,11 +82,13 @@ def test_centralized_training_draws_a_quota_per_station_and_mixes_batches():
     model = torch.nn.Linear(1, 1)
     calls = []
     model.register_forward_pre_hook(lambda _, args: calls.append(args[0].flatten().tolist()))
-    settings = RunSettings(batch_size=8, local_epochs=3, early_stopping=0, lr_scheduler="none")
+    settings = RunSettings(batch_size=8, local_epochs=3, pad_last_batch=pad_last_batch,
+                           early_stopping=0, lr_scheduler="none")
     metrics = train_local(model, data, settings, torch.device("cpu"), 23, max_train_windows=5)
     seen = set()
     assert len(calls) == metrics["optimizer-steps"] == 6
     for a, b in zip(calls[::2], calls[1::2], strict=True):
+        assert len(a) == 8 and len(b) == (8 if pad_last_batch else 4)
         draws = a + b
         selected = set(draws[:12])
         assert [sum(low <= index < high for index in selected)
@@ -96,7 +99,7 @@ def test_centralized_training_draws_a_quota_per_station_and_mixes_batches():
     assert metrics["admissible-windows"] == 23
     assert metrics["unique-training-windows"] == len(seen) > metrics["num-examples"] == 12
     assert metrics["num-targets"] == 12
-    assert metrics["replacement-window-occurrences"] == 12
+    assert metrics["replacement-window-occurrences"] == 12 * pad_last_batch
 
 
 def test_target_support_uses_the_actual_epoch_draws_and_excludes_the_tail():
@@ -121,24 +124,31 @@ def test_target_support_uses_the_actual_epoch_draws_and_excludes_the_tail():
 
 
 @pytest.mark.parametrize("size,batch_size", [(3, 8), (11, 8), (8, 8)])
-def test_real_optimizer_batches_are_complete_and_federation_support_is_not_inflated(size, batch_size):
+@pytest.mark.parametrize("pad_last_batch", [0, 1])
+def test_optimizer_respects_batch_tail_policy_and_federation_support(size, batch_size, pad_last_batch):
     torch.manual_seed(2)
     actual = torch.arange(size * 2, dtype=torch.float32).reshape(size, 2)
     actual[::2, 1] = float("nan")
     data = TensorDataset(torch.randn(size, 3), actual)
-    settings = RunSettings(local_epochs=2, batch_size=batch_size, early_stopping=0, lr_scheduler="none")
+    settings = RunSettings(local_epochs=2, batch_size=batch_size, pad_last_batch=pad_last_batch,
+                           early_stopping=0, lr_scheduler="none")
     model = torch.nn.Linear(3, 2)
     calls = []
     model.register_forward_pre_hook(lambda _, args: calls.append(args[0].clone()))
     metrics = train_local(model, data, settings, torch.device("cpu"), 23)
     expected_batches = 2 * math.ceil(size / batch_size)
     assert len(calls) == metrics["optimizer-steps"] == expected_batches
-    assert all(len(batch) == batch_size for batch in calls)
+    expected_sizes = [batch_size] * math.ceil(size / batch_size)
+    if not pad_last_batch:
+        expected_sizes[-1] = size % batch_size or batch_size
+    assert list(map(len, calls)) == expected_sizes * 2
     assert metrics["num-examples"] == size
     assert metrics["num-targets"] == int(torch.isfinite(actual).sum())
-    assert metrics["sampled-window-occurrences"] == expected_batches * batch_size
-    assert metrics["replacement-window-occurrences"] == 2 * ((-size) % batch_size)
+    assert metrics["sampled-window-occurrences"] == sum(expected_sizes) * 2
+    assert metrics["replacement-window-occurrences"] == pad_last_batch * 2 * ((-size) % batch_size)
     assert metrics["sampled-target-occurrences"] >= 2 * metrics["num-targets"]
+    if not pad_last_batch:
+        assert metrics["sampled-target-occurrences"] == metrics["selected-target-occurrences"]
     # Only the true pre-replacement support is used for client aggregation.
     other = {"num-examples": 1, "num-targets": 1, "train-mse-normalized": 100.}
     pooled = aggregate_training([RecordDict({"metrics": MetricRecord(row)}) for row in (metrics, other)], "num-targets")
@@ -148,17 +158,18 @@ def test_real_optimizer_batches_are_complete_and_federation_support_is_not_infla
     )
 
 
-def test_replacement_preserves_gradients_under_microbatch_accumulation(monkeypatch):
+@pytest.mark.parametrize("pad_last_batch", [0, 1])
+def test_batch_tail_preserves_gradients_under_microbatch_accumulation(monkeypatch, pad_last_batch):
     data = TensorDataset(torch.randn(5, 4), torch.randn(5, 3))
     data.tensors[1][::2, 0] = float("nan")
     full = torch.nn.Linear(4, 3)
     micro = deepcopy(full)
-    settings = RunSettings(batch_size=8)
+    settings = RunSettings(batch_size=8, pad_last_batch=pad_last_batch)
     monkeypatch.setattr("fd_airquality.task._microbatch_size", lambda *_: 8)
     expected = train_local(full, data, settings, torch.device("cpu"), 19, .3)
     monkeypatch.setattr("fd_airquality.task._microbatch_size", lambda *_: 3)
     result = train_local(micro, data, settings, torch.device("cpu"), 19, .3)
-    assert expected["replacement-window-occurrences"] == result["replacement-window-occurrences"] == 3
+    assert expected["replacement-window-occurrences"] == result["replacement-window-occurrences"] == 3 * pad_last_batch
     assert expected["sampled-target-occurrences"] == result["sampled-target-occurrences"]
     for key, value in full.state_dict().items():
         torch.testing.assert_close(micro.state_dict()[key], value)

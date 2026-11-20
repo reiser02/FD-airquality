@@ -80,7 +80,7 @@ def test_default_matrix_includes_the_tiny_model_and_requires_opt_in_for_patchtst
 
 
 @pytest.mark.parametrize("filename,modes,seeds,folds", [
-    ("fd-airquality.toml", ["local", "centralized", "federated", "zero-shot"], [42], 3),
+    ("fd-airquality.toml", ["local", "centralized", "federated", "zero-shot"], [42], 4),
     ("experiments/smoke.toml", ["local", "centralized", "federated"], [42], 2),
 ])
 def test_shipped_backtest_configs_keep_modes_seeds_and_fold_counts(filename, modes, seeds, folds):
@@ -93,6 +93,18 @@ def test_shipped_backtest_configs_keep_modes_seeds_and_fold_counts(filename, mod
     assert preparation.folds == folds
     assert preparation.min_stations == 15
     assert not hasattr(preparation, "test_end")
+
+
+def test_main_config_shares_batch_budget_and_controls_in_all_training_modes():
+    root = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
+    for command in ("baseline", "simulate", "backtest"):
+        args = arguments([command, "--config", str(root)])
+        assert (args.batch_size, args.pad_last_batch, args.local_epochs, args.early_stopping_patience) == (32, 0, 40, 7)
+        assert (args.arrival_period_hours, args.federated_update_epochs) == (240, 20)
+        assert (args.round_validation_hours, args.round_validation_max_hours) == (24, 336)
+    data = arguments(["prepare-backtest", "--config", str(root)])
+    assert data.max_train_windows == 256 and data.station is None
+    assert (data.stride, data.train_stride) == (4, 4)
 
 
 def test_backtest_inherits_geometry_but_not_the_fixed_cuts_or_station_split_lengths(tmp_path):

@@ -1,4 +1,4 @@
-"""Training-only epoch sampling and batch completion."""
+"""Training-only epoch sampling and optional batch completion."""
 
 from __future__ import annotations
 
@@ -12,17 +12,19 @@ from fd_airquality.data import WindowDataset
 
 
 class CompleteBatchSampler(Sampler[list[int]]):
-    """Draw a fresh subset per group, then complete the tail from that subset."""
+    """Draw a fresh subset per group, with optional resampling to complete the tail."""
 
     def __init__(
         self, size: int, batch_size: int, generator: torch.Generator, *,
         max_windows: int | None = None, group_sizes: Sequence[int] | None = None,
+        pad_last_batch: bool = True,
     ):
         if size < 1 or batch_size < 1:
             raise ValueError("El muestreo requiere ventanas y batch_size positivos.")
         if max_windows is not None and (type(max_windows) is not int or max_windows < 1):
             raise ValueError("max_train_windows debe ser un entero positivo.")
         self.size, self.batch_size, self.generator = size, batch_size, generator
+        self.pad_last_batch = pad_last_batch
         self.group_sizes = (size,) if group_sizes is None else tuple(group_sizes)
         if any(n < 0 for n in self.group_sizes) or sum(self.group_sizes) != size:
             raise ValueError("Los grupos de entrenamiento no cubren el conjunto de ventanas.")
@@ -54,7 +56,7 @@ class CompleteBatchSampler(Sampler[list[int]]):
         for first in range(0, self.epoch_size, self.batch_size):
             batch = order[first:first + self.batch_size].tolist()
             missing = self.batch_size - len(batch)
-            if missing:
+            if missing and self.pad_last_batch:
                 fills = torch.randint(self.epoch_size, (missing,), generator=self.generator)
                 batch.extend((fills if self.epoch_size == self.size else order[fills]).tolist())
             yield batch

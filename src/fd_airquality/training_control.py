@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
 from torch.utils.data import Dataset
 
@@ -16,7 +17,7 @@ def controls_enabled(settings) -> bool:
 
 
 class ContextSupervisionDataset(Dataset):
-    """Keep monitoring values as input, never as autoencoder reconstruction labels."""
+    """Old and monitoring values may give context, but not reconstruction labels."""
 
     def __init__(self, dataset):
         self.dataset = dataset
@@ -27,9 +28,13 @@ class ContextSupervisionDataset(Dataset):
     def __getitem__(self, index):
         inputs, actual = self.dataset[index]
         times = self.dataset.context_timestamps(index)
-        lower, upper = self.dataset.monitoring_interval
-        allowed = (times < lower.value) | (times >= upper.value)
-        return inputs, actual, torch.from_numpy(allowed.copy())
+        allowed = np.ones_like(times, dtype=bool)
+        if self.dataset.arrival_lower is not None:
+            allowed &= times >= self.dataset.arrival_lower.value
+        if self.dataset.monitoring_interval is not None:
+            lower, upper = self.dataset.monitoring_interval
+            allowed &= (times < lower.value) | (times >= upper.value)
+        return inputs, actual, torch.from_numpy(allowed)
 
 
 class TrainingControl:

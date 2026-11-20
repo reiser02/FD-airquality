@@ -149,12 +149,13 @@ def test_actual_flower_fedavg_weights_by_valid_window_count(tmp_path, flower_ide
 
 
 @pytest.mark.parametrize("strategy_name", ["fedavg", "fedprox", "lora"])
+@pytest.mark.parametrize("pad_last_batch", [0, 1])
 def test_federation_uses_fractional_sampled_target_support_before_replacement(
-    tmp_path, monkeypatch, strategy_name, flower_identity,
+    tmp_path, monkeypatch, strategy_name, pad_last_batch, flower_identity,
 ):
     settings = (RunSettings(model="flowstate-r1", adaptation="lora") if strategy_name == "lora"
                 else RunSettings(strategy=strategy_name))
-    settings = replace(settings, local_epochs=2, batch_size=3)
+    settings = replace(settings, local_epochs=2, batch_size=3, pad_last_batch=pad_last_batch)
     manifest = {
         "schema_version": 6,
         "geometry": {"context": 6, "horizon": 2, "max_train_windows": 2},
@@ -179,8 +180,9 @@ def test_federation_uses_fractional_sampled_target_support_before_replacement(
             "metrics": MetricRecord({
                 "partition-id": partition, "num-examples": 2, "num-targets": selected / 2,
                 "admissible-windows": 12, "unique-training-windows": 3, "epochs-completed": 2,
-                "selected-target-occurrences": selected, "sampled-window-occurrences": 6,
-                "replacement-window-occurrences": 2, "sampled-target-occurrences": selected + repeated,
+                "selected-target-occurrences": selected, "sampled-window-occurrences": 4 + 2 * pad_last_batch,
+                "replacement-window-occurrences": 2 * pad_last_batch,
+                "sampled-target-occurrences": selected + repeated * pad_last_batch,
                 "train-mse-normalized": 1.,
             }),
         }), reply_to=request))
@@ -188,7 +190,12 @@ def test_federation_uses_fractional_sampled_target_support_before_replacement(
     assert metrics["num-targets"] == 6.
     for tensor in result.to_numpy_ndarrays():
         np.testing.assert_allclose(tensor, (2.5 * 2 + 3.5 * 10) / 6)
-    replies[0].content["metrics"]["num-targets"] = 3.0
+    station = replies[0].content["metrics"]
+    station["replacement-window-occurrences"] += 1
+    with pytest.raises(ValueError, match="Soporte de entrenamiento"):
+        strategy.aggregate_train(2, replies)
+    station["replacement-window-occurrences"] -= 1
+    station["num-targets"] = 3.0
     with pytest.raises(ValueError, match="Soporte de entrenamiento"):
         strategy.aggregate_train(2, replies)
 

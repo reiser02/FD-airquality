@@ -82,11 +82,10 @@ Esquema 6 registra política y límite autorizado de targets.
 
 Después de los filtros, cada época vuelve a sortear hasta `max-train-windows`
 ventanas distintas por estación desde el conjunto admisible completo. Sin cuota
-se recorren todas una vez. Solo se completa el último batch corto con reemplazo
-de la selección de esa época, sin introducir ventanas distintas adicionales.
+se recorren todas una vez. `[run].pad-last-batch = 0` conserva el último lote
+corto sin repetir ni descartar ventanas; solo se rellena si se activa la opción.
 No se repiten ventanas al evaluar. Con `masked`, la agregación federada usa el
-promedio del soporte observado por época **antes del reemplazo**; las ocurrencias
-muestreadas y repetidas se informan aparte. Consulta
+promedio del soporte observado por época sin contar el posible relleno. Consulta
 [las reglas completas](TRAINING_CONTROLS.md).
 
 ## Normalización sin fuga
@@ -169,8 +168,9 @@ cada fold sigue teniendo un histórico autorizado mayor, pero un modelo nuevo.
 
 ```toml
 [prepare-backtest]
-folds = 3                   # usa 1 para una sola evaluación temporal
+folds = 4                   # usa 1 para una sola evaluación temporal
 min-stations = 15           # mínimo del panel común si se usan todas
+max-train-windows = 256     # por estación y época
 validation-hours = 672      # objetivo por fold (28 días)
 test-hours = 672            # objetivo por fold (28 días)
 train-history = "expanding"  # opción normal; solo se amplían los datos
@@ -279,7 +279,7 @@ num-server-rounds = 3
 arrival-period-hours = 24
 ```
 
-Si el entrenamiento del fold acaba el 9 de enero a las 00:00:
+Ejemplo de bloques de 24 h si el entrenamiento acaba el 9 de enero a las 00:00:
 
 | Ronda | Información disponible, extremo exclusivo | Targets usados para ajustar |
 |---|---|---|
@@ -287,9 +287,11 @@ Si el entrenamiento del fold acaba el 9 de enero a las 00:00:
 | 2 | Antes del 8 de enero, 00:00 | Solo `[7 de enero, 8 de enero)` |
 | 3 | Antes del 9 de enero, 00:00 | Solo `[8 de enero, 9 de enero)` |
 
-La primera ronda recibe un histórico inicial; las siguientes incorporan 24 horas
-de calendario. No se divide todo el histórico en partes iguales: el reloj mantiene
-un prefijo inicial y `num-server-rounds - 1` incrementos diarios. No se fijan
+La configuración principal usa cinco rondas, bloques de **240 horas** y hasta
+**40 épocas** en la primera ronda y **20** por bloque posterior mediante
+`federated-update-epochs`. No se divide todo el histórico en partes iguales:
+el reloj mantiene un prefijo inicial y `num-server-rounds - 1` incrementos
+del tamaño configurado. No se fijan
 cantidades iguales de ventanas por cliente, porque la disponibilidad puede variar.
 
 ```text
@@ -303,7 +305,7 @@ pesos globales agregados de la ronda anterior, no una inicialización nueva. Ada
 sí se reinicia en cada ronda, como antes.
 
 El contexto puede reutilizar observaciones antiguas: no son targets de ajuste
-de esa ronda. Con `window-padding="none"`, el horizonte completo debe quedar
+ni etiquetas de reconstrucción en esa ronda. Con `window-padding="none"`, el horizonte completo debe quedar
 dentro de su bloque y haber llegado, incluso si su último target está ausente.
 Con `right` o `both`, puede prolongarse a la derecha, pero solo se supervisan
 sus posiciones dentro del bloque y anteriores al corte; las demás quedan NaN.
@@ -326,9 +328,9 @@ ventanas crezca: normalmente baja tras el histórico inicial y luego depende de
 cada bloque. La cuota de cada época se aplica después del corte y el filtro
 de disponibilidad. Se registran ventanas admisibles, sorteadas por época y
 distintas visitadas entre todas las épocas de la ronda.
-Dentro de un bloque, las ventanas pueden solaparse, `local-epochs` puede hacer
-varias pasadas y el sampler puede repetirlas para completar un lote; lo que no
-se repite son los bloques de targets entre rondas.
+Dentro de un bloque, las ventanas pueden solaparse y se puede hacer más de una
+época. Con el TOML principal el lote corto no se rellena. No se repiten los
+bloques de targets entre rondas.
 Las ausencias pueden hacer que lleguen horas sin nuevas ventanas admisibles.
 
 El servidor envía los extremos del bloque y comprueba el intervalo devuelto:
@@ -342,7 +344,8 @@ inactivos no influyen en los pesos. La validación completa
 del fold no se consulta hasta terminar su flujo de entrenamiento; en este modo
 no se hace early stopping con validación futura durante las llegadas.
 El control de épocas locales utiliza una reserva causal del prefijo inicial,
-excluida de gradientes y del ajuste del scaler fijo. No cancela rondas posteriores.
+excluida de gradientes y del ajuste del scaler fijo. Si faltan observaciones, se
+puede ampliar hacia atrás hasta `round-validation-max-hours`. No cancela rondas posteriores.
 Consulta [los controles de entrenamiento](TRAINING_CONTROLS.md).
 
 `arrival-period-hours = 0` desactiva expresamente la simulación dentro del fold.

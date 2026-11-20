@@ -27,6 +27,7 @@ from fd_airquality.training_control import ContextSupervisionDataset, TrainingCo
     {"early_stopping_min_delta": -1.}, {"lr_scheduler": "unknown"},
     {"lr_scheduler_patience": -1}, {"lr_scheduler_factor": 1.},
     {"lr_scheduler_factor": 0.}, {"min_learning_rate": 0.}, {"min_learning_rate": .1},
+    {"pad_last_batch": 2}, {"federated_update_epochs": -1}, {"round_validation_max_hours": 23},
 ])
 def test_training_control_settings_reject_invalid_values(options):
     with pytest.raises(ValueError):
@@ -150,18 +151,32 @@ def test_federated_monitor_requires_observed_past_not_future_fallback(arrival_ra
     assert len(artifact["validation_starts"]) > 0
     with pytest.raises(ValueError, match="Sin ventanas observadas"):
         round_validation_view(artifact, manifest["geometry"], settings)
+    # The optional fallback uses only earlier observed targets, excluded from gradients and scaling.
+    settings = replace(settings, round_validation_max_hours=48, normalization="fixed")
+    geometry = manifest["geometry"]
+    lower, cutoff = round_validation_bounds(geometry, settings, artifact)
+    local = normalization_artifact(artifact, geometry, settings)
+    view = round_validation_view(local, geometry, settings)
+    assert lower < pd.Timestamp("2025-01-06")
+    assert cutoff == pd.Timestamp("2025-01-07")
+    assert view.target_time_bounds()[0] == lower.value
+    assert view.target_time_bounds()[1] < cutoff.value
+    assert local["normalization_reference_mask"].any()
+    assert not local["normalization_reference_mask"][local["timestamps"] >= lower.value].any()
+    assert training_view(local, geometry, settings, 1).target_time_bounds()[1] < lower.value
 
 
 @pytest.mark.parametrize("padding", ["none", "both"])
-def test_monitoring_labels_are_not_reused_by_autoencoder_auxiliary_loss(arrival_raw, tmp_path, padding):
+@pytest.mark.parametrize("epochs", [1, 8])
+def test_old_labels_are_not_reused_by_autoencoder_auxiliary_loss(arrival_raw, tmp_path, padding, epochs):
     raw, config = arrival_raw
     path = prepare(raw, tmp_path / "prepared", "PM25", replace(config, window_padding=padding))
     manifest, artifact = load_client_data(str(path), 0)
-    settings = RunSettings(model="autoencoder", local_epochs=8, num_server_rounds=3)
+    settings = RunSettings(model="autoencoder", local_epochs=epochs, num_server_rounds=3)
     geometry = manifest["geometry"]
     train = training_view(artifact, geometry, settings, 2)
-    # The first new target is at the upper edge of the reserve, the next starts
-    # three hours later. Their contexts are respectively all/partly reserved.
+    # The first target is at the lower edge of the new block, the next starts
+    # three hours later. Previous-block context can give inputs, never labels.
     protected = ContextSupervisionDataset(train)
     for index, allowed_labels in ((0, [False] * 6), (1, [False] * 3 + [True] * 3)):
         inputs, actual, allowed = protected[index]
@@ -169,6 +184,10 @@ def test_monitoring_labels_are_not_reused_by_autoencoder_auxiliary_loss(arrival_
         torch.testing.assert_close(inputs, expected_inputs, equal_nan=True)
         torch.testing.assert_close(actual, expected_actual, equal_nan=True)
         assert allowed.tolist() == allowed_labels
+    if epochs > 1:
+        initial_train = training_view(artifact, geometry, settings, 1)
+        initial = ContextSupervisionDataset(initial_train)
+        assert initial[-1][2].all()
 
 
 @pytest.mark.parametrize(("mode", "model_name", "padding"), [
@@ -199,6 +218,11 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
     assert train["learning-rate-reductions"].eq(2).all()
     assert train["num-examples"].eq(10 if mode == "centralized" else 5).all()
     assert train["replacement-window-occurrences"].eq(12 if mode == "centralized" else 6).all()
+    if mode == "federated":
+        cutoff = round_cutoff(json.loads(path.read_text())["geometry"], settings, 1)
+        assert train["monitoring-through-ns"].eq(cutoff.value).all()
+        initial = train.loc[train["round"] == 1]
+        assert (initial["train-last-target-ns"] < initial["monitoring-from-ns"]).all()
     if mode != "centralized":
         assert train["learning-rate-final"].eq(settings.learning_rate / 4).all()
     run = json.loads((output / "run.json").read_text())

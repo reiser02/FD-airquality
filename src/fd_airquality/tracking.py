@@ -18,6 +18,7 @@ from pathlib import Path
 
 import torch
 
+from fd_airquality.arrival import round_epoch_limit
 from fd_airquality.artifacts import file_digest
 from fd_airquality.calibration import (
     ESTIMATED_LEVELS,
@@ -56,7 +57,7 @@ _TRACKED_METRICS = {
     "train": (
         "train-seconds", "peak-cuda-allocated-mib", "trainable-parameters",
         "uplink-tensor-bytes", "downlink-tensor-bytes", "global-state-tensor-bytes",
-        "server-aggregation-seconds", "server-aggregation-cuda",
+        "server-aggregation-seconds", "server-aggregation-cuda", "replacement-window-occurrences",
     ),
     "validation": _EVALUATION_METRICS,
     "test": _EVALUATION_METRICS,
@@ -193,6 +194,10 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                             for index in range(torch.cuda.device_count())]
     progressive = bool(mode == "federated" and settings.arrival_period_hours
                        and manifest["geometry"].get("split_mode") == "global")
+    update_epochs = (
+        round_epoch_limit(manifest["geometry"], settings, 2)
+        if progressive and settings.num_server_rounds > 1 else None
+    )
     metadata = model_metadata(manifest["geometry"], settings)
     (output / "run.json").write_text(json.dumps({
         "mode": mode, "settings": asdict(settings),
@@ -218,7 +223,8 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "evaluation_padding": "none",
             "training_window_sampling": "resample_without_replacement_each_epoch",
             "max_train_windows_per_station_per_epoch": manifest["geometry"].get("max_train_windows"),
-            "short_training_batch": "fill_with_replacement_from_current_epoch_selection",
+            "short_training_batch": ("fill_with_replacement_from_current_epoch_selection"
+                                     if settings.pad_last_batch else "keep_without_replacement"),
             "federation_weight": ("mean_observed_targets_per_epoch_before_replacement"
                                   if manifest.get("schema_version", 4) >= 5 else "windows_per_epoch"),
         },
@@ -235,6 +241,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         "training_budget": {
             "stages": 0 if mode == "zero-shot" or settings.model in STATION_CONTROLS else settings.num_server_rounds,
             "epochs_per_stage": settings.local_epochs,
+            "federated_update_epochs": update_epochs,
             "optimizer_reset_each_stage": True,
         },
         "training_controls": {
@@ -249,6 +256,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "min_lr": settings.min_learning_rate,
             "federated_monitor": "fixed_reserve_before_round_one" if progressive else None,
             "round_validation_hours": settings.round_validation_hours if progressive else None,
+            "round_validation_max_hours": settings.round_validation_max_hours if progressive else None,
             "single_epoch_budget": settings.local_epochs == 1,
         },
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -308,7 +316,7 @@ class RunTracker:
         if settings.normalization != "none":
             keys.append("scaler_type")
         if self.mode != "zero-shot" and settings.model not in STATION_CONTROLS:
-            keys.extend(("num_server_rounds", "local_epochs", "batch_size", "learning_rate", "weight_decay"))
+            keys.extend(("num_server_rounds", "local_epochs", "batch_size", "pad_last_batch", "learning_rate", "weight_decay"))
         if self.mode == "federated":
             keys.append("strategy")
             if settings.strategy == "fedprox":
@@ -324,6 +332,10 @@ class RunTracker:
             "num_clients": len(self.manifest["clients"]),
             "missing_policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
         }
+        if self.mode == "federated" and geometry.get("split_mode") == "global":
+            params["arrival_period_hours"] = settings.arrival_period_hours
+            if settings.arrival_period_hours and settings.num_server_rounds > 1:
+                params["federated_update_epochs"] = round_epoch_limit(geometry, settings, 2)
         for key in ("revision", "inference_parameters", "inference_macs"):
             if key in metadata:
                 params[f"model.{key}"] = metadata[key]

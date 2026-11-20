@@ -15,9 +15,9 @@ context = 90
 # Horas futuras que predice cada ventana.
 horizon = 12
 # Separación en horas entre ventanas de validación/test; no debe superar horizon.
-stride = 6
+stride = 4
 # Separación en horas entre ventanas de entrenamiento; un valor mayor reduce solapamiento.
-train-stride = 6
+train-stride = 4
 # Mínimo de ventanas admisibles para incluir una estación; independiente de la cuota por época.
 min-train-windows = 16
 # Mínimo de ventanas de validación para incluir una estación.
@@ -102,13 +102,13 @@ test-hours = 96
 # output-dir = "reports/experimentos"
 # Rondas federadas o etapas de entrenamiento de los controles no federados por candidato y fold.
 num-server-rounds = 5
-# Máximo de épocas por ajuste de cliente o por etapa de un baseline entrenado.
-local-epochs = 50
+# Máximo de épocas en el ajuste inicial de cada cliente o por etapa de un baseline entrenado.
+local-epochs = 40
 # 1 permite parar por MSE de validación interna; 0 desactiva la parada.
 # Ni la parada ni el scheduler se aplican con local-epochs = 1.
 early-stopping = 1
 # Épocas consecutivas sin mejora antes de parar y restaurar los mejores pesos.
-early-stopping-patience = 5
+early-stopping-patience = 7
 # Mejora absoluta mínima de MSE (unidades al cuadrado), también usada por el scheduler.
 early-stopping-min-delta = 0.0
 # "plateau" usa ReduceLROnPlateau de PyTorch con ese MSE; "none" lo desactiva.
@@ -122,8 +122,13 @@ min-learning-rate = 0.000001
 # En federado con llegadas y control de épocas: horas reservadas para monitorizar
 # antes de la primera ronda. Se usa al menos horizon y no se entrena con esos targets.
 round-validation-hours = 24
-# Ventanas por actualización; el último lote corto se completa repitiendo ventanas de esa época.
-batch-size = 128
+# Si falta cobertura, permite ampliar hacia atrás la reserva de esa estación hasta este límite.
+# 0 desactiva la ampliación; nunca se consulta el bloque nuevo ni la validación o el test.
+round-validation-max-hours = 336
+# Máximo de ventanas por actualización para todos los modelos y modos.
+batch-size = 32
+# 0 conserva el último lote aunque sea corto. 1 lo completa con ventanas de la misma época.
+pad-last-batch = 0
 # Tasa de aprendizaje de AdamW.
 learning-rate = 0.001
 # Penalización weight decay de AdamW; 0 la desactiva.
@@ -218,9 +223,11 @@ training-data-availability-threshold = [0.0, 0.0]
 # Alternativa avanzada: mapa JSON en una cadena TOML; si se indica, reemplaza [availability].
 # training-availability = '{"mlp": [0.5, 1.0]}'
 # Horas de calendario por bloque nuevo en federado con cortes globales; 0 desactiva las llegadas.
-# Primera ronda: histórico inicial. Las siguientes ajustan solo con targets del bloque nuevo,
-# conservando los pesos agregados.
-arrival-period-hours = 24
+# Primera ronda: histórico inicial. Las siguientes ajustan solo con datos nuevos de cada
+# bloque (10 días), conservando los pesos agregados. El histórico solo puede dar contexto.
+arrival-period-hours = 240
+# Tope adicional de épocas solo para rondas federadas con bloques nuevos. 0 usa local-epochs.
+federated-update-epochs = 20
 
 [missing]
 # Política de contexto por modelo cuando missing-policy = "auto"; nunca se imputan targets.
@@ -273,7 +280,9 @@ output = "data/backtests"
 # INFO muestra el reparto; DEBUG añade detalles por estación. Los avisos y errores se guardan en el log.
 # log-level = "INFO"
 # Número de folds; usa 1 para un solo corte. El calendario se calcula a partir de los CSV.
-folds = 3
+folds = 4
+# Cuota de ventanas distintas de entrenamiento por estación y época.
+max-train-windows = 256
 # Mínimo de estaciones en el panel común al usar todas. Con una selección explícita basta una.
 min-stations = 15
 # Horas objetivo de validación y test por fold (672 = 28 días cada uno). Se reducen si no caben.

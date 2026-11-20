@@ -14,7 +14,7 @@ from flwr.app import ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDic
 from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg, FedProx, Strategy
 
-from fd_airquality.arrival import round_bounds
+from fd_airquality.arrival import round_bounds, round_epoch_limit, round_validation_bounds
 from fd_airquality.calibration import calibration_enabled
 from fd_airquality.federated_adapters import aggregate_adapter_updates
 from fd_airquality.models import GRANITE, checkpoint_payload
@@ -61,7 +61,8 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
     return MetricRecord(metrics)
 
 
-def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: bool, settings, horizon: int) -> None:
+def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: bool, settings, horizon: int,
+                             epoch_limit: int) -> None:
     admissible = metrics["admissible-windows"]
     selected = metrics["num-examples"]
     unique = metrics["unique-training-windows"]
@@ -69,14 +70,15 @@ def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: 
     if not (0 <= admissible <= available and (dynamic or admissible == available)
             and selected == (min(admissible, cap) if cap is not None else admissible)
             and selected <= unique <= min(admissible, selected * epochs)
-            and int(selected > 0) <= epochs <= (settings.local_epochs if selected else 0)):
+            and int(selected > 0) <= epochs <= (epoch_limit if selected else 0)):
         raise ValueError("Número de ventanas o épocas incompatible con el presupuesto de muestreo.")
     sampled = metrics["sampled-window-occurrences"]
     replacement = metrics["replacement-window-occurrences"]
     originals = selected * epochs
     targets = metrics["selected-target-occurrences"]
     repeated_targets = metrics["sampled-target-occurrences"] - targets
-    if (replacement != (-selected) % settings.batch_size * epochs
+    expected_replacements = (-selected) % settings.batch_size * epochs if settings.pad_last_batch else 0
+    if (replacement != expected_replacements
             or sampled != originals + replacement
             or not originals <= targets <= originals * horizon
             or not replacement <= repeated_targets <= replacement * horizon
@@ -193,6 +195,7 @@ class AuditedStrategy(Strategy):
         self.station_history: list[dict] = []
         self.runtime_nodes: dict[int, int] = {}
         self.validation_support: dict[int, tuple[int, int]] = {}
+        self.monitoring_intervals: dict[int, tuple[int, int]] = {}
         self.trained_targets = 0
 
     def summary(self) -> None:
@@ -201,10 +204,12 @@ class AuditedStrategy(Strategy):
     def configure_train(
         self, server_round: int, arrays: ArrayRecord, config: ConfigRecord, grid: Grid
     ) -> Iterable[Message]:
+        geometry = self.manifest["geometry"]
         report_progress("train", f"round={server_round}/{self.settings.num_server_rounds} "
+                        f"max_epochs={round_epoch_limit(geometry, self.settings, server_round)} "
                         f"waiting_clients={len(self.manifest['clients'])}; clientes gestionados por Ray")
         self.current_arrays = arrays
-        lower, cutoff = round_bounds(self.manifest["geometry"], self.settings, server_round)
+        lower, cutoff = round_bounds(geometry, self.settings, server_round)
         if cutoff is not None:
             config = ConfigRecord(dict(config) | {"available-through-ns": cutoff.value})
             if lower is not None:
@@ -257,6 +262,22 @@ class AuditedStrategy(Strategy):
                                   dst_node_id=node, message_type=message.metadata.message_type))
         return result
 
+    def _check_monitoring_interval(self, metrics, geometry, server_round, partition) -> None:
+        bounds = round_validation_bounds(geometry, self.settings)
+        if bounds is None:
+            return
+        start, end = bounds
+        earliest = min(start, end - pd.Timedelta(hours=self.settings.round_validation_max_hours))
+        if geometry.get("train_start"):
+            earliest = max(earliest, pd.Timestamp(geometry["train_start"]))
+        lower, upper = metrics.get("monitoring-from-ns"), metrics.get("monitoring-through-ns")
+        if type(lower) is not int or upper != end.value or not earliest.value <= lower <= start.value:
+            raise ValueError("La reserva de monitorización no respeta el histórico de la primera ronda.")
+        if self.monitoring_intervals.setdefault(partition, (lower, upper)) != (lower, upper):
+            raise ValueError("La reserva de monitorización cambió entre rondas.")
+        if server_round == 1 and metrics["num-examples"] and metrics["train-last-target-ns"] >= lower:
+            raise ValueError("El entrenamiento inicial utiliza targets de monitorización.")
+
     def _check_panel(self, replies: Iterable[Message], split: str, server_round: int = 0) -> list[Message]:
         replies = list(replies)
         expected = set(range(len(self.manifest["clients"])))
@@ -297,11 +318,13 @@ class AuditedStrategy(Strategy):
                         raise ValueError("Un target de entrenamiento aún no ha llegado.")
                     if lower is not None and first < lower.value:
                         raise ValueError("Un target de entrenamiento pertenece a un bloque anterior.")
+                self._check_monitoring_interval(metrics, geometry, server_round, partition)
             if any(not np.isfinite(value) for value in metrics.values()):
                 raise ValueError("Una estación devolvió métricas no finitas.")
             if split == "train":
                 if "admissible-windows" in metrics:
-                    _check_training_sampling(metrics, available, cap, dynamic, self.settings, horizon)
+                    epochs = round_epoch_limit(geometry, self.settings, server_round)
+                    _check_training_sampling(metrics, available, cap, dynamic, self.settings, horizon, epochs)
                 arrays = reply.content["arrays"].to_numpy_ndarrays()
                 if any(not np.isfinite(array).all() for array in arrays):
                     raise ValueError("Una estación devolvió pesos no finitos.")
