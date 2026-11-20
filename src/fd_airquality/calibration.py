@@ -108,7 +108,7 @@ def residual_calibration(actual, prediction, min_pairs: int, *, target_positions
 @torch.no_grad()
 def point_calibration(model, artifact, geometry, settings, device) -> Calibration:
     data = validation_view(artifact, geometry, settings, calibration=True)
-    model.eval()
+    model.to(device).eval()
     forecasts = [forecast(model, x.to(device), settings).to("cpu", torch.float64).numpy()
                  for x, _ in DataLoader(data, batch_size=settings.batch_size)]
     points = np.concatenate(forecasts) if forecasts else np.empty((0, data.horizon))

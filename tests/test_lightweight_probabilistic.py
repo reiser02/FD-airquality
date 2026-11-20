@@ -1,6 +1,7 @@
 import json
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pandas as pd
@@ -157,6 +158,22 @@ def test_calibration_and_selection_cannot_share_targets_or_read_test(global_prep
     after = point_calibration(model, artifact | {"values": changes}, geometry, settings, torch.device("cpu"))
     assert before.offsets is not None
     np.testing.assert_array_equal(before.offsets, after.offsets)
+
+
+def test_point_calibration_places_fresh_model_on_evaluation_device(global_prepared, monkeypatch):
+    path, manifest = global_prepared
+    _, artifact = load_client_data(str(path), 0)
+    geometry = manifest["geometry"]
+    settings = RunSettings(model="autoencoder", probabilistic=1, calibrate_point_forecasts=1,
+                           calibration_min_pairs=2)
+    model = make_model(geometry, settings)
+    move = Mock(wraps=model.to)
+    monkeypatch.setattr(model, "to", move)
+    device = torch.device("cpu")
+    result = point_calibration(model, artifact, geometry, settings, device)
+    move.assert_called_once_with(device)
+    assert result.offsets is not None
+    assert np.isfinite(result.offsets).all()
 
 
 def test_weekly_scoring_respects_the_panel_and_uses_origin_week():
