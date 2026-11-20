@@ -13,6 +13,7 @@ from torch import nn
 
 from fd_airquality.availability import availability_threshold
 from fd_airquality.missing import impute_context
+from fd_airquality.probabilistic import rearrange_around_median
 
 NEURALFORECAST_REVISION = "69e431413b22cbb1a74d35db2fa7994092ce0ea4"
 NEURAL_MODELS = ("mlp", "nlinear", "nlinear-point", "nhits")
@@ -102,7 +103,7 @@ class NeuralForecaster(nn.Module):
         squared = (point[observed] - target[observed]).square().sum()
         return loss, squared
 
-    def forecast_distribution(self, inputs, *, missing_policy="native"):
+    def _raw_distribution(self, inputs, missing_policy):
         batch, _, _ = self._prepare(inputs, missing_policy=missing_policy)
         output = self._predict_normalized(batch)
         output = self.module._inv_normalization(output, y_idx=0)
@@ -111,8 +112,17 @@ class NeuralForecaster(nn.Module):
             return quantiles[..., self.quantile_levels.index(.5)], quantiles, self.quantile_levels
         return output[..., 0], None, None
 
+    def forecast_distribution_with_raw(self, inputs, *, missing_policy="native"):
+        point, raw, levels = self._raw_distribution(inputs, missing_policy)
+        quantiles = rearrange_around_median(raw, levels.index(.5)) if raw is not None else None
+        return point, quantiles, levels, raw
+
+    def forecast_distribution(self, inputs, *, missing_policy="native"):
+        point, quantiles, levels, _ = self.forecast_distribution_with_raw(inputs, missing_policy=missing_policy)
+        return point, quantiles, levels
+
     def forward(self, inputs, *, missing_policy="native"):
-        return self.forecast_distribution(inputs, missing_policy=missing_policy)[0]
+        return self._raw_distribution(inputs, missing_policy)[0]
 
     def export_state(self):
         # Fixed quantile levels are loss configuration, never federated weights.

@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from fd_airquality.comparison import compare_runs
+from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 
 
 @pytest.fixture
@@ -125,6 +126,27 @@ def test_seed_summary_averages_repeated_seeds_before_reporting_variability(compl
     assert summary.iloc[0]["num_runs"] == 3
     assert summary.iloc[0]["macro-mase-mean"] == 4.5
     assert summary.iloc[0]["macro-mase-std"] == pytest.approx(np.std([3., 6.], ddof=1))
+
+
+def test_probabilistic_comparison_labels_and_warns_about_changed_postprocessing(completed_run, tmp_path):
+    paths = [completed_run("historical"), completed_run("rearranged")]
+    for path, crossings in zip(paths, (19, 0), strict=True):
+        result_path = path / "test_metrics.json"
+        result = json.loads(result_path.read_text())
+        result["test"].update(crps=2., **{"quantile-crossings": crossings})
+        result_path.write_text(json.dumps(result))
+    metadata_path = paths[1] / "run.json"
+    metadata = json.loads(metadata_path.read_text())
+    metadata["probabilistic_protocol"] = {"quantile_postprocessing": MEDIAN_ANCHORED_REARRANGEMENT}
+    metadata_path.write_text(json.dumps(metadata))
+
+    output = compare_runs(paths, tmp_path / "comparison")
+    rows = pd.read_csv(output / "comparison.csv")
+    assert rows["quantile_postprocessing"].tolist() == ["none", MEDIAN_ANCHORED_REARRANGEMENT]
+    assert rows["quantile-crossings"].tolist() == [19, 0]
+    assert any("diferencia de CRPS" in warning
+               for warning in json.loads((output / "comparison.json").read_text())["warnings"])
+    assert len(pd.read_csv(output / "seed_summary.csv")) == 2
 
 
 @pytest.mark.parametrize("changed", ["model", "application_sources", "versions"])

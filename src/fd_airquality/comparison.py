@@ -13,12 +13,16 @@ import pandas as pd
 from fd_airquality.missing import resolve_missing_policy
 
 _MACRO_ERRORS = ("macro-mase", "macro-rmsse")
+_COMPARISON_METRICS = (*_MACRO_ERRORS, "crps", "macro-scaled-crps")
 _REPORT_METRICS = (
     *_MACRO_ERRORS, "pooled-mase", "pooled-rmsse", "mean-mase", "mean-rmsse",
     "num-clients", "num-examples", "num-targets", "num-target-slots", "target-coverage",
     "macro-mase-stations", "macro-rmsse-stations", "mase-count", "rmsse-count",
     "bias", "missing-targets", "missing-context-values", "negative-prediction-fraction",
     "probabilistic-available", "crps", "crps-count", "wis", "mean-quantile-loss", "quantile-count",
+    "macro-scaled-crps", "macro-scaled-crps-stations", "scaled-crps-count",
+    "scaled-crps-eligible-stations", "scaled-crps-eligible-targets",
+    "quantile-crossings", "quantile-raw-crossings", "interval-80-coverage", "interval-90-coverage",
     "robust-num-clients",
 )
 
@@ -56,7 +60,7 @@ def _metric_difference(metric: str, value_a: float, value_b: float) -> dict:
 
 def _write_pairwise(rows: list[dict], output: Path) -> None:
     pairs = []
-    metrics = (*_MACRO_ERRORS, "crps") if any("crps" in row for row in rows) else _MACRO_ERRORS
+    metrics = (*_MACRO_ERRORS, *(key for key in _COMPARISON_METRICS[2:] if any(key in row for row in rows)))
     for a, b in permutations(range(len(rows)), 2):
         identity = {"run_a": rows[a]["run"], "run_b": rows[b]["run"]}
         for metric in metrics:
@@ -72,6 +76,7 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
     if len(paths) < (1 if allow_single else 2) or len({path.resolve() for path in paths}) != len(paths):
         raise ValueError("Indica al menos dos ejecuciones diferentes y completas.")
     runs, rows, blocks, warnings = [], [], [], []
+    probabilistic_protocols = {}
     for path in paths:
         run = json.loads((path / "run.json").read_text(encoding="utf-8"))
         result = json.loads((path / "test_metrics.json").read_text(encoding="utf-8"))
@@ -96,6 +101,14 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         adaptation = run.get("model", {}).get("adaptation", "full")
         label = f"{model}/{adaptation}/{run['settings']['strategy'] if mode == 'federated' else mode}/{path.name}"
         metrics = result["test"]
+        protocol = run.get("probabilistic_protocol", {})
+        quantile_postprocessing = protocol.get("quantile_postprocessing", "none")
+        if "crps" in metrics:
+            if probabilistic_protocols.setdefault(model, quantile_postprocessing) != quantile_postprocessing:
+                warnings.append(f"Posprocesado de cuantiles distinto para {model}: {path}. "
+                                "La diferencia de CRPS puede deberse al posprocesado.")
+        else:
+            quantile_postprocessing = None
         expected = len(run["manifest"]["clients"])
         if metrics["num-clients"] != expected or not all(np.isfinite(value) for value in metrics.values()):
             raise ValueError(f"Test incompleto o no finito: {path}")
@@ -123,6 +136,9 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
             "revision": run.get("model", {}).get("revision"),
             "selection_metric": result.get("selection_metric"),
             "missing_policy": _missing_policy(run),
+            "quantile_postprocessing": quantile_postprocessing,
+            "quantile_source": protocol.get("quantile_source"),
+            "quantile_levels": json.dumps(protocol["quantile_levels"]) if protocol.get("quantile_levels") else None,
             "candidate_configuration": sha256(json.dumps({
                 "settings": {key: value for key, value in run["settings"].items()
                              if key not in {"seed", "output_dir", "manifest", "mlflow_tracking_uri",
@@ -130,11 +146,16 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
                 "mode": mode, "manifest": run["manifest_sha256"], "model": run.get("model"),
                 "application_sources": run.get("application_sources"), "versions": run["versions"],
                 "granite_source": run.get("granite_source"),
+                "probabilistic_protocol": run.get("probabilistic_protocol"),
             }, sort_keys=True).encode()).hexdigest(),
             "strategy": run["settings"]["strategy"] if mode == "federated" else "none",
             "selected_round": result["selected_round"], **scores,
         })
         runs.append(run)
+    grids = {row["quantile_levels"] for row in rows if "crps" in row and row["quantile_levels"]}
+    if len(grids) > 1:
+        warnings.append("CRPS: las rejillas de cuantiles se conservan por modelo; "
+                        "las comparaciones incluyen el efecto de la discretización.")
     for row, run in zip(rows, runs, strict=True):
         references = [ref for ref, reference_run in zip(rows, runs, strict=True)
                        if ref["model"] == row["model"] and ref["mode"] == "zero-shot"
@@ -177,13 +198,16 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
 
 def _write_seed_summary(rows: list[dict], output: Path) -> None:
     frame = pd.DataFrame(rows)
-    metrics = [name for name in (*_MACRO_ERRORS, "crps") if name in frame]
+    metrics = [name for name in _COMPARISON_METRICS if name in frame]
     summaries = []
     for signature, group in frame.groupby("candidate_configuration", sort=False):
         by_seed = group.groupby("seed", dropna=False)[metrics].mean()
         identity = {key: group.iloc[0][key] for key in ("model", "mode", "adaptation", "strategy", "lora_rank", "missing_policy")}
         row = identity | {"candidate_configuration": signature, "num_seeds": len(by_seed), "num_runs": len(group)}
         for metric in metrics:
-            row.update({f"{metric}-mean": by_seed[metric].mean(), f"{metric}-std": by_seed[metric].std(ddof=1)})
+            values = by_seed[metric]
+            complete = values.notna().all() if metric in {"crps", "macro-scaled-crps"} else True
+            row.update({f"{metric}-mean": values.mean() if complete else np.nan,
+                        f"{metric}-std": values.std(ddof=1) if complete else np.nan})
         summaries.append(row)
     pd.DataFrame(summaries).to_csv(output / "seed_summary.csv", index=False)

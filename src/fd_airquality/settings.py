@@ -46,6 +46,8 @@ class RunSettings:
     missing_policies: str = "{}"
     deterministic: int = 0
     probabilistic: int = 0
+    calibrate_point_forecasts: int = 0
+    calibration_min_pairs: int = 20
     training_data_availability_threshold: str = "0.0"
     training_availability: str = "{}"
     normalization: str = "window"
@@ -134,6 +136,10 @@ class RunSettings:
             raise ValueError("deterministic debe ser 0/1.")
         if type(self.probabilistic) is not int or self.probabilistic not in {0, 1}:
             raise ValueError("probabilistic debe ser 0/1.")
+        if type(self.calibrate_point_forecasts) is not int or self.calibrate_point_forecasts not in {0, 1}:
+            raise ValueError("calibrate_point_forecasts debe ser 0/1.")
+        if type(self.calibration_min_pairs) is not int or self.calibration_min_pairs < 2:
+            raise ValueError("calibration_min_pairs debe ser un entero >= 2.")
         if not isfinite(self.heartbeat_seconds) or self.heartbeat_seconds <= 0:
             raise ValueError("heartbeat_seconds debe ser finito y positivo.")
         if self.log_level not in {"DEBUG", "INFO", "WARNING", "ERROR"}:

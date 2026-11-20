@@ -26,7 +26,7 @@ def test_flower_rounds_write_metrics_and_checkpoints(prepared, tmp_path, flower_
         manifest=str(path), output_dir=str(tmp_path / "reports"),
         num_server_rounds=2, hidden_size=8, strategy=strategy, batch_size=32, model=model,
         lora_targets="proj" if model == "flowstate-r1" else "auto",
-        mlflow_tracking_uri="disabled",
+        mlflow_tracking_uri="disabled", probabilistic=int(model == "nlinear"),
     )
     clients = manifest["clients"]
     output = run_server(flower_grid(settings, len(clients)), settings)
@@ -44,6 +44,9 @@ def test_flower_rounds_write_metrics_and_checkpoints(prepared, tmp_path, flower_
     assert metrics["split"].tolist() == ["validation", "train", "validation", "train", "validation", "test"]
     test = pd.read_csv(output / "station_metrics.csv").query("split == 'test'")
     assert test.station.tolist() == [client["station"] for client in clients]
+    if model == "nlinear":
+        assert results["test"]["quantile-crossings"] == 0
+        assert results["test"]["quantile-raw-crossings"] == test["quantile-raw-crossings"].sum() > 0
     assert (output / "last_model.pt").is_file()
 
 
@@ -333,6 +336,7 @@ def test_cuda_client_cleanup_preserves_arrival_and_validation_paths(
     monkeypatch.setattr(client_app, "arrival_metrics", lambda _: {"available-through-ns": 20, "available-from-ns": 10})
     monkeypatch.setattr(client_app, "round_validation_view", lambda *_: validation)
     monkeypatch.setattr(client_app, "WindowDataset", lambda *_: [0])
+    monkeypatch.setattr(client_app, "validation_view", lambda *_: [0])
     monkeypatch.setattr(client_app, "train_local", run)
     monkeypatch.setattr(client_app, "evaluate_local", run)
     monkeypatch.setattr(client_app, "shared_state", lambda _: {"weight": torch.tensor(1.)})

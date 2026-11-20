@@ -402,13 +402,41 @@ pinball entre cuantiles: el puente divide explícitamente por 19 para optimizar
 la media. No copia ni modifica esa pérdida. Se selecciona el checkpoint con
 nuestras métricas externas, no con `ptl/val_loss`.
 
+En inferencia de MLP, NLinear y NHITS se ordenan los cuantiles por debajo y por
+encima de 0.5 por separado y se acotan a la mediana por el lado correspondiente.
+El ajuste no usa etiquetas, no cambia la predicción puntual ni el entrenamiento.
+El método queda identificado en `run.json` y `comparison.csv`; `compare` avisa
+si se comparan CRPS del mismo modelo con distinto tratamiento. La monotonicidad
+evita intervalos invertidos, **no garantiza la cobertura nominal**.
+
 Granite utiliza los cuantiles genuinos disponibles. Las revisiones fijadas de
-TTM-R3, PatchTST-FM-R2 y FlowState-R1 los han proporcionado en la validación real;
-no se fabrican intervalos para modelos con salida exclusivamente puntual.
+TTM-R3, PatchTST-FM-R2 y FlowState-R1 los han proporcionado en la validación real.
+No se obliga a los modelos a emitir nueve cuantiles: se conserva su rejilla.
+`run.json`, `comparison.csv` y MLflow registran los niveles y `compare` advierte
+si difieren. El error de aproximación puede variar con la rejilla.
+
+Con `calibrate-point-forecasts = 1` y `probabilistic = 1`, la primera mitad de
+validación elige el checkpoint de todos los candidatos. La segunda mitad
+calibra la incertidumbre de los predictores puntuales, sin cambiar sus pesos
+ni su pronóstico puntual. No se usan horizontes que crucen el corte; test
+se mantiene intacto. La reserva puede cambiar qué época o checkpoint se
+selecciona respecto a usar toda la validación, pero ni los cuantiles ni
+el CRPS retroalimentan el ajuste. En cada estación y horizonte se añaden al punto los
+cuantiles empíricos 0,10–0,90 de `observado − pronosticado`. Si el horizonte no
+alcanza `calibration-min-pairs` (20 con el TOML principal), se añaden los
+horizontes más cercanos de esa estación hasta alcanzar el mínimo, con un
+único residuo por hora real. Si no se alcanza, no se asigna un CRPS a un panel
+parcial. Las tablas locales registran el soporte por horizonte; no se envían
+en mensajes Flower ni a MLflow. SeasonalNaive usa intervalos gaussianos al
+estilo StatsForecast con residuos estacionales sobre pares observados del
+historial de entrenamiento; con huecos conserva el retardo de calendario.
+
 En unidades originales se calcula:
 
 - Pinball, WIS y cobertura/anchura de intervalos compatibles.
-- Cruces de cuantiles, sin ordenarlos silenciosamente.
+- Cruces en los cuantiles emitidos (`quantile-crossings`) y, al aplicar el ajuste
+  anterior, cruces en la salida original (`quantile-raw-crossings`). Ambos cuentan
+  targets observados con al menos un cruce, no pares de cuantiles.
 - **CRPS aproximado** por `2 × integral de pinball en τ`: cuadratura trapezoidal
   en la rejilla proporcionada, con colas cuantiles constantes hasta 0 y 1.
   La rejilla y el método forman parte del registro. No es el CRPS exacto de una
@@ -420,6 +448,19 @@ En unidades originales se calcula:
 El servidor agrega **sumas de CRPS y targets observados**, no medias arbitrarias
 de clientes. No hay puntuación en objetivos sin verdad original y se rechaza una
 predicción no finita incluso cuando su etiqueta está ausente.
+
+El **CRPS escalado macro** (`macro-scaled-crps`) divide primero el CRPS de cada
+estación por su referencia estacional de **entrenamiento**: el denominador MASE
+de validación, que termina en el corte de entrenamiento. Es el mismo
+denominador MASE de test si `error-scale-reference = "training"`. Se respetan
+los mínimos de pares y la política de escala del manifest; no se añade ningún
+suelo extra. Una estación sin escala válida queda fuera de esta métrica para
+todos; una estación elegible sin CRPS impide publicar la media del panel.
+Cada estación elegible pesa igual. La referencia es independiente del modelo;
+no se usa la concentración media, un pronóstico de cero ni errores del test.
+Para una distribución concentrada en un punto, coincide con MASE sobre el
+mismo soporte y la misma referencia. Esta definición no es el `scaled_crps`
+del leaderboard de Impermanent.
 
 ## Integridad y límites
 

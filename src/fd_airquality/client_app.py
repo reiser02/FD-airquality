@@ -17,6 +17,7 @@ from fd_airquality.arrival import (
     training_view,
 )
 from fd_airquality.artifacts import source_fingerprints
+from fd_airquality.calibration import calibration_options, validation_view
 from fd_airquality.data import WindowDataset, load_client_data
 from fd_airquality.federated_adapters import tensor_bytes
 from fd_airquality.models import load_shared_state, shared_state
@@ -62,7 +63,8 @@ def _execute_task(message, settings, partition, training):
         if split not in {"train", "validation", "test"} or (not training and split == "train"):
             raise ValueError(f"Split no permitido: {split}")
         dataset = (training_view(artifact, geometry, settings, round_number) if training else
-                   WindowDataset(artifact, split, geometry["context"], geometry["horizon"]))
+                   validation_view(artifact, geometry, settings) if split == "validation" else
+                   WindowDataset(artifact, "test", geometry["context"], geometry["horizon"]))
         if training:
             metrics = train_local(
                 model, dataset, settings, device, seed,
@@ -89,7 +91,11 @@ def _execute_task(message, settings, partition, training):
             metrics["uplink-tensor-bytes"] = tensor_bytes(state)
             metrics["downlink-tensor-bytes"] = tensor_bytes(message.content["arrays"].to_torch_state_dict())
         else:
-            metrics = evaluate_local(model, dataset, settings, device, artifact, geometry["seasonality"])
+            options = (calibration_options(
+                model, artifact, geometry, manifest["clients"][partition], settings, device,
+                Path(log_dir) if log_dir else None, partition,
+            ) if split == "test" else {})
+            metrics = evaluate_local(model, dataset, settings, device, artifact, geometry["seasonality"], **options)
         # Integer identity is metadata, not an aggregation weight.
         metrics["partition-id"] = partition
         content = RecordDict({"metrics": MetricRecord(metrics)})

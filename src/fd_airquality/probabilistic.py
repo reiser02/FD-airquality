@@ -1,11 +1,25 @@
-"""Masked quantile scores; no fabricated intervals for point-only models."""
+"""Masked quantile scores on the supplied grid, with optional seasonal scaling."""
 
 from __future__ import annotations
 
 import numpy as np
+import torch
+
+MEDIAN_ANCHORED_REARRANGEMENT = "sort_tails_clip_at_median_v1"
 
 
-def quantile_statistics(actual: np.ndarray, quantiles: np.ndarray, levels) -> dict:
+def rearrange_around_median(quantiles: torch.Tensor, median_index: int) -> torch.Tensor:
+    """Order each tail without moving its central forecast or using any labels."""
+    median = quantiles[..., median_index:median_index + 1]
+    lower = quantiles[..., :median_index].sort(dim=-1).values.minimum(median)
+    upper = quantiles[..., median_index + 1:].sort(dim=-1).values.maximum(median)
+    return torch.cat((lower, median, upper), dim=-1)
+
+
+def quantile_statistics(
+    actual: np.ndarray, quantiles: np.ndarray, levels, *, raw_quantiles: np.ndarray | None = None,
+    seasonal_scale: float = 0., origin_days: np.ndarray | None = None,
+) -> dict:
     levels = np.asarray(levels, dtype=float)
     if (quantiles.shape != actual.shape + (len(levels),) or len(levels) < 2
             or not np.isfinite(quantiles).all() or not np.isfinite(levels).all()
@@ -23,15 +37,36 @@ def quantile_statistics(actual: np.ndarray, quantiles: np.ndarray, levels) -> di
     errors = np.column_stack([delta[:, 0], delta, delta[:, -1]])
     integrand = np.maximum(grid * errors, (grid - 1) * errors)
     crps = 2 * np.trapezoid(integrand, grid, axis=1)
-    stats = {"quantile-loss-sum": float((2 * pinball).sum()),
-             "quantile-count": int(pinball.size),
-             "quantile-crossings": int((np.diff(forecasts, axis=1) < 0).any(axis=1).sum()),
-             "probabilistic-targets": len(truth),
-             # Finite-grid approximation of 2 ∫ pinball dτ, not the
-             # unnormalized training MQLoss nor exact continuous CRPS.
-             "crps-sum": float(crps.sum()),
-             "crps-count": len(truth),
-             "crps": float(crps.mean())}
+    stats = {
+        "quantile-loss-sum": float((2 * pinball).sum()),
+        "quantile-count": int(pinball.size),
+        "quantile-crossings": int((np.diff(forecasts, axis=1) < 0).any(axis=1).sum()),
+        "probabilistic-targets": len(truth),
+        # Finite-grid approximation of 2 ∫ pinball dτ, not the
+        # unnormalized training MQLoss nor exact continuous CRPS.
+        "crps-sum": float(crps.sum()),
+        "crps-count": len(truth),
+        "crps": float(crps.mean()),
+    }
+    scaled = crps / seasonal_scale if np.isfinite(seasonal_scale) and seasonal_scale > 0 else None
+    if scaled is not None:
+        stats.update({"scaled-crps": float(scaled.mean()), "scaled-crps-sum": float(scaled.sum()),
+                      "scaled-crps-count": len(scaled)})
+    if origin_days is not None:
+        days = np.broadcast_to(np.asarray(origin_days)[:, None], actual.shape)[observed]
+        for day in np.unique(days):
+            rows = days == day
+            prefix = f"block-{day}"
+            stats[f"{prefix}-crps-error-sum"] = float(crps[rows].sum())
+            stats[f"{prefix}-crps-target-count"] = int(rows.sum())
+            if scaled is not None:
+                stats[f"{prefix}-scaled-crps-error-sum"] = float(scaled[rows].sum())
+                stats[f"{prefix}-scaled-crps-target-count"] = int(rows.sum())
+    if raw_quantiles is not None:
+        if raw_quantiles.shape != quantiles.shape or not np.isfinite(raw_quantiles).all():
+            raise ValueError("Cuantiles originales no finitos o con forma incompatible.")
+        raw = raw_quantiles[observed]
+        stats["quantile-raw-crossings"] = int((np.diff(raw, axis=1) < 0).any(axis=1).sum())
     median = np.flatnonzero(np.isclose(levels, .5))
     wis = .5 * np.abs(truth - forecasts[:, median[0]]) if len(median) else None
     intervals = 0

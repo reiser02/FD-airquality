@@ -87,3 +87,11 @@ def forecast_distribution(model, inputs: torch.Tensor, settings):
     if hasattr(model, "forecast_distribution"):
         return model.forecast_distribution(values, missing_policy="native" if policy == "native" else "strict")
     return model(values), None, None
+
+
+def forecast_distribution_with_raw(model, inputs: torch.Tensor, settings):
+    """Also return the original quantiles when the model applies post-processing."""
+    if hasattr(model, "forecast_distribution_with_raw"):
+        policy = resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies)
+        return model.forecast_distribution_with_raw(inputs, missing_policy=policy)
+    return (*forecast_distribution(model, inputs, settings), None)

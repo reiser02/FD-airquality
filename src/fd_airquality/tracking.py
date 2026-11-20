@@ -19,9 +19,17 @@ from pathlib import Path
 import torch
 
 from fd_airquality.artifacts import file_digest
+from fd_airquality.calibration import (
+    ESTIMATED_LEVELS,
+    POINT_MODELS,
+    SCALED_CRPS_PROTOCOL,
+    calibration_enabled,
+)
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.missing import resolve_missing_policy
 from fd_airquality.models import GRANITE, model_metadata
+from fd_airquality.neural import trained_quantiles
+from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
 
@@ -39,7 +47,9 @@ ADAPTATION_LABELS = {
 }
 
 _EVALUATION_METRICS = (
-    "macro-mase", "macro-rmsse", "crps", "wis", "target-coverage",
+    "macro-mase", "macro-rmsse", "crps", "macro-scaled-crps", "wis", "target-coverage",
+    "scaled-crps-count", "macro-scaled-crps-stations", "scaled-crps-eligible-stations",
+    "interval-80-coverage", "interval-90-coverage",
     "robust-num-clients", "robust-macro-mase", "robust-macro-rmsse",
 )
 _TRACKED_METRICS = {
@@ -107,6 +117,29 @@ def initialize_tracking(settings: RunSettings, artifacts: Path) -> None:
         ))
 
 
+def uncertainty_protocol(settings: RunSettings, metadata: dict) -> dict:
+    native = metadata.get("quantiles", []) if settings.probabilistic else []
+    calibrated = calibration_enabled(settings)
+    method = "native" if native else "none"
+    if calibrated and settings.model in POINT_MODELS:
+        method = "empirical_residual_quantiles_by_lead"
+    elif calibrated and settings.model == "seasonal-naive":
+        method = "gaussian_seasonal_residuals_from_train"
+    levels = list(ESTIMATED_LEVELS) if method not in {"native", "none"} else native
+    return {
+        "crps": "quantile_integral_trapezoid_constant_tails_approximation",
+        "scaled_crps": SCALED_CRPS_PROTOCOL,
+        "truth": "canonical_observed_original_units",
+        "quantile_source": method,
+        "quantile_levels": levels,
+        "quantile_postprocessing": MEDIAN_ANCHORED_REARRANGEMENT if trained_quantiles(settings) else "none",
+        "validation_partition": "first_half_selection_second_half_calibration" if calibrated else "full_selection",
+        "calibration_min_pairs": settings.calibration_min_pairs if calibrated else None,
+        "calibration_sparse_leads": ("pool_nearest_leads_same_station_one_residual_per_target_time"
+                                     if method == "empirical_residual_quantiles_by_lead" else None),
+    }
+
+
 def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) -> None:
     versions = {}
     for name in (
@@ -160,8 +193,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "federation_weight": ("mean_observed_targets_per_epoch_before_replacement"
                                   if manifest.get("schema_version", 4) >= 5 else "windows_per_epoch"),
         },
-        "probabilistic_protocol": {"crps": "quantile_integral_trapezoid_constant_tails_approximation",
-                                   "truth": "canonical_observed_original_units"},
+        "probabilistic_protocol": uncertainty_protocol(settings, metadata),
         "arrival_protocol": {"period_hours": settings.arrival_period_hours if progressive else 0,
                               "history": "new-only" if progressive else None,
                               "training_targets": "current_block_only" if progressive else "full_fold_training",
@@ -266,6 +298,12 @@ class RunTracker:
         for key in ("revision", "inference_parameters", "inference_macs"):
             if key in metadata:
                 params[f"model.{key}"] = metadata[key]
+        protocol = uncertainty_protocol(settings, metadata)
+        params["quantile_source"] = protocol["quantile_source"]
+        if protocol["quantile_levels"]:
+            params["quantile_levels"] = json.dumps(protocol["quantile_levels"], separators=(",", ":"))
+        if calibration_enabled(settings):
+            params["calibration_min_pairs"] = settings.calibration_min_pairs
         for key, value in params.items():
             self.client.log_param(self.run_id, key, value)
 

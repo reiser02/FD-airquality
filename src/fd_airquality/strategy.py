@@ -15,6 +15,7 @@ from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg, FedProx, Strategy
 
 from fd_airquality.arrival import round_bounds
+from fd_airquality.calibration import calibration_enabled
 from fd_airquality.federated_adapters import aggregate_adapter_updates
 from fd_airquality.models import GRANITE, checkpoint_payload
 from fd_airquality.run_logging import report_progress
@@ -117,6 +118,17 @@ def aggregate_evaluation(contents: list[RecordDict], weighted_by_key: str) -> Me
         metrics["wis"] = metrics["wis-sum"] / metrics["wis-count"]
     if metrics.get("crps-count", 0):
         metrics["crps"] = metrics["crps-sum"] / metrics["crps-count"]
+    if all("scaled-crps-eligible" in record for record in records):
+        eligible = [record for record in records if record["scaled-crps-eligible"]]
+        complete = [record for record in eligible if record.get("scaled-crps-count") == record["num-targets"]]
+        metrics.update({
+            "scaled-crps-eligible-stations": len(eligible),
+            "macro-scaled-crps-stations": len(complete),
+            "scaled-crps-eligible-targets": sum(record["num-targets"] for record in eligible),
+            "scaled-crps-count": sum(record["scaled-crps-count"] for record in complete),
+        })
+        if complete and len(complete) == len(eligible):
+            metrics["macro-scaled-crps"] = float(np.mean([record["scaled-crps"] for record in complete]))
     for key in sorted(probability_keys):
         if key.startswith("interval-") and key.endswith("-count") and metrics.get(key, 0):
             prefix = key.removesuffix("-count")
@@ -180,6 +192,7 @@ class AuditedStrategy(Strategy):
         self.history: list[dict] = []
         self.station_history: list[dict] = []
         self.runtime_nodes: dict[int, int] = {}
+        self.validation_support: dict[int, tuple[int, int]] = {}
         self.trained_targets = 0
 
     def summary(self) -> None:
@@ -259,7 +272,8 @@ class AuditedStrategy(Strategy):
             client = self.manifest["clients"][partition]
             geometry = self.manifest["geometry"]
             horizon = geometry["horizon"]
-            dynamic = split == "train" and (
+            selection_half = split == "validation" and calibration_enabled(self.settings)
+            dynamic = selection_half or split == "train" and (
                 self.progressive
                 or self.settings.training_data_availability_threshold != "0.0"
                 or self.settings.training_availability != "{}")
@@ -291,6 +305,13 @@ class AuditedStrategy(Strategy):
                 arrays = reply.content["arrays"].to_numpy_ndarrays()
                 if any(not np.isfinite(array).all() for array in arrays):
                     raise ValueError("Una estación devolvió pesos no finitos.")
+            elif selection_half:
+                examples, targets = metrics["num-examples"], metrics["num-targets"]
+                maximum = client.get("num_validation_targets", available * horizon)
+                support = (examples, targets)
+                if (not 0 < examples <= targets <= min(examples * horizon, maximum)
+                        or self.validation_support.setdefault(partition, support) != support):
+                    raise ValueError("Soporte de selección incoherente en la primera mitad de validación.")
             elif metrics["num-targets"] != client.get(f"num_{split}_targets", metrics["num-examples"] * horizon):
                 raise ValueError("Número de targets incoherente.")
             if split == "train" and self.manifest.get("schema_version", 4) >= 5:

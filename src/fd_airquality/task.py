@@ -19,7 +19,7 @@ from fd_airquality.data import WindowDataset
 from fd_airquality.metrics import compute_mase, compute_rmsse
 from fd_airquality.missing import (
     forecast,
-    forecast_distribution,
+    forecast_distribution_with_raw,
     resolve_missing_policy,
 )
 from fd_airquality.models import ForecastAutoencoder, make_model, shared_state  # noqa: F401
@@ -291,22 +291,28 @@ def evaluate_local(
     device: torch.device,
     artifact: dict[str, np.ndarray],
     seasonality: int,
+    *,
+    calibration=None,
 ) -> dict[str, float | int]:
     model.to(device).eval()
     predictions, actuals = [], []
     missing_context = 0
-    quantile_batches, quantile_levels = [], None
+    quantile_batches, raw_quantile_batches, quantile_levels = [], [], None
     row_offset = 0
     loader = DataLoader(dataset, batch_size=_microbatch_size(settings, device), num_workers=0)
     last_report = time.monotonic()
     for batch, (inputs, actual) in enumerate(loader, start=1):
         if settings.probabilistic:
-            predicted, quantiles, levels = forecast_distribution(model, inputs.to(device), settings)
+            predicted, quantiles, levels, raw_quantiles = forecast_distribution_with_raw(
+                model, inputs.to(device), settings,
+            )
             if quantiles is not None:
                 if quantile_levels is not None and list(levels) != list(quantile_levels):
                     raise ValueError("Los niveles de cuantiles cambiaron entre lotes.")
                 quantile_levels = levels
                 quantile_batches.append(quantiles.cpu().numpy().astype(np.float64) * dataset.scale + dataset.mean)
+                if raw_quantiles is not None:
+                    raw_quantile_batches.append(raw_quantiles.cpu().numpy().astype(np.float64) * dataset.scale + dataset.mean)
         else:
             predicted = forecast(model, inputs.to(device), settings)
         if predicted.shape != actual.shape or not torch.isfinite(predicted).all():
@@ -330,6 +336,8 @@ def evaluate_local(
     if not count:
         raise ValueError("No hay targets observados para evaluar.")
     error = np.where(observed, prediction - actual, 0.0)
+    days = (pd.to_datetime(artifact["timestamps"][dataset.starts + dataset.context]).strftime("%Y%m%d").to_numpy()
+            if dataset.split == "test" and "timestamps" in artifact else None)
     signed_error = float(error.sum())
     negative = int((prediction < 0).sum())
     stats: dict[str, float | int] = {
@@ -347,11 +355,31 @@ def evaluate_local(
         "rmsse-sum": 0.0,
         "rmsse-count": 0,
     }
-    stats["probabilistic-available"] = int(bool(quantile_batches))
-    if quantile_batches:
+    scale = float(artifact.get("validation_mase_scale", 0.))
+    stats["scaled-crps-eligible"] = int(np.isfinite(scale) and scale > 0)
+    if calibration is not None:
+        stats["calibration-min-lead-support"] = int(calibration.counts.min())
+        if calibration.effective_counts is not None:
+            stats["calibration-min-effective-support"] = int(calibration.effective_counts.min())
+            stats["calibration-neighbor-leads"] = int((calibration.effective_counts > calibration.counts).sum())
+        stats["calibration-available"] = int(calibration.offsets is not None)
+    provided = bool(quantile_batches or (calibration is not None and calibration.offsets is not None))
+    stats["probabilistic-available"] = int(provided)
+    if provided:
+        from fd_airquality.calibration import ESTIMATED_LEVELS
         from fd_airquality.probabilistic import quantile_statistics
 
-        stats.update(quantile_statistics(actual, np.concatenate(quantile_batches), quantile_levels))
+        raw = np.concatenate(raw_quantile_batches) if raw_quantile_batches else None
+        if quantile_batches:
+            values = np.concatenate(quantile_batches)
+        else:
+            values = prediction[..., None] + calibration.offsets
+            quantile_levels = ESTIMATED_LEVELS
+        stats.update(quantile_statistics(actual, values, quantile_levels, raw_quantiles=raw,
+                                         seasonal_scale=scale, origin_days=days))
+    if days is not None:
+        for day in np.unique(days):
+            stats[f"block-{day}-observed-target-count"] = int(observed[days == day].sum())
     lead_counts = observed.sum(axis=0)
     for lead, support in enumerate(lead_counts, start=1):
         stats[f"lead-{lead:02d}-count"] = int(support)
@@ -377,13 +405,11 @@ def evaluate_local(
             for lead, numerator in enumerate(scaled_error.sum(axis=0), start=1):
                 stats[f"lead-{lead:02d}-{name}-scaled-error-sum"] = float(numerator)
                 stats[f"lead-{lead:02d}-{name}-target-count"] = int(lead_counts[lead - 1])
-            # Keep only scaled calendar aggregates for the paired test bootstrap.
-            if name == "mase" and dataset.split == "test" and "timestamps" in artifact:
-                days = pd.to_datetime(artifact["timestamps"][dataset.starts + dataset.context]).normalize()
-                for day in days.unique():
+            if days is not None:
+                for day in np.unique(days):
                     rows = days == day
-                    stats[f"block-{day:%Y%m%d}-mase-scaled-error-sum"] = float(by_origin[rows].sum())
-                    stats[f"block-{day:%Y%m%d}-mase-target-count"] = int(origin_counts[rows].sum())
+                    stats[f"block-{day}-{name}-scaled-error-sum"] = float(by_origin[rows].sum())
+                    stats[f"block-{day}-{name}-target-count"] = int(origin_counts[rows].sum())
         return stats
     # Historical schema-2 artifacts only: their original origin-dependent scales
     # are not silently relabelled as a fixed-reference protocol.

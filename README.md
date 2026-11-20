@@ -202,7 +202,7 @@ Modelos disponibles con `--model`:
 | `autoencoder` | Encoder con cuello de botella, decoder de reconstrucción y cabeza de forecasting |
 | `autoencoder-tiny` | Variante para inferencia embebida: cuello fijo de 4 unidades, dos capas densas en inferencia |
 | `nlinear` | NLinear del paquete NeuralForecast |
-| `nlinear-point` | NLinear con salida puntual y MSE |
+| `nlinear-point` | NLinear con salida puntual y MSE, aunque se evalúe con cuantiles calibrados |
 | `nhits` | NHITS del paquete NeuralForecast, con su tratamiento de máscara en los residuos |
 | `linear-6lags` | Regresión directa de 6 retardos (1, 2, 3, 24, 48 y 72 h); 84 parámetros para 12 salidas |
 | `seasonal-naive` | Referencia local sin entrenamiento: misma hora a 24, 48 o 72 h, o última lectura válida |
@@ -249,7 +249,8 @@ conexión residual desde el último valor del contexto preprocesado. El decoder 
 reconstruye el contexto se usa solo al entrenar. El predictor usa **424 parámetros**
 (1.696 bytes en FP32) y **408 multiplicaciones-acumulaciones** en las capas densas
 por pronóstico. Son cifras del núcleo, no del checkpoint completo ni de la RAM
-o la latencia del dispositivo. El predictor es puntual.
+o la latencia del dispositivo. El predictor es puntual; la evaluación puede
+añadir incertidumbre sin cambiarlo.
 
 Para un microcontrolador, no hace falta portar PyTorch, NeuralForecast ni Flower:
 se pueden implementar las dos capas en C con los tensores `encoder.0.*` y
@@ -413,11 +414,13 @@ automático de métrica ni ampliación de referencia. Los fallos de integridad o
 entrenamiento siguen abortando, sin cambiar el panel a mitad del experimento.
 La normalización de entrada sigue ajustándose únicamente con entrenamiento.
 Las evaluaciones nuevas calculan MASE/RMSSE sobre los targets observados en
-unidades originales, sin calcular MAE/RMSE no escalados. `comparison.csv`
-compara candidatos agregados e incluye mejoras frente a un único zero-shot
-con revisión y configuración de inferencia compatibles.
+unidades originales, sin calcular MAE/RMSE no escalados. En MLP/NLinear/NHITS se ordenan los cuantiles de cada lado
+sin mover la mediana; se registran los cruces antes y después del ajuste. Esto
+evita intervalos invertidos, **no los calibra**. `comparison.csv` compara candidatos
+agregados e incluye mejoras frente a un único zero-shot con revisión y configuración
+de inferencia compatibles.
 `pairwise_comparison.csv` compara **todos contra todos**, en ambas direcciones,
-para macro-MASE, macro-RMSSE y CRPS cuando se dispone de cuantiles. Delta = A − B:
+para macro-MASE, macro-RMSSE, CRPS y CRPS escalado cuando se dispone de cuantiles. Delta = A − B:
 negativo favorece A; mejora (%) = `100 × (1 − A/B)`: positiva favorece A y queda vacía si B=0.
 Cambiar la escala de FlowState no excluye ningún candidato de esas comparaciones;
 solo impide atribuir la diferencia exclusivamente a la adaptación si no hay un
@@ -610,7 +613,8 @@ Usa `params.seed` y, para adaptadores LoRA, `params.lora_rank` para distinguir
 variantes del mismo método. También puedes filtrar por las etiquetas `model`,
 `mode`, `adaptation` y el parámetro `output_dir`.
 
-Compara `test/macro-mase`, `test/macro-rmsse` y `runtime/wall-seconds`.
+Compara `test/macro-mase`, `test/macro-rmsse`, `test/crps`,
+`test/macro-scaled-crps` y `runtime/wall-seconds`.
 Se conserva el historial agregado de validación, CRPS/WIS si hay cuantiles, la
 selección del checkpoint global cuando corresponde, y el coste de entrenamiento
 y agregación. Para FAIR se registran `train/server-aggregation-seconds` y

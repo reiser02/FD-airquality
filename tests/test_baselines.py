@@ -5,6 +5,8 @@ import pytest
 import torch
 
 from fd_airquality.baselines import run_baseline
+from fd_airquality.models import AUTOENCODER_MODELS
+from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.settings import RunSettings
 
 
@@ -17,6 +19,7 @@ def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_pa
     settings = RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "runs"), model=model,
         num_server_rounds=1, hidden_size=8, batch_size=32, mlflow_tracking_uri="disabled",
+        probabilistic=1,
     )
     output = run_baseline(settings, mode)
     results = json.loads((output / "test_metrics.json").read_text())
@@ -25,6 +28,15 @@ def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_pa
     test = pd.read_csv(output / "station_metrics.csv").query("split == 'test'")
     assert test["num-examples"].tolist() == [client["num_test_windows"] for client in clients]
     assert not (output / "mlflow.json").exists()
+    protocol = json.loads((output / "run.json").read_text())["probabilistic_protocol"]
+    if model in AUTOENCODER_MODELS:
+        assert protocol["quantile_postprocessing"] == "none"
+        assert not {"quantile-raw-crossings", "crps"} & results["test"].keys()
+    else:
+        assert protocol["quantile_postprocessing"] == MEDIAN_ANCHORED_REARRANGEMENT
+        assert results["test"]["quantile-crossings"] == 0
+        assert results["test"]["quantile-raw-crossings"] == test["quantile-raw-crossings"].sum() > 0
+        assert results["test"]["interval-90-mean-width"] >= 0
     if mode == "local":
         assert results["selected_round"] is None
         stages = test["round"].tolist()

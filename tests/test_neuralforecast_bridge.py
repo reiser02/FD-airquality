@@ -53,13 +53,16 @@ def test_package_models_masks_losses_and_scalers_are_used(model_name, probabilis
     torch.testing.assert_close(objective, expected)
     objective.backward()
     assert any(parameter.grad is not None for parameter in model.parameters() if parameter.requires_grad)
-    point, quantiles, levels = model.forecast_distribution(x)
+    point, quantiles, levels, raw = model.forecast_distribution_with_raw(x)
     assert point.shape == y.shape and torch.isfinite(point).all()
     if probabilistic:
         assert quantiles.shape == (2, 3, 19) and len(levels) == 19
+        assert (quantiles.diff(dim=-1) >= 0).all()
+        torch.testing.assert_close(point, raw[..., levels.index(.5)], atol=0, rtol=0)
+        torch.testing.assert_close(point, quantiles[..., levels.index(.5)], atol=0, rtol=0)
         assert not any("loss" in name for name in shared_state(model))
     else:
-        assert quantiles is levels is None
+        assert quantiles is levels is raw is None
     torch.testing.assert_close(x, original, equal_nan=True)
     assert squared >= 0
 

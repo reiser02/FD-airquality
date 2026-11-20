@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from fd_airquality.availability import filter_training_windows
+from fd_airquality.calibration import validation_view
 from fd_airquality.data import WindowDataset
 from fd_airquality.splitting import window_observation_counts
 from fd_airquality.training_control import controls_enabled
@@ -50,7 +51,7 @@ def round_validation_bounds(geometry: dict, settings):
 def round_validation_view(artifact: dict, geometry: dict, settings):
     bounds = round_validation_bounds(geometry, settings)
     if bounds is None:
-        return WindowDataset(artifact, "validation", geometry["context"], geometry["horizon"])
+        return validation_view(artifact, geometry, settings)
     lower, cutoff = bounds
     times = artifact["timestamps"]
     starts = artifact["train_starts"]

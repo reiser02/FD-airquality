@@ -51,9 +51,9 @@ def _pooled(frame: pd.DataFrame) -> dict:
     }
     if "num-target-slots" in frame:
         result["target-coverage"] = count / frame["num-target-slots"].sum()
-    for name in ("mase", "rmsse", "crps"):
-        count_key = "crps-count" if name == "crps" else f"{name}-target-count"
-        numerator = "crps-sum" if name == "crps" else f"{name}-scaled-error-sum"
+    for name in ("mase", "rmsse", "crps", "scaled-crps"):
+        count_key = f"{name}-count" if name.endswith("crps") else f"{name}-target-count"
+        numerator = f"{name}-sum" if name.endswith("crps") else f"{name}-scaled-error-sum"
         if count_key not in frame or numerator not in frame:
             continue
         support = frame[count_key].sum()
@@ -77,11 +77,11 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
         for _, fold_group in group.groupby("fold", sort=False):
             fold_score = _pooled(fold_group)
             fold_score.update({key: fold_group.iloc[0][key] for key in (
-                "macro-mase", "macro-rmsse", "macro-crps",
+                "macro-mase", "macro-rmsse", "macro-crps", "macro-scaled-crps",
             ) if key in fold_group})
             fold_scores.append(fold_score)
         fold_frame = pd.DataFrame(fold_scores)
-        for metric in ("mase", "rmsse", "crps", "macro-mase", "macro-rmsse", "macro-crps"):
+        for metric in ("mase", "rmsse", "crps", "macro-mase", "macro-rmsse", "macro-crps", "macro-scaled-crps"):
             if metric in fold_frame:
                 values = fold_frame[metric]
                 defined = np.isfinite(values)
@@ -98,6 +98,11 @@ def summarize_cv(rows: list[dict], stations: list[dict], output: Path) -> pd.Dat
             score[f"macro-{name}-stations"] = len(valid)
             if valid:
                 score[f"macro-{name}"] = float(np.mean(valid))
+        if "macro-scaled-crps" in group and group["macro-scaled-crps"].notna().all():
+            valid = [record["scaled-crps"] for record in per_station if "scaled-crps" in record]
+            if valid:
+                score.update({"macro-scaled-crps": float(np.mean(valid)),
+                              "macro-scaled-crps-stations": len(valid)})
         summaries.append(identity | score)
     result = pd.DataFrame(summaries)
     result.to_csv(output / "cv_summary.csv", index=False)

@@ -15,6 +15,7 @@ from torch.utils.data import ConcatDataset
 
 from fd_airquality.arrival import audit_normalization, normalization_artifact, training_view
 from fd_airquality.artifacts import source_fingerprints
+from fd_airquality.calibration import calibration_options, validation_view
 from fd_airquality.data import WindowDataset, load_client_data, read_manifest
 from fd_airquality.lightweight import HOLT_GRID, STATION_CONTROLS
 from fd_airquality.models import (
@@ -121,7 +122,7 @@ def _run_baseline(settings, mode, manifest, output):
         artifact = normalization_artifact(artifact, geometry, settings)
         audit_normalization(artifact, settings, partition, output / "clients")
         artifacts.append(artifact)
-        data = {"validation": WindowDataset(artifact, "validation", geometry["context"], geometry["horizon"]),
+        data = {"validation": validation_view(artifact, geometry, settings),
                 "test": WindowDataset(artifact, "test", geometry["context"], geometry["horizon"])}
         if mode != "zero-shot" and settings.model not in STATION_CONTROLS:
             data["train"] = training_view(artifact, geometry, settings)
@@ -175,9 +176,13 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 _model_on_device(model, device, offload=offload),
             ):
                 report_progress(split, f"station={partition + 1}/{count}")
+                options = (calibration_options(
+                    model, artifacts[partition], geometry, manifest["clients"][partition], settings,
+                    device, output / "clients", partition,
+                ) if split == "test" else {})
                 records.append(evaluate_local(
                     model, data[split], settings, device,
-                    artifacts[partition], geometry["seasonality"],
+                    artifacts[partition], geometry["seasonality"], **options,
                 ))
         return records
 

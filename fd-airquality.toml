@@ -196,6 +196,12 @@ missing-policy = "auto"
 deterministic = 0
 # 1 entrena cuantiles de MLP/NHITS/NLinear (no nlinear-point) y evalúa los nativos de Granite.
 probabilistic = 1
+# Los modelos puntuales conservan el entrenamiento: la segunda mitad de la
+# validación se reserva para calibrar cuantiles después de seleccionar los pesos.
+calibrate-point-forecasts = 1
+# Soporte mínimo por horizonte; si hay pocos datos se añaden retardos vecinos
+# de la misma estación sin contar dos veces una hora. No se puntúa un panel parcial.
+calibration-min-pairs = 20
 # "window": TemporalNorm sobre el contexto observado de cada ventana; "fixed": media y
 # desviación por estación con el histórico autorizado; "none": sin normalización externa.
 normalization = "window"
