@@ -73,14 +73,14 @@ def execute_plan(settings, plan: list[dict], root: Path, *,
         raise ValueError("max-parallel-models debe ser un entero positivo.")
     slots = usable_gpu_slots(settings.device)
     if settings.device == "cuda" and not slots:
-        LOGGER.warning("Ninguna GPU utilizable; benchmark secuencial en CPU.")
+        LOGGER.warning("Ninguna GPU utilizable; candidatos del fold secuenciales en CPU.")
         settings = replace(settings, device="cpu")
     slots = slots[:max_parallel_models] if max_parallel_models else slots
     (root / "logs").mkdir()
     rows = [case | {"status": "pending", "gpu": None, "log": str(root / "logs" / f"case_{i + 1:04d}.log")}
             for i, case in enumerate(plan)]
     paths = [None] * len(plan)
-    progress_path = root / "benchmark.json"
+    progress_path = root / "candidates.json"
     runner = ProcessRunner()
 
     def persist(mode):

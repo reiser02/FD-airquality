@@ -6,10 +6,11 @@ import pandas as pd
 import pytest
 
 from fd_airquality.artifacts import file_digest
+from fd_airquality.backtesting import prepare_backtest, run_backtest
 from fd_airquality.baselines import run_baseline
-from fd_airquality.cli import launch_simulation, run_benchmark
+from fd_airquality.cli import launch_simulation
 from fd_airquality.comparison import compare_runs
-from fd_airquality.data import load_client_data, read_manifest
+from fd_airquality.data import DataConfig, load_client_data, read_manifest
 from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.settings import RunSettings
 
@@ -117,21 +118,23 @@ def test_flower_launcher_uses_retained_station_count_and_saves_audit(selection_p
     assert pd.read_csv(report).station.to_list() == ["station-a"]
 
 
-def test_benchmark_filters_once_for_all_candidates(selection_prepared, tmp_path, monkeypatch):
-    path, _ = selection_prepared
+def test_backtest_filters_once_for_all_candidates_in_the_fold(selection_prepared, tmp_path, monkeypatch):
+    _, source = selection_prepared
+    path = prepare_backtest(Path(source["raw_root"]), tmp_path / "backtests", "PM25",
+                            DataConfig(**source["geometry"]), folds=1, min_stations=1)
     calls = []
 
-    def run(settings, *args, **kwargs):
+    def run(settings, mode):
         calls.append(settings)
         assert [row["station"] for row in read_manifest(settings.manifest)["clients"]] == ["station-b"]
-        return tmp_path / f"run{len(calls)}"
+        return run_baseline(settings, mode)
 
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", run)
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", run)
-    monkeypatch.setattr("fd_airquality.comparison.compare_runs", lambda paths, output: output)
-    output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "benchmarks"),
-                                      mlflow_tracking_uri="disabled"),
-                            ["mlp"], ["federated", "local", "centralized"])
-    assert len(calls) == 3
+    output = run_backtest(RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
+                                      num_server_rounds=1, mlflow_tracking_uri="disabled"),
+                          ["mlp"], ["local", "centralized"])
+    assert len(calls) == 2
     assert len({call.manifest for call in calls}) == 1
-    assert pd.read_csv(output.parent / "excluded_stations.csv").station.to_list() == ["station-a"]
+    report = pd.read_csv(output / "temporal_exclusions.csv")
+    assert report.station.to_list() == ["station-a"]
+    assert report.reason.to_list() == ["validation_reference_no_pairs"]

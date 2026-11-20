@@ -121,7 +121,7 @@ def flower_grid(flower_identity):
 
 @pytest.fixture
 def in_process_federation(monkeypatch, flower_grid):
-    """Backtest/benchmark path with real client/server logic but no Ray startup."""
+    """Backtest with real client/server logic but no Ray startup."""
     from fd_airquality.server_app import run_server
 
     def launch(settings, dry_run=False):
@@ -227,7 +227,7 @@ def temporal_family(tmp_path):
     for offset, name in enumerate(("station-a", "station-b")):
         directory = raw / name
         directory.mkdir(parents=True)
-        index = pd.date_range("2025-01-01", periods=20 * 24 * 12, freq="5min")
+        index = pd.date_range("2024-12-28", "2025-01-21", freq="5min", inclusive="left")
         values = 10 + offset + np.sin(np.arange(len(index)) / 23)
         values.reshape(-1, 12)[offset::13] = np.nan
         pd.DataFrame({"PM25": values}, index=index).to_csv(directory / "PM25.csv")
@@ -236,3 +236,11 @@ def temporal_family(tmp_path):
                         validation_start="2025-01-10", test_start="2025-01-12", test_end="2025-01-14",
                         max_train_windows=12)
     return raw, config
+
+
+@pytest.fixture
+def single_fold_manifest(temporal_family, tmp_path):
+    from fd_airquality.backtesting import prepare_backtest
+
+    raw, config = temporal_family
+    return prepare_backtest(raw, tmp_path / "backtests", "PM25", config, folds=1, min_stations=2)

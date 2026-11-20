@@ -169,12 +169,52 @@ cada fold sigue teniendo un histórico autorizado mayor, pero un modelo nuevo.
 
 ```toml
 [prepare-backtest]
-folds = 3
-step-hours = 672
+folds = 3                   # usa 1 para una sola evaluación temporal
+min-stations = 15           # mínimo del panel común si se usan todas
+validation-hours = 672      # objetivo por fold (28 días)
+test-hours = 672            # objetivo por fold (28 días)
 train-history = "expanding"  # opción normal; solo se amplían los datos
 # Alternativa: train-history = "sliding"
 history-hours = 672         # longitud de targets de ajuste si se usa sliding
 ```
+
+El calendario se detecta en los CSV seleccionados: empieza en la primera hora
+observada y acaba justo después de la última, tras el filtrado de calidad. No
+se heredan las fechas fijas de `[prepare]`. El programa reserva normalmente
+alrededor del 40 % para el histórico inicial. Ajusta la reserva para permitir
+entrenar también con estaciones que arrancan más tarde cuando su tramo tiene
+espacio para el reparto, y para que quepan las ventanas mínimas de cada fold.
+
+El resto se divide en `folds` **bloques consecutivos de duración casi igual**.
+Cada bloque termina con validación y test de las duraciones configuradas, sin
+crecer en proporción al calendario. Se redondean hacia abajo para que las ventanas
+de horizonte completo cubran las horas con el stride configurado. Si no caben
+tras reservar tiempo para entrenamiento nuevo (hasta un cuarto del bloque),
+se reducen respetando los mínimos de ventanas. Las horas sobrantes pertenecen
+al entrenamiento. La CLI y el manifest
+indican las duraciones solicitadas y efectivas; si no caben los mínimos, la
+preparación falla en lugar de descartar un fold. Las duraciones de `[prepare]`
+para particiones individuales por estación no se heredan.
+
+Los mínimos de ventanas se aplican por estación y fold. La preparación comprueba
+que queden al menos `min-stations` estaciones en la intersección de los folds;
+el backtest verifica el mismo umbral antes de entrenar, tras aplicar la regla
+de selección por métrica de validación. Con una lista explícita de estaciones
+(`station` en el TOML o `--station`) el mínimo común es uno, sin relajar los
+requisitos de ventanas.
+
+Con histórico expansivo, quedan disponibles el test anterior **y las nuevas
+observaciones posteriores a él** hasta el inicio de la nueva validación. No se
+exige que todas las horas se puntúen: también se usan para entrenar o validar.
+Con histórico deslizante solo entra la parte dentro de `history-hours`. Se
+mantienen los filtros de calidad, el panel común y las reglas de disponibilidad,
+muestreo y llegada de cada ronda. Los informes `coverage.csv` de los folds
+permiten distinguir el calendario de las horas observadas cubiertas por ventanas.
+
+`backtest` usa el `backtest_manifest.json` de `prepare-backtest` para uno o varios
+folds. La matriz de modelos, modos, adaptaciones, semillas y rangos se define en
+`[backtest]` y se repite en cada fold. Con `folds = 1` se aplica la misma regla
+automática a un único bloque, y la comparación queda en `fold_001/comparison/`.
 
 Dentro de cada fold los checkpoints siguen sirviendo para seleccionar y restaurar
 su predictor. Lo eliminado es **cargarlos como punto de partida de otro fold**.
@@ -189,7 +229,8 @@ reserva automáticamente el último. `cv_summary.csv` conserva además la
 agregación por conteos observados, que no siempre coincide con esa media.
 La preparación marca un posible holdout; solo el flujo optativo le asigna ese papel.
 
-El flujo de selección siguiente debe solicitarse explícitamente:
+El flujo de selección siguiente debe solicitarse explícitamente y requiere al menos
+dos folds:
 
 ```bash
 uv run --frozen fd-airquality prepare-backtest --config experiments/smoke.toml
@@ -392,9 +433,12 @@ específicos y los recuentos realizados se registran en cada ejecución.
 Las preparaciones anteriores se conservan y no se sobrescriben. Los cambios en
 módulos fingerprinted requieren preparar de nuevo. Checkpoints anteriores de
 MLP/NLinear no se reinterpretan como pesos de NeuralForecast.
-Las familias temporales nuevas usan esquema 2, `protocol = temporal_cv` e
-inicialización `fresh`. Las familias anteriores se rechazan con una indicación
-de ejecutar `prepare-backtest`; no se reinterpretan ni se sobrescriben.
+Las familias temporales nuevas usan esquema 5, `protocol = temporal_cv`,
+inicialización `fresh`, los extremos del calendario y del histórico inicial y
+el mínimo efectivo de estaciones comunes.
+Retira las opciones antiguas `step-hours`, `fold-gap-hours` o fechas manuales de
+`[prepare-backtest]` y vuelve a ejecutarlo. Los manifests anteriores no se
+reinterpretan ni se sobrescriben.
 
 Pruebas:
 

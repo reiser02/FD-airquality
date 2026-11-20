@@ -3,7 +3,7 @@
 References: arXiv:2403.12313, 2409.05976, 2411.14961v3; LoRA-FAIR
 server.py at jmbian/LoRA-FAIR@6afb36c4d8ff9f7b5dce5fd4be7728d4f9467d5a.
 FAIR follows the released column-wise cosine loss and squared L2 regularizer.
-All clients use identical ranks/scaling in this benchmark. No server data needed.
+All clients use identical ranks/scaling within each federated run. No server data needed.
 """
 
 from __future__ import annotations

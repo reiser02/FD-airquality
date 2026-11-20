@@ -106,7 +106,7 @@ def test_server_tracks_one_run_with_aggregate_fair_metrics(prepared, tmp_path, m
     candidate = "FlowState-R1 | federado | LoRA-FAIR | FedAvg"
     assert run.data.tags["candidate"] == candidate
     assert run.info.run_name.startswith(f"{candidate} | PM25 | ")
-    assert "benchmark" not in run.data.tags
+    assert not {"backtest", "fold"} & run.data.tags.keys()
     assert run.data.params["fair_iterations"] == "3"
     assert run.data.params["strategy"] == "fedavg"
     assert "proximal_mu" not in run.data.params

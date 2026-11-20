@@ -8,7 +8,8 @@ de los CSV, sin importar código ni configuración de otro proyecto.
 **Protocolo actual:** ventanas con ausencias conservadas, tratamiento del contexto
 por modelo, targets enmascarados, MASE/RMSSE y CRPS aproximado desde cuantiles.
 MLP/NLinear/NHITS usan el paquete **NeuralForecast 3.1.4**, no copias locales.
-La evaluación temporal separa desarrollo y holdout y, en federado, libera datos
+La evaluación temporal se ejecuta con `backtest`, incluso para un solo corte.
+Permite reservar un holdout de forma explícita y, en federado, libera datos
 **periódicamente dentro de cada fold**. Consulta [la guía de evaluación temporal](TEMPORAL_EVALUATION.md)
 para comandos, garantías, comparación estricta, cuantiles y limitaciones.
 
@@ -24,35 +25,37 @@ Requiere Python 3.11, `uv` y los datos de cinco minutos bajo
 
 ```bash
 uv sync --locked
-uv run fd-airquality prepare
-uv run fd-airquality inspect
-uv run fd-airquality simulate
+uv run fd-airquality prepare-backtest
+uv run fd-airquality backtest
 uv run fd-airquality models
 uv run pytest
 uv run ruff check src tests
 ```
 
-La configuración raíz utiliza todas las estaciones y tres semillas en las matrices.
-Para una prueba acotada usa `--config experiments/smoke.toml`; sus manifests se
-deben indicar explícitamente. El benchmark completo no se ejecuta al instalar.
+La configuración raíz prepara tres folds, usa todas las estaciones elegibles y
+ejecuta el backtest con una sola semilla (`42`). Para una prueba acotada usa
+`--config experiments/smoke.toml`;
+indica explícitamente el manifest que imprime `prepare-backtest`. El backtest
+no se ejecuta al instalar.
 
 Ejecuta los comandos desde la raíz de este repositorio. La CLI carga automáticamente
 [`fd-airquality.toml`](fd-airquality.toml): PM2.5, contexto común de **90 horas**, horizonte
-de 12 y stride de evaluación de 6 horas. Entrenamiento anterior a **2026-03-01**;
-validación `[2026-03-01, 2026-03-29)` y test `[2026-03-29, 2026-04-26)`.
-Los extremos derechos son exclusivos. Se conserva el calendario sin zona de los
-CSV, sin presumir que sea UTC. No se lee configuración de otro proyecto.
+de 12 y stride de evaluación de 6 horas. `prepare-backtest` calcula el calendario a
+partir de los CSV, incluso con un solo fold. Las fechas de `[prepare]` se usan solo
+para preparaciones individuales con `prepare`. Los extremos derechos son exclusivos.
+Se conserva el calendario sin zona de los CSV, sin presumir que sea UTC.
 
 `PM25` es el único contaminante admitido; también se acepta `pm25` en CLI y TOML.
 Se leen únicamente los CSV de PM25, sin modificar los archivos de otros contaminantes.
 Los manifests históricos de otros contaminantes no se usan para nuevas ejecuciones:
 vuelve a ejecutar `prepare` o `prepare-backtest` para generar los de PM25.
 
-`simulate` usa la preparación de PM25 más reciente, calcula automáticamente cuántas
+Para depurar una ejecución individual, `simulate` usa la preparación de PM25
+más reciente creada con `prepare`, calcula automáticamente cuántas
 estaciones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
-Ray y la API de mensajes de Flower 1.40. Por defecto ejecuta cinco rondas,
-una época local y un cliente simultáneo por GPU utilizable, hasta el número de
-estaciones; en CPU se ejecuta un cliente cada vez. No emplea la API
+Ray y la API de mensajes de Flower 1.40. Con el TOML raíz ejecuta cinco rondas
+con hasta 50 épocas locales por ronda. Ejecuta un cliente simultáneo por GPU
+utilizable, hasta el número de estaciones; en CPU, uno cada vez. No emplea la API
 obsoleta `start_simulation`. FedAvg/FedProx clásicos son oficiales; las variantes
 LoRA tienen su propia agregación de factores auditada.
 
@@ -66,36 +69,51 @@ No hay que configurar `workers` ni `client-gpus`; esas opciones ya no se admiten
 
 ### Configuración por archivo
 
-Edita `fd-airquality.toml` para no repetir argumentos. La prioridad es:
+Usa [`fd-airquality.toml`](fd-airquality.toml) como referencia: sus comentarios
+explican las opciones activas e incluyen ejemplos para las opcionales.
+Para una misma clave, la prioridad es:
 
 **argumento explícito en CLI > sección del comando > `[run]` > valor interno**.
 
 - `[prepare]`: fuentes, filtrado y geometría temporal.
-- `[run]`: opciones compartidas por `simulate`, `baseline`, `benchmark` y `backtest`.
-- `[simulate]`, `[baseline]`, `[benchmark]`, `[backtest]`: opciones específicas y overrides de `[run]`.
-- `[prepare-backtest]`: folds e historial; hereda `[prepare]` salvo el directorio de salida.
-- `[missing]`: políticas de tratamiento del contexto por modelo.
-- `[availability]`: umbrales de entrenamiento por modelo, sin modificar el scoring.
-- `[inspect]` y `[compare]`: también admiten sus opciones (`manifest`, `runs`, `output`).
+- `[run]`: opciones compartidas por `simulate`, `baseline` y `backtest`.
+- `[simulate]`, `[baseline]`, `[backtest]`: opciones específicas y valores que
+  sobrescriben `[run]`. Conviene fijar `manifest` y `output-dir` en estas tablas:
+  `backtest` requiere otro tipo de manifest. Si preparaste datos en una ruta
+  personalizada, indícalo: la búsqueda automática solo mira `data/federated/`
+  o `data/backtests/`.
+- `[prepare-backtest]`: folds, mínimo de estaciones comunes, historial y duraciones de validación y test por
+  fold. Hereda `[prepare]` salvo sus fechas fijas, duraciones por estación y directorio
+  de salida; las claves propias prevalecen sobre las heredadas.
+- `[missing]`: políticas de contexto por modelo cuando `missing-policy = "auto"`.
+- `[availability]`: umbrales por modelo que prevalecen sobre el umbral general
+  (`training-data-availability-threshold`), sin cambiar la evaluación.
+- `[inspect]` admite `manifest`; `[compare]` admite `runs`, `output` y
+  `allow-training-differences`. `[plot]` admite `output`, pero la fuente se pasa
+  como argumento posicional en la CLI.
 
-Las claves coinciden con los argumentos, sin `--`; las listas son arrays TOML.
-Por ejemplo:
+Las claves coinciden con los argumentos, sin `--`. Usa arrays TOML no vacíos para
+listas y comillas para las fechas de corte. `print-command` y
+`allow-training-differences` usan booleanos TOML (`true`/`false`); opciones como
+`early-stopping` y `probabilistic` usan enteros `0`/`1`. Por ejemplo:
 
 ```toml
 [run]
 selection-metric = "macro-mase"
 num-server-rounds = 10
 
-[benchmark]
+[backtest]
 models = ["mlp", "autoencoder", "nlinear", "nhits"]
 modes = ["local", "centralized", "federated"]
 ```
 
 ```bash
 # Usa el archivo predeterminado; este argumento prevalece sobre sus valores:
-uv run fd-airquality benchmark --num-server-rounds 2
+uv run fd-airquality backtest --num-server-rounds 2
 # Usa solo este otro archivo, sin heredar fd-airquality.toml:
-uv run fd-airquality benchmark --config experiments/smoke.toml
+uv run fd-airquality prepare-backtest --config experiments/smoke.toml
+uv run fd-airquality backtest --config experiments/smoke.toml \
+  --manifest data/smoke_backtests/<preparacion>/backtest_manifest.json
 ```
 
 `--config` funciona antes o después del subcomando. Las rutas relativas se resuelven
@@ -105,13 +123,42 @@ explícito inexistente, una clave desconocida o un tipo inválido producen un er
 Los argumentos de listas sustituyen la lista del archivo, también `--station`.
 `--no-print-command` permite desactivar un `print-command = true` del archivo.
 
-Para comparar estrategias, fija **el mismo manifest**:
+Si tienes un TOML antiguo con `[benchmark]`, traslada sus opciones a `[backtest]`
+y elimina la sección antigua. Para ejecutar la matriz en un único corte global,
+fija `folds = 1` en `[prepare-backtest]` o usa `prepare-backtest --folds 1`.
+
+Tras reservar el histórico inicial, el calendario observado se divide en bloques
+casi iguales. Cada bloque termina con validación y test; su parte anterior se
+añade al entrenamiento. `validation-hours` y `test-hours` en `[prepare-backtest]`
+limitan esas duraciones a **672 horas (28 días) cada una** por defecto, también
+con un solo fold. Se ajustan a las ventanas disponibles si no caben; la CLI
+muestra la duración efectiva. Por ejemplo, para validar 14 días y probar 28:
 
 ```bash
-uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.json \
-  --strategy fedavg --num-server-rounds 10
-uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.json \
-  --strategy fedprox --proximal-mu 0.01 --num-server-rounds 10
+uv run fd-airquality prepare-backtest --validation-hours 336 --test-hours 672
+```
+
+Con histórico expansivo, el siguiente fold puede entrenar con el test anterior
+y las horas observadas posteriores a él, sin mirar su propio test. El último
+test llega hasta la última hora observada en los datos seleccionados.
+
+Si cambian los CSV, vuelve a ejecutar `prepare-backtest`: no hay que editar fechas.
+Retira las opciones antiguas `step-hours`, `fold-gap-hours` o cortes fijos de
+`[prepare-backtest]`. Usa el nuevo `backtest_manifest.json` para evaluar.
+
+Al usar todas las estaciones, `min-stations = 15` en `[prepare-backtest]` exige
+al menos 15 estaciones en común entre los folds. Puedes cambiarlo en el TOML
+o con `prepare-backtest --min-stations N`. Para una prueba con una selección
+explícita (`--station` o `station = [...]`), basta con una estación común.
+En ambos casos siguen aplicándose los mínimos por estación y fold
+`min-train-windows`, `min-validation-windows` y `min-test-windows`, heredados de
+`[prepare]` y configurables también en `[prepare-backtest]`.
+
+Para comparar estrategias, usa **la misma preparación de folds**:
+
+```bash
+uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
+  --models mlp --modes federated --strategies fedavg fedprox --proximal-mu 0.01 --num-server-rounds 10
 ```
 
 ### Prueba pequeña con datos reales
@@ -156,7 +203,7 @@ Modelos disponibles con `--model`:
 | `nlinear` | NLinear del paquete NeuralForecast |
 | `nhits` | NHITS del paquete NeuralForecast, con su tratamiento de máscara en los residuos |
 | `ttm-r3` | Granite TTM-R3, checkpoint `90-30-dec-90-r3`, adaptación interna |
-| `patchtst-fm-r2` | Granite PatchTST-FM-R2, adaptación interna |
+| `patchtst-fm-r2` | Granite PatchTST-FM-R2, fuera de las matrices predeterminadas; solo por selección explícita |
 | `flowstate-r1` | Granite FlowState-R1/1.0, adaptación interna experimental |
 
 Los tres Granite cargan **pesos preentrenados reales**, con revisiones SHA fijadas;
@@ -172,24 +219,25 @@ pérdida. Todos los modelos comparten el mismo manifest; no se inventa historia.
 No compares directamente con las preparaciones históricas de 72/512.
 
 ```bash
-uv run fd-airquality prepare --context 90
-# Ejecuta la matriz completa sobre la preparación más reciente:
-uv run fd-airquality benchmark --num-server-rounds 5
+uv run fd-airquality prepare-backtest --context 90
+# Ejecuta la matriz completa por fold en la preparación más reciente:
+uv run fd-airquality backtest --num-server-rounds 5
 ```
 
-`benchmark` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
+En cada fold, `backtest` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
 (LoRA, FFA-LoRA, FLoRA y LoRA-FAIR), y controles local/centralizado con LoRA y A
-congelada. Son **27 configuraciones de foundations**, más doce controles clásicos:
-**39 ejecuciones** con una semilla y rango. Zero-shot no se duplica por semilla/rango;
-los clásicos no se duplican por rango. Las tres semillas del TOML raíz producen
-111 ejecuciones por fold. La CV por defecto evalúa todos los folds y publica su
-media, sin seleccionar una configuración. El flujo de desarrollo/holdout requiere
+congelada. Con TTM-R3 y FlowState-R1 por defecto son **18 configuraciones de foundations**,
+**12 controles clásicos**: **30 ejecuciones por fold** con la semilla y el rango
+predeterminados. Zero-shot se ejecuta una sola vez por fold aunque se indiquen
+varias semillas; los clásicos no se duplican por rango. Por defecto el backtest
+evalúa todos los folds y publica su media, sin seleccionar una configuración.
+El flujo de desarrollo/holdout requiere
 `--stage development` explícito. FLoRA y LoRA-FAIR no tienen modalidades
 centralizadas nativas ni se cruzan automáticamente con FedProx.
 
 ### Modos secuenciales y candidatos paralelos por GPU
 
-La matriz respeta el orden de `--modes` / `[benchmark].modes`; por defecto:
+En cada fold, la matriz respeta el orden de `--modes` / `[backtest].modes`; por defecto:
 **local → centralizado → federado → zero-shot**. Todos los casos de un modo deben
 terminar antes de comenzar el siguiente.
 
@@ -211,7 +259,7 @@ El límite de candidatos **no limita** los clientes de una federación.
 
 ```bash
 # Dos candidatos como máximo en los modos no federados; en federado, Ray gestiona clientes:
-uv run fd-airquality benchmark --device cuda --max-parallel-models 2
+uv run fd-airquality backtest --device cuda --max-parallel-models 2
 ```
 
 Para limitar las GPUs visibles se puede usar `CUDA_VISIBLE_DEVICES` antes de iniciar
@@ -223,14 +271,20 @@ Cada candidato debe caber por sí mismo en memoria. No se reducen automáticamen
 batch, contexto, estaciones ni precisión ante un OOM: el error detiene la matriz.
 Más concurrencia puede aumentar el uso de RAM/VRAM y no garantiza menor duración.
 
-La primera ejecución descarga los pesos. PatchTST tiene unos 385 millones de
-parámetros (1,54 GB de pesos). LoRA necesita backpropagation dentro del backbone;
-el benchmark completo en CPU puede ser costoso y no se lanza al instalar.
+La primera ejecución con Granite descarga los pesos. LoRA necesita
+backpropagation dentro del backbone; el backtest completo en CPU puede ser
+costoso y no se lanza al instalar. Si eliges PatchTST explícitamente, ten en
+cuenta que tiene unos 385 millones de parámetros (1,54 GB de pesos).
 
 PatchTST usa autocast BF16 en CUDA solo si la GPU tiene soporte **nativo**; en GPUs
 como la RTX 2080 Ti se ejecuta en FP32, también durante el entrenamiento de LoRA.
 La emulación de tensores BF16 no basta para sus convoluciones cuDNN. No se desactiva
 cuDNN ni se cambia la precisión de los otros modelos.
+
+Para el checkpoint fijado de PatchTST se vectoriza la reconstrucción de parches
+en FP32 cuando el ancho es el doble del stride. Conserva el orden de suma y el
+gradiente sin recorrer los parches en Python. Las revisiones alternativas, la
+ruta BF16 y otras geometrías mantienen la operación del paquete.
 
 En CUDA, PatchTST divide entrenamiento y evaluación en microbatches de hasta 8
 ventanas. El DataLoader de entrenamiento conserva los batches originales: se
@@ -250,7 +304,7 @@ El evento `stage=cuda-cleanup` registra los MiB asignados y reservados tras la l
 Puedes limitar la matriz, sin cambiar el soporte temporal:
 
 ```bash
-uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
+uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
   --models mlp autoencoder nlinear nhits --modes local centralized federated
 ```
 
@@ -304,23 +358,24 @@ Se conservan las horas ausentes, sin compactar ni ampliar la referencia para com
 `inspect` muestra los pares disponibles; con `unfloored`, una escala nula o con
 pares insuficientes queda indefinida. El TOML raíz exige al menos 24 pares;
 `epsilon` aplica suelos ε y ε² sin inventar pares.
-Antes de entrenar, `simulate`, `baseline` y `benchmark` descartan las estaciones
+Antes de entrenar, `simulate`, `baseline` y `backtest` descartan las estaciones
 cuya **métrica de selección de validación** no esté definida. La regla es común a
 local, centralizado, federado y zero-shot: no se deja una estación en unos candidatos
-y fuera de otros. Cada descarte aparece en el log y en `excluded_stations.csv`, con
-estación, motivo, métrica, intervalo de referencia y número de pares. Se distingue
+y fuera de otros. En `backtest` se fija un panel común a los folds de evaluación
+y se audita en `temporal_exclusions.csv`. Para una ejecución individual, los
+descartes aparecen en el log y en `excluded_stations.csv`. Se distingue
 entre ausencia de pares, cobertura insuficiente y escala cero con pares disponibles.
 Si todas quedan descartadas, se guarda el informe y se aborta antes de entrenar.
-La preparación original y sus NPZ no se alteran; se genera un `runtime_manifest.json`
-con el panel efectivo y las identidades originales. La matriz lo fija una sola vez.
+La preparación original y sus NPZ no se alteran; el panel efectivo queda en los
+manifests de cada fold o en `runtime_manifest.json` para ejecuciones individuales.
 La alternativa explícita es `--selection-metric macro-rmsse`. No hay cambio
 automático de métrica ni ampliación de referencia. Los fallos de integridad o de
 entrenamiento siguen abortando, sin cambiar el panel a mitad del experimento.
 La normalización de entrada sigue ajustándose únicamente con entrenamiento.
 Las evaluaciones nuevas calculan MASE/RMSSE sobre los targets observados en
-unidades originales, sin calcular MAE/RMSE no escalados ni evaluar persistencia
-con esas métricas. `comparison.csv` compara candidatos agregados e incluye mejoras
-frente a un único zero-shot con revisión y configuración de inferencia compatibles.
+unidades originales, sin calcular MAE/RMSE no escalados. `comparison.csv`
+compara candidatos agregados e incluye mejoras frente a un único zero-shot
+con revisión y configuración de inferencia compatibles.
 `pairwise_comparison.csv` compara **todos contra todos**, en ambas direcciones,
 para macro-MASE, macro-RMSSE y CRPS cuando se dispone de cuantiles. Delta = A − B:
 negativo favorece A; mejora (%) = `100 × (1 − A/B)`: positiva favorece A y queda vacía si B=0.
@@ -339,9 +394,9 @@ no tests IID sobre targets solapados.
 ### Gráficas de test sin reentrenar
 
 ```bash
-uv run fd-airquality plot reports/benchmarks/<benchmark>
+uv run fd-airquality plot reports/backtests/<backtest>/fold_001
 # También acepta el directorio comparison o el archivo comparison.csv:
-uv run fd-airquality plot reports/benchmarks/<benchmark>/comparison --output reports/graficas-pm25
+uv run fd-airquality plot reports/backtests/<backtest>/fold_001/comparison --output reports/graficas-pm25
 ```
 
 Abre `index.html` en el directorio de salida (por defecto, `<comparación>/plots`).
@@ -361,13 +416,13 @@ favorece a federado si es positiva; queda indefinida si el denominador es cero.
 `plots.json` conserva la procedencia y los avisos de `compare`. Los cruces entre
 modelos son descriptivos: no aíslan el efecto de federar.
 
-### Prueba de integración pequeña para los seis modelos
+### Prueba de integración con pocas estaciones
 
 ```bash
-uv run fd-airquality prepare --context 90 --max-train-windows 8 --min-train-windows 1 \
-  --station 'AQN1 - Puerto' --station 'AQN2 - San Francisco' --output data/benchmark_smoke
-uv run fd-airquality benchmark --manifest data/benchmark_smoke/<preparacion>/manifest.json \
-  --num-server-rounds 1 --batch-size 8
+uv run fd-airquality prepare-backtest --config experiments/smoke.toml --folds 1
+uv run fd-airquality backtest --config experiments/smoke.toml \
+  --manifest data/smoke_backtests/<preparacion>/backtest_manifest.json \
+  --num-server-rounds 1
 ```
 
 Esta prueba valida la integración, **no estima el rendimiento del experimento
@@ -376,15 +431,15 @@ completo**. No compares sus puntuaciones con las de un manifest sin límite.
 Varias semillas y rangos sobre las mismas ventanas:
 
 ```bash
-uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
-  --models ttm-r3 patchtst-fm-r2 flowstate-r1 \
+uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
+  --models ttm-r3 flowstate-r1 \
   --adaptations lora ffa-lora flora lora-fair --seeds 42 43 44 --lora-ranks 4 8
 ```
 
 Valores iniciales: `--lora-rank 4 --lora-alpha 8 --lora-dropout 0`.
 Un rango excesivo falla, no se recorta. FAIR añade refinamiento de servidor:
 `--fair-iterations 1000 --fair-learning-rate 0.01 --fair-lambda 1`.
-Reducir iteraciones para un smoke cambia el presupuesto, no es un benchmark completo.
+Reducir iteraciones para una prueba de integración cambia el presupuesto de entrenamiento.
 Con `--device cuda`, FAIR refina en la primera GPU visible del servidor una capa
 cada vez, después de recibir las actualizaciones de los clientes. Los factores y
 checkpoints vuelven a CPU. Se mantienen los pesos por soporte, la precisión de
@@ -441,20 +496,22 @@ identidad del candidato; entrenamiento y evaluación añaden estación, ronda/é
 y lotes cuando corresponde. El log informa también de carga de modelos, selección
 de checkpoints, descartes, fallback a CPU, errores con traceback e interrupciones.
 
-En una matriz bajo `reports/benchmarks/<benchmark>/`:
+`backtest.log` registra el arranque, el panel común y el progreso entre folds;
+`backtest.json` registra sus estados. En cada `fold_001/`, `fold_002/`,
+etc., bajo `reports/backtests/<backtest>/`:
 
-- `benchmark.log`: eventos globales y progreso de candidatos, con escritura coordinada
+- `fold.log`: eventos del fold y progreso de candidatos, con escritura coordinada
   mediante una cola; los procesos no escriben concurrentemente en ese mismo archivo.
 - `logs/case_0001.log`, etc.: detalle de cada candidato; los casos en subprocesos
   incluyen su salida combinada de stdout/stderr. Sus TOML efectivos quedan al lado.
 - `runs/case_0001/<ejecucion>/run.log`, etc.: log propio del baseline o servidor.
-- `benchmark.json`: estado por caso (`pending`, `running`, `completed`, `failed`,
+- `candidates.json`: estado por caso (`pending`, `running`, `completed`, `failed`,
   `cancelled`), GPU asignada, ruta del log y resultado. Se reemplaza atómicamente
   para poder leerlo mientras se actualiza.
 
 ```bash
-tail -F reports/benchmarks/<benchmark>/benchmark.log
-tail -F reports/benchmarks/<benchmark>/logs/case_0001.log
+tail -F reports/backtests/<backtest>/fold_001/fold.log
+tail -F reports/backtests/<backtest>/fold_001/logs/case_0001.log
 ```
 
 `--heartbeat-seconds 60` emite un resumen periódico con etapa, contadores, tiempo
@@ -463,15 +520,26 @@ monitor, no una prueba de avance del entrenamiento ni una estimación de finaliz
 El mismo intervalo limita los mensajes intermedios por lotes. Se puede reducir,
 por ejemplo con `--heartbeat-seconds 15`, o ajustar el nivel mediante
 `--log-level DEBUG|INFO|WARNING|ERROR` (predeterminado `INFO`). También son opciones
-de `[run]` en el TOML; para `prepare` pertenecen a `[prepare]`.
+de `[run]` en el TOML; para preparar datos pertenecen a `[prepare]` o `[prepare-backtest]`.
 
 Los baselines independientes guardan `run.log` en su directorio de resultados.
 `simulate` conserva el flujo real de Flower en `flower.log`, además del `run.log`
 del servidor y `clients/client_000.log`, etc., para el detalle de los clientes.
 Su auditoría y logs previos al lanzamiento quedan en `.flwr/launches/<lanzamiento>/`;
-el flujo se copia a los resultados al completar la simulación. La CLI de `prepare`
-escribe en `<output>/logs/prepare_<sello>/run.log` y, tras finalizar correctamente,
-lo copia a `prepare.log` junto al manifest generado.
+el flujo se copia a los resultados al completar la simulación. `prepare` y
+`prepare-backtest` escriben en `<output>/logs/prepare_<sello>/run.log` y, si
+terminan correctamente, lo copian a `prepare.log` junto al manifest generado.
+Si fallan, la CLI muestra la ruta del log original.
+
+En `prepare-backtest`, `INFO` muestra el calendario, los cortes y el soporte real
+por fold. `WARNING` avisa si se reduce el histórico inicial o se acorta la
+validación o el test para que quepan. `CRITICAL` aborta si no caben los mínimos
+o si el panel común no alcanza `min-stations` (una estación con selección explícita).
+El backtest también comprueba el mínimo antes de entrenar, tras excluir estaciones
+sin métrica de validación definida. El aviso de demasiados folds indica
+cuántas horas hacen falta y el máximo **teórico**; la disponibilidad real de
+ventanas puede reducirlo. Con `DEBUG` se muestra también la cobertura horaria
+por estación y el ajuste de las duraciones al stride.
 
 Un fallo cancela los casos activos y pendientes antes de iniciar otro modo; no
 genera una comparación parcial como si estuviese completa. Al interrumpir Flower,
@@ -480,7 +548,7 @@ ni otras ejecuciones. Si esa solicitud falla, el error se conserva en el log.
 
 ## MLflow
 
-MLflow está instalado y **activo por defecto** en simulaciones y baselines.
+MLflow está instalado y **activo por defecto** en los candidatos del backtest y en ejecuciones individuales.
 Con los directorios estándar usa SQLite en `reports/mlflow.db`, sin requerir un
 servidor. La ruta efectiva y el ID de cada ejecución quedan en `mlflow.json`.
 
@@ -491,10 +559,11 @@ uv run mlflow ui --backend-store-uri sqlite:///reports/mlflow.db --host 127.0.0.
 Abre `http://127.0.0.1:5000` y el experimento `fd-airquality`; selecciona las
 ejecuciones de interés para compararlas. Los runs nuevos tienen nombres legibles y
 la etiqueta `candidate` (modelo, modo, adaptación y estrategia federada). Los
-candidatos de una matriz añaden `benchmark` (contaminante y hora de inicio UTC). Por ejemplo:
+candidatos del backtest añaden `backtest` (contaminante y hora de inicio UTC)
+y `fold` (número de corte). Por ejemplo:
 
 ```text
-tags.benchmark = 'PM25 | 2026-11-04 09:18:36 UTC' AND tags.candidate = 'PatchTST-FM-R2 | federado | LoRA-FAIR | FedAvg'
+tags.backtest = 'PM25 | 2026-11-04 09:18:36 UTC' AND tags.fold = '1' AND tags.candidate = 'PatchTST-FM-R2 | federado | LoRA-FAIR | FedAvg'
 ```
 
 Usa `params.seed` y, para adaptadores LoRA, `params.lora_rank` para distinguir
@@ -524,7 +593,7 @@ de ejecución, no la preparación ni la carga inicial de metadatos previa.
 Para elegir almacenamiento, experimento o servidor existente:
 
 ```bash
-uv run fd-airquality benchmark --manifest data/federated/<preparacion>/manifest.json \
+uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
   --mlflow-tracking-uri sqlite:///reports/mlflow.db --mlflow-experiment comparacion-pm25
 uv run fd-airquality simulate --mlflow-tracking-uri http://127.0.0.1:5000
 ```
@@ -541,7 +610,9 @@ usa los archivos locales. Los logs detallados de actores Ray se conservan localm
 
 ## Resultados y auditoría
 
-Cada preparación crea un directorio nuevo bajo `data/federated/`:
+`prepare-backtest` crea una familia nueva bajo `data/backtests/`, con un
+`backtest_manifest.json` que apunta a los manifests de cada fold. Tanto los folds
+como las preparaciones individuales de `prepare` (bajo `data/federated/`) guardan:
 
 - `manifest.json`: identidad, protocolo, hashes y metadatos de cada cliente; sin mediciones ni escaladores.
 - `clients/000/series.npz`, etc.: serie e índices de ventanas **locales** a cada estación.
@@ -554,7 +625,7 @@ Los manifests con ventanas enmascaradas usan `schema_version=5`; la referencia
 estricta conserva el esquema 4. Ambos registran hashes del código local de
 preparación. Guardan límites y recuentos de pares de referencia para validación y
 test; los denominadores permanecen en los NPZ locales, separados por split.
-Las preparaciones antiguas deben regenerarse con `prepare`; no se
+Las preparaciones antiguas incompatibles deben regenerarse; no se
 modifican ni se sobrescriben. Los resultados históricos se conservan.
 
 Preparación histórica de otros contaminantes (ya no admitidos), verificada el
@@ -588,13 +659,14 @@ Cada simulación escribe un directorio nuevo bajo `reports/federated/`:
 - `resource_metrics.json`: tiempo del coordinador y máximo RSS de su proceso.
 
 Los baselines generan el mismo esquema CSV/JSON bajo `reports/non_federated/`;
-el modo local guarda además un checkpoint por estación. Las matrices se escriben
-bajo `reports/benchmarks/`, con los resultados individuales y una comparación final.
-La raíz de la matriz conserva también `excluded_stations.csv` y, si hay descartes,
-`runtime_manifest.json`; el launcher deja su auditoría previa en `.flwr/launches/`.
-`benchmark.json` registra todos los casos y su estado. Un fallo detiene la matriz
-y queda marcado; no se omiten combinaciones silenciosamente.
-Cada caso usa `runs/case_<numero>/` para aislar sus resultados. El bloque `execution`
+el modo local guarda además un checkpoint por estación. Bajo `reports/backtests/`,
+cada backtest guarda la comparación individual en `fold_NNN/comparison/` y el
+resumen entre folds en `cv_fold_mean.csv` para `--stage evaluation`, además de
+`temporal_comparison.csv` con los resultados de todos los casos evaluados.
+`temporal_exclusions.csv` audita el panel común y `backtest.json` registra el
+estado de los folds. Un fallo detiene el backtest y queda marcado; no se omiten
+combinaciones silenciosamente.
+Cada caso usa `runs/case_<numero>/` dentro de su fold. El bloque `execution`
 de `run.json` registra PID y `CUDA_VISIBLE_DEVICES`; el dispositivo efectivo sigue
 en `settings.device`.
 

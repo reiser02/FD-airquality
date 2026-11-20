@@ -30,7 +30,7 @@ def test_toml_defaults_and_preparation_overrides_are_valid(tmp_path, monkeypatch
     for key, value in asdict(DataConfig()).items():
         assert getattr(data, key) == (6 if key == "train_stride" else value)
     assert data.station == ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
-    for command in ("simulate", "baseline", "benchmark"):
+    for command in ("simulate", "baseline", "backtest"):
         args = arguments([command])
         for key, value in asdict(RunSettings()).items():
             if key not in {"manifest", "output_dir"}:
@@ -45,7 +45,7 @@ def test_explicit_toml_is_valid_without_requiring_builtin_defaults(tmp_path):
     geometry = DataConfig(**{field.name: getattr(data, field.name)
                              for field in fields(DataConfig) if getattr(data, field.name) is not None})
     assert (geometry.context, geometry.horizon, geometry.stride) == (24, 6, 3)
-    for command in ("simulate", "baseline", "benchmark"):
+    for command in ("simulate", "baseline", "backtest"):
         args = arguments([command, "--config", str(path)])
         settings = RunSettings(**{field.name: getattr(args, field.name) for field in fields(RunSettings)})
         assert (settings.seed, settings.batch_size) == (17, 16)
@@ -68,11 +68,55 @@ def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     assert arguments(["backtest", "--stage", "development"]).stage == "development"
 
 
+def test_default_matrix_requires_opt_in_for_patchtst():
+    root_config = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
+    for config in ([], ["--config", str(root_config)]):
+        args = arguments(["backtest", *config])
+        assert args.models == [
+            "mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "flowstate-r1",
+        ]
+        assert arguments(["backtest", *config, "--models", "patchtst-fm-r2"]).models == ["patchtst-fm-r2"]
+
+
+@pytest.mark.parametrize("filename,modes,seeds,folds", [
+    ("fd-airquality.toml", ["local", "centralized", "federated", "zero-shot"], [42], 3),
+    ("experiments/smoke.toml", ["local", "centralized", "federated"], [42], 2),
+])
+def test_shipped_backtest_configs_keep_modes_seeds_and_fold_counts(filename, modes, seeds, folds):
+    config = Path(__file__).resolve().parents[1] / filename
+    evaluation = arguments(["backtest", "--config", str(config)])
+    assert evaluation.modes == modes
+    assert evaluation.seeds == seeds
+    assert evaluation.adaptations == ["lora", "ffa-lora", "flora", "lora-fair"]
+    preparation = arguments(["prepare-backtest", "--config", str(config)])
+    assert preparation.folds == folds
+    assert preparation.min_stations == 15
+    assert not hasattr(preparation, "test_end")
+
+
+def test_backtest_inherits_geometry_but_not_the_fixed_cuts_or_station_split_lengths(tmp_path):
+    path = tmp_path / "experiment.toml"
+    path.write_text('[prepare]\ncontext = 16\nvalidation-start = "2026-03-01"\n'
+                    'test-start = "2026-03-29"\ntest-end = "2026-04-26"\nvalidation-hours = 48\ntest-hours = 96\n'
+                    'min-train-windows = 16\nmin-validation-windows = 7\nmin-test-windows = 15\n'
+                    '[prepare-backtest]\nfolds = 3\ntest-hours = 504\nmin-stations = 12\nmin-validation-windows = 10\n')
+    args = ["prepare-backtest", "--config", str(path)]
+    temporal = arguments([*args, "--folds", "1", "--test-hours", "672", "--min-stations", "8"])
+    assert (temporal.context, temporal.folds) == (16, 1)
+    assert not {"validation_start", "test_start", "test_end"} & vars(temporal).keys()
+    assert (temporal.validation_hours, temporal.test_hours) == (672, 672)
+    assert arguments(args).test_hours == 504
+    assert (arguments(args).min_stations, temporal.min_stations) == (12, 8)
+    assert (temporal.min_train_windows, temporal.min_validation_windows, temporal.min_test_windows) == (16, 10, 15)
+    standalone = arguments(["prepare", "--config", str(path)])
+    assert (standalone.test_end, standalone.validation_hours, standalone.test_hours) == ("2026-04-26", 48, 96)
+
+
 def test_new_blocks_are_default_without_changing_fold_history(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     removed = {"arrival_history", "arrival_history_hours"}
     assert not removed.intersection(asdict(RunSettings()))
-    for command in ("simulate", "baseline", "benchmark", "backtest"):
+    for command in ("simulate", "baseline", "backtest"):
         assert not removed.intersection(vars(arguments([command])))
         for option in ("--arrival-history", "--arrival-history-hours"):
             with pytest.raises(SystemExit):
@@ -130,28 +174,32 @@ def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypat
     monkeypatch.chdir(tmp_path)
     (tmp_path / "fd-airquality.toml").write_text(
         '[prepare]\nstation = ["old-a", "old-b"]\n'
-        '[benchmark]\nmodels = ["mlp", "autoencoder"]\nseeds = [1, 2]\n'
+        '[backtest]\nmodels = ["mlp", "autoencoder"]\nseeds = [1, 2]\n'
     )
     assert arguments(["prepare"]).station == ["old-a", "old-b"]
     assert arguments(["prepare", "--station", "new"]).station == ["new"]
-    args = arguments(["benchmark", "--models", "nlinear", "--seeds", "42"])
+    args = arguments(["backtest", "--models", "nlinear", "--seeds", "42"])
     assert (args.models, args.seeds) == (["nlinear"], [42])
 
 
 @pytest.mark.parametrize("text, diagnostic", [
     ('[unknown]\nseed = 1', r"Secciones desconocidas .*unknown"),
+    ('[benchmark]\nseeds = [7]', r"\[benchmark\].*Traslada sus opciones a \[backtest\]"),
+    ('[prepare-backtest]\nstep-hours = 48', r"\[prepare-backtest\].step-hours.*datos observados"),
+    ('[prepare-backtest]\nfold-gap-hours = 0', r"\[prepare-backtest\].fold-gap-hours.*datos observados"),
+    ('[prepare-backtest]\ntest-end = "2026-04-26"', r"\[prepare-backtest\].test-end.*datos observados"),
     ('[run]\nsead = 1', r"Opción desconocida .*\[run\]\.sead"),
     ('[run]\nworkers = 1', r"Opción desconocida .*\[run\]\.workers"),
     ('[simulate]\nworkers = 2', r"Opción desconocida .*\[simulate\]\.workers"),
     ('[simulate]\nclient-gpus = 1.0', r"Opción desconocida .*\[simulate\]\.client-gpus"),
-    ('[benchmark]\nworkers = 2', r"Opción desconocida .*\[benchmark\]\.workers"),
-    ('[benchmark]\nclient-gpus = 1.0', r"Opción desconocida .*\[benchmark\]\.client-gpus"),
+    ('[backtest]\nworkers = 2', r"Opción desconocida .*\[backtest\]\.workers"),
+    ('[backtest]\nclient-gpus = 1.0', r"Opción desconocida .*\[backtest\]\.client-gpus"),
     ('[run]\nbatch-size = "32"', r"\[run\]\.batch-size: tipo inválido"),
     ('[run]\nseed = true', r"\[run\]\.seed: tipo inválido"),
     ('[run]\nbatch-size = 1.5', r"\[run\]\.batch-size: tipo inválido"),
-    ('[benchmark]\nmodels = "mlp"', r"\[benchmark\]\.models: se requiere una lista"),
-    ('[benchmark]\nmodels = ["unknown"]', r"\[benchmark\]\.models: 'unknown' no está entre"),
-    ('[benchmark]\nseeds = []', r"\[benchmark\]\.seeds: se requiere una lista no vacía"),
+    ('[backtest]\nmodels = "mlp"', r"\[backtest\]\.models: se requiere una lista"),
+    ('[backtest]\nmodels = ["unknown"]', r"\[backtest\]\.models: 'unknown' no está entre"),
+    ('[backtest]\nseeds = []', r"\[backtest\]\.seeds: se requiere una lista no vacía"),
     ('[simulate]\nprint-command = 1', r"\[simulate\]\.print-command: tipo inválido"),
     ('[run]\nlearning-rate = true', r"\[run\]\.learning-rate: tipo inválido"),
     ('[prepare]\nraw-root = 1', r"\[prepare\]\.raw-root: tipo inválido"),
@@ -242,9 +290,12 @@ def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_pat
     monkeypatch.chdir(tmp_path)
     (tmp_path / "fd-airquality.toml").write_text(
         '[run]\nheartbeat-seconds = 15\nlog-level = "DEBUG"\n'
-        '[benchmark]\nmax-parallel-models = 2\n'
+        '[backtest]\nmax-parallel-models = 2\n'
         'modes = ["centralized", "local", "zero-shot", "federated"]\n'
+        'lora-ranks = [4, 8]\nstrategies = ["fedprox", "fedavg"]\n'
     )
-    args = arguments(["benchmark", "--max-parallel-models", "1", "--heartbeat-seconds", "30"])
+    args = arguments(["backtest", "--max-parallel-models", "1", "--heartbeat-seconds", "30"])
     assert (args.max_parallel_models, args.heartbeat_seconds, args.log_level) == (1, 30.0, "DEBUG")
     assert args.modes == ["centralized", "local", "zero-shot", "federated"]
+    assert args.lora_ranks == [4, 8]
+    assert args.strategies == ["fedprox", "fedavg"]

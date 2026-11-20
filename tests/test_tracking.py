@@ -7,13 +7,13 @@ from mlflow import MlflowClient
 
 from fd_airquality.baselines import run_baseline
 from fd_airquality.settings import RunSettings
-from fd_airquality.tracking import RunTracker, benchmark_tags, run_labels, tracking_uri, write_run
+from fd_airquality.tracking import RunTracker, backtest_tags, run_labels, tracking_uri, write_run
 
 
 @pytest.mark.parametrize("failure", [False, True])
 def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepared, tmp_path, monkeypatch, failure, mlflow_uri):
     path, _ = prepared
-    output_dir = tmp_path / "benchmark_20261104_091836_270422" / "runs" / "case_0001"
+    output_dir = tmp_path / "backtest_20261104_091836" / "fold_001" / "runs" / "case_0001"
     settings = RunSettings(manifest=str(path), output_dir=str(output_dir), num_server_rounds=1,
                            mlflow_tracking_uri=mlflow_uri, mlflow_experiment="test-airquality")
     if failure:
@@ -34,9 +34,10 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
     assert run.data.tags["adaptation"] == "full"
     assert run.data.params["data.context"] == "6"
     assert "manifest_sha256" in run.data.tags
-    assert run.data.tags["benchmark"] == "PM25 | 2026-11-04 09:18:36 UTC"
+    assert run.data.tags["backtest"] == "PM25 | 2026-11-04 09:18:36 UTC"
+    assert run.data.tags["fold"] == "1"
     assert run.data.tags["candidate"] == "MLP | centralizado | completo"
-    assert run.info.run_name == "MLP | centralizado | completo | PM25 | 2026-11-04 09:18:36 UTC"
+    assert run.info.run_name == "MLP | centralizado | completo | PM25 | 2026-11-04 09:18:36 UTC | fold 1"
     assert run.data.params["seed"] == "42"
     assert not {"model", "model.name", "model.context", "adaptation", "strategy", "proximal_mu",
                 "mlflow_tracking_uri", "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level",
@@ -116,17 +117,19 @@ def test_cpu_run_metadata_never_initializes_cuda_or_cudnn(prepared, tmp_path, mo
 
 
 @pytest.mark.parametrize("directory,expected", [
-    ("reports/benchmark_20261104_091836_270422/runs/case_0029", {"benchmark": "PM25 | 2026-11-04 09:18:36 UTC"}),
-    ("/missing/path/fold_003/benchmark_20261104_091836_270422/runs/case_10000/",
-     {"benchmark": "PM25 | 2026-11-04 09:18:36 UTC"}),
-    ("reports/benchmark_20261104_091836/runs/case_0029", {"benchmark": "PM25 | 2026-11-04 09:18:36 UTC"}),
-    ("reports/benchmark_20261304_091836_270422/runs/case_0029", {}),
-    ("reports/benchmark_20261104_091836_270422/runs/case_0029_copy", {}),
-    ("reports/benchmark_20261104_091836_270422/not-runs/case_0029", {}),
+    ("reports/backtest_20261104_091836/fold_001/runs/case_0029", {"backtest": "PM25 | 2026-11-04 09:18:36 UTC", "fold": "1"}),
+    ("/missing/path/backtest_20261104_091836/fold_003/runs/case_10000/",
+     {"backtest": "PM25 | 2026-11-04 09:18:36 UTC", "fold": "3"}),
+    ("reports/backtest_20261104_091836_1/fold_003/runs/case_0029",
+     {"backtest": "PM25 | 2026-11-04 09:18:36 UTC", "fold": "3"}),
+    ("reports/backtest_20261304_091836/fold_001/runs/case_0029", {}),
+    ("reports/backtest_20261104_091836/fold_001/runs/case_0029_copy", {}),
+    ("reports/backtest_20261104_091836/fold_001/not-runs/case_0029", {}),
+    ("reports/backtest_20261104_091836/runs/case_0029", {}),
     ("reports/non_federated", {}),
 ])
-def test_benchmark_tags_derive_the_matrix_label_without_reading_or_renaming_paths(directory, expected):
-    assert benchmark_tags(directory, "PM25") == expected
+def test_backtest_tags_derive_the_group_and_fold_without_reading_paths(directory, expected):
+    assert backtest_tags(directory, "PM25") == expected
 
 
 @pytest.mark.parametrize("model,mode,adaptation,strategy,candidate", [
@@ -149,7 +152,7 @@ def test_duplicate_display_names_remain_separate_and_filterable_by_seed_and_rank
     client = MlflowClient(tracking_uri=mlflow_uri)
     ids = {}
     for seed, rank in ((42, 4), (42, 8), (43, 4)):
-        output_dir = tmp_path / "benchmark_20261104_091836_270422" / "runs" / f"case_{len(ids) + 1:04d}"
+        output_dir = tmp_path / "backtest_20261104_091836" / "fold_001" / "runs" / f"case_{len(ids) + 1:04d}"
         output = output_dir / "run"
         output.mkdir(parents=True)
         settings = RunSettings(manifest=str(path), output_dir=str(output_dir), seed=seed, lora_rank=rank,
@@ -158,7 +161,7 @@ def test_duplicate_display_names_remain_separate_and_filterable_by_seed_and_rank
             ids[seed, rank] = tracker.run_id
 
     experiment = client.get_experiment_by_name("fd-airquality")
-    query = ("tags.benchmark = 'PM25 | 2026-11-04 09:18:36 UTC' "
+    query = ("tags.backtest = 'PM25 | 2026-11-04 09:18:36 UTC' AND tags.fold = '1' "
              "AND tags.candidate = 'FlowState-R1 | federado | LoRA | FedAvg'")
     runs = client.search_runs([experiment.experiment_id], filter_string=query)
     assert {run.info.run_id for run in runs} == set(ids.values()) and len(runs) == 3

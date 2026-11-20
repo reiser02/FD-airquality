@@ -11,7 +11,9 @@ from pathlib import Path
 from fd_airquality.settings import RunSettings
 
 DEFAULT_CONFIG = Path("fd-airquality.toml")
-RUN_COMMANDS = {"simulate", "baseline", "benchmark", "backtest"}
+RUN_COMMANDS = {"simulate", "baseline", "backtest"}
+FIXED_PREPARE_DATES = {"train_start", "validation_start", "test_start", "test_end"}
+STANDALONE_PREPARE_FIELDS = FIXED_PREPARE_DATES | {"validation_hours", "test_hours"}
 
 
 def _value(action: argparse.Action, value, location: str):
@@ -42,6 +44,11 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
             document = tomllib.load(stream)
         except tomllib.TOMLDecodeError as exc:
             raise ValueError(f"TOML inválido en {path}: {exc}") from exc
+    if "benchmark" in document:
+        raise ValueError(
+            f"{path}: [benchmark] ya no se admite. Traslada sus opciones a [backtest]; "
+            "para un solo corte usa folds = 1 en [prepare-backtest]."
+        )
     unknown = document.keys() - (commands.keys() | {"run", "missing", "availability"})
     if unknown:
         raise ValueError(f"Secciones desconocidas en {path}: {sorted(unknown)}")
@@ -73,6 +80,13 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
         converted = {}
         for key, value in options.items():
             name = key.replace("-", "_")
+            if section == "prepare-backtest" and name in (
+                FIXED_PREPARE_DATES | {"step_hours", "fold_gap_hours"}
+            ):
+                raise ValueError(
+                    f"{path}: [{section}].{key} ya no se admite. Retira esa opción: "
+                    "el calendario se calcula a partir de los datos observados."
+                )
             if name not in actions:
                 raise ValueError(f"Opción desconocida en {path}: [{section}].{key}")
             if name in converted:
@@ -103,7 +117,8 @@ def parse_configured_args(parser: argparse.ArgumentParser, commands: dict[str, a
     command = defaults["command"]
     configured = (sections.get("run", {}) if command in RUN_COMMANDS else {}) | sections.get(command, {})
     if command == "prepare-backtest":
-        inherited = {key: value for key, value in sections.get("prepare", {}).items() if key != "output"}
+        inherited = {key: value for key, value in sections.get("prepare", {}).items()
+                     if key not in STANDALONE_PREPARE_FIELDS | {"output"}}
         configured = inherited | configured
     if command in RUN_COMMANDS and "missing" in sections:
         configured.setdefault("missing_policies", json.dumps(sections["missing"], sort_keys=True))

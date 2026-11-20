@@ -4,13 +4,15 @@ import subprocess
 import sys
 import threading
 from contextlib import contextmanager
+from dataclasses import asdict
 from io import StringIO
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
-from fd_airquality.cli import build_benchmark_matrix, run_benchmark
+from fd_airquality.backtesting import build_candidate_matrix
+from fd_airquality.cli import main
 from fd_airquality.execution import execute_plan, usable_gpu_slots
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging
@@ -31,7 +33,7 @@ def result(root, index, device="cuda"):
 
 def test_matrix_groups_modes_in_requested_order():
     modes = ["local", "centralized", "federated", "zero-shot"]
-    matrix = build_benchmark_matrix(["mlp", "ttm-r3"], modes, ["lora", "ffa-lora"])
+    matrix = build_candidate_matrix(["mlp", "ttm-r3"], modes, ["lora", "ffa-lora"])
     assert list(dict.fromkeys(case["mode"] for case in matrix)) == modes
     assert [modes.index(case["mode"]) for case in matrix] == sorted(modes.index(case["mode"]) for case in matrix)
 
@@ -50,7 +52,7 @@ def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path
             assert not active or set(active.values()) == {mode}
             active[gpu] = mode
             seen.append((mode, gpu))
-            assert json.loads((tmp_path / "benchmark.json").read_text())
+            assert json.loads((tmp_path / "candidates.json").read_text())
         barrier.wait(timeout=10)
         with lock:
             del active[gpu]
@@ -73,7 +75,7 @@ def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path
     assert [mode for mode, _ in seen] == [mode for mode in modes for _ in range(2)]
     assert launches == [("cuda", False)] * 2
     assert os.environ.get("CUDA_VISIBLE_DEVICES") == original_visible
-    rows = json.loads((tmp_path / "benchmark.json").read_text())
+    rows = json.loads((tmp_path / "candidates.json").read_text())
     assert all(row["status"] == "completed" for row in rows)
     assert {row["gpu"] for row in rows if row["mode"] != "federated"} == {"3", "7"}
 
@@ -137,7 +139,7 @@ def test_failure_cancels_running_and_future_candidates_and_stops_at_mode_barrier
           RunLogging(tmp_path, "test", stream=StringIO()) as log):
         execute_plan(RunSettings(device="cuda"), plan, tmp_path,
                      max_parallel_models=None, baseline=None, launch=None, progress_log=log)
-    rows = json.loads((tmp_path / "benchmark.json").read_text())
+    rows = json.loads((tmp_path / "candidates.json").read_text())
     assert [row["status"] for row in rows] == ["failed", "cancelled", "cancelled"]
     assert "RuntimeError: candidate failed" in (tmp_path / "run.log").read_text()
 
@@ -209,22 +211,51 @@ def test_gpu_slots_probe_each_visible_device_and_preserve_physical_mapping(monke
     assert usable_gpu_slots("cuda") == ["GPU-B"]
 
 
-def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared, tmp_path, monkeypatch, mlflow_uri):
+def test_single_fold_backtest_cli_keeps_the_matrix_and_uses_isolated_processes(
+    temporal_family, tmp_path, monkeypatch, mlflow_uri,
+):
     from mlflow import MlflowClient
 
-    from fd_airquality.tracking import benchmark_tags
+    from fd_airquality.data import read_manifest
+    from fd_airquality.tracking import backtest_tags
 
-    path, manifest = prepared
-    count = len(manifest["clients"])
+    raw, geometry = temporal_family
     monkeypatch.chdir(tmp_path)
+    config = tmp_path / "experiment.toml"
+    data_options = "\n".join(
+        f"{key.replace('_', '-')} = {json.dumps(value)}"
+        for key, value in asdict(geometry).items() if value is not None
+    )
+    config.write_text(
+        f'[prepare]\nraw-root = "{raw}"\n{data_options}\n'
+        '[prepare-backtest]\nfolds = 1\nvalidation-hours = 24\ntest-hours = 48\nmin-stations = 2\n'
+        f'[run]\nnum-server-rounds = 1\nhidden-size = 8\nmlflow-tracking-uri = "{mlflow_uri}"\n'
+        '[backtest]\noutput-dir = "matrix"\nmodels = ["mlp", "autoencoder"]\n'
+        'modes = ["local", "centralized"]\nseeds = [23]\n'
+    )
+    main(["prepare-backtest", "--config", str(config)])
+    family, = (tmp_path / "data" / "backtests").glob("*/backtest_manifest.json")
+    family_data = json.loads(family.read_text())
+    assert family_data["calendar_end"] == "2025-01-21 00:00:00"
+    assert (family_data["station_selection"], family_data["min_stations"]) == ("all", 2)
+    assert (family_data["validation_hours"], family_data["test_hours"]) == (24, 48)
+    fold, = family_data["folds"]
+    manifest = read_manifest(fold["manifest"])
+    count = len(manifest["clients"])
     # Both logical slots hide CUDA but have distinct values; check propagation to the children.
     monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "-1")
     monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["", "-1,-1"])
-    output = run_benchmark(RunSettings(manifest=str(path), output_dir=str(tmp_path / "matrix"),
-                            num_server_rounds=1, hidden_size=8, mlflow_tracking_uri=mlflow_uri),
-                             ["mlp", "autoencoder"], ["local", "centralized"])
-    root = output.parent
-    rows = json.loads((root / "benchmark.json").read_text())
+    main(["backtest", "--config", str(config)])
+    backtest, = (tmp_path / "matrix").glob("backtest_*")
+    completed, = json.loads((backtest / "backtest.json").read_text())["results"]
+    assert (completed["fold"], completed["status"]) == (1, "completed")
+    log = (backtest / "backtest.log").read_text()
+    assert "Iniciando fold 1 (1/1)" in log and "Fold 1 completado (1/1)" in log
+    assert "Estaciones en el panel común: 2" in log
+    root = backtest / "fold_001"
+    output = root / "comparison"
+    assert completed["comparison"] == str(output)
+    rows = json.loads((root / "candidates.json").read_text())
     assert len(rows) == 4 and all(row["status"] == "completed" for row in rows)
     assert {row["gpu"] for row in rows} == {"", "-1,-1"}
     comparison = pd.read_csv(output / "comparison.csv")
@@ -233,6 +264,16 @@ def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared,
         (row["model"], row["mode"]) for row in rows
     }
     assert comparison["num-clients"].eq(count).all()
+    assert comparison["seed"].eq(23).all()
+    temporal = pd.read_csv(backtest / "temporal_comparison.csv")
+    assert temporal["fold"].eq(1).all()
+    pd.testing.assert_frame_equal(temporal[comparison.columns], comparison)
+    means = pd.read_csv(backtest / "cv_fold_mean.csv")
+    keys = ["model", "mode", "seed"]
+    assert means["num-folds"].eq(1).all()
+    assert comparison.set_index(keys)["macro-mase"].to_dict() == pytest.approx(
+        means.set_index(keys)["macro-mase"].to_dict(),
+    )
     assert not list(output.glob("station_*"))
     for row in rows:
         run = Path(row["output"])
@@ -247,17 +288,18 @@ def test_real_process_benchmark_has_complete_comparable_panel_and_logs(prepared,
         assert "epoch=1/1" in Path(row["log"]).read_text()
         assert "Run completed" in (run / "run.log").read_text()
     assert os.environ["CUDA_VISIBLE_DEVICES"] == "-1"
-    assert "mode-completed" in (root / "benchmark.log").read_text()
+    assert "mode-completed" in (root / "fold.log").read_text()
 
     client = MlflowClient(tracking_uri=mlflow_uri)
     experiment = client.get_experiment_by_name("fd-airquality")
     runs = client.search_runs([experiment.experiment_id])
     assert len(runs) == len(rows)
     assert all(run.info.status == "FINISHED" for run in runs)
-    label = benchmark_tags(root / "runs" / "case_0001", manifest["pollutant"])["benchmark"]
-    assert {run.data.tags["benchmark"] for run in runs} == {label}
+    label = backtest_tags(root / "runs" / "case_0001", manifest["pollutant"])["backtest"]
+    assert {run.data.tags["backtest"] for run in runs} == {label}
+    assert {run.data.tags["fold"] for run in runs} == {"1"}
     assert len({run.data.tags["candidate"] for run in runs}) == len(rows)
-    assert all("case_" not in run.info.run_name and run.info.run_name.endswith(label) for run in runs)
-    filtered = client.search_runs([experiment.experiment_id], filter_string=f"tags.benchmark = '{label}'")
+    assert all("case_" not in run.info.run_name and run.info.run_name.endswith(f"{label} | fold 1") for run in runs)
+    filtered = client.search_runs([experiment.experiment_id], filter_string=f"tags.backtest = '{label}'")
     assert {run.info.run_id for run in filtered} == {run.info.run_id for run in runs}
     assert all("run.log" in {artifact.path for artifact in client.list_artifacts(run.info.run_id)} for run in runs)

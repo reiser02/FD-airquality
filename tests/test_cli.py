@@ -7,11 +7,12 @@ from pathlib import Path
 
 import pytest
 
+from fd_airquality.artifacts import file_digest
 from fd_airquality.cli import _parser, launch_simulation, main
 from fd_airquality.settings import RunSettings
 
 
-@pytest.mark.parametrize("command", ["simulate", "baseline", "benchmark", "backtest"])
+@pytest.mark.parametrize("command", ["simulate", "baseline", "backtest"])
 def test_cli_defaults_and_flower_mapping_use_shared_settings(command):
     parser, _ = _parser()
     args = parser.parse_args([command])
@@ -22,7 +23,7 @@ def test_cli_defaults_and_flower_mapping_use_shared_settings(command):
     assert RunSettings.from_mapping(settings.flower_config()) == settings
 
 
-@pytest.mark.parametrize("command", ["simulate", "benchmark"])
+@pytest.mark.parametrize("command", ["simulate", "backtest"])
 @pytest.mark.parametrize("option", ["--workers", "--client-gpus"])
 def test_manual_federated_resource_options_are_removed(command, option, capsys):
     parser, _ = _parser()
@@ -30,6 +31,15 @@ def test_manual_federated_resource_options_are_removed(command, option, capsys):
         parser.parse_args([command, option, "1"])
     assert exc.value.code == 2
     assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_benchmark_is_not_a_separate_command(capsys):
+    parser, commands = _parser()
+    assert "benchmark" not in commands
+    with pytest.raises(SystemExit) as exc:
+        parser.parse_args(["benchmark"])
+    assert exc.value.code == 2
+    assert "invalid choice" in capsys.readouterr().err
 
 
 def test_simulation_command_uses_manifest_station_count(prepared, capsys, tmp_path, monkeypatch):
@@ -59,45 +69,135 @@ def test_models_lists_granite_without_downloading(capsys, monkeypatch):
     output = capsys.readouterr().out
     for name in ("autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"):
         assert name in output
+    assert "patchtst-fm-r2:" in output and "fuera de las matrices predeterminadas" in output
 
 
-def test_benchmark_validates_all_contexts_before_starting_any_run(prepared, tmp_path, monkeypatch):
-    path, _ = prepared
-    monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *_: pytest.fail("No debe entrenar"))
+def test_backtest_requires_a_backtest_manifest(global_prepared, tmp_path, capsys):
+    path, _ = global_prepared
     with pytest.raises(SystemExit) as exc:
-        main(["benchmark", "--manifest", str(path), "--models", "mlp", "ttm-r3", "--output-dir", str(tmp_path / "runs")])
+        main(["backtest", "--manifest", str(path), "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
+    assert "prepare-backtest" in capsys.readouterr().err
     assert not (tmp_path / "runs").exists()
 
 
-def test_benchmark_validates_adapter_ranks_before_training_classics(
-    global_prepared, tmp_path, monkeypatch, mock_granite,
+def test_prepare_backtest_requires_15_stations_by_default_but_allows_a_test_subset(temporal_family, tmp_path, capsys):
+    raw, _ = temporal_family
+    output = tmp_path / "prepared"
+    args = ["prepare-backtest", "--raw-root", str(raw), "--output", str(output),
+            "--folds", "1", "--window-policy", "masked"]
+    with pytest.raises(SystemExit) as exc:
+        main(args)
+    assert exc.value.code == 2
+    assert "2 estaciones; mínimo exigido: 15" in capsys.readouterr().err
+    assert not list(output.glob("*/backtest_manifest.json"))
+
+    main([*args, "--station", "station-a"])
+    path, = output.glob("*/backtest_manifest.json")
+    family = json.loads(path.read_text())
+    assert (family["station_selection"], family["min_stations"]) == ("subset", 1)
+    assert "selección explícita de estaciones" in path.with_name("prepare.log").read_text()
+
+
+def test_prepare_backtest_logs_fold_sizes_and_warns_when_targets_are_reduced(temporal_family, tmp_path):
+    raw, _ = temporal_family
+    output = tmp_path / "prepared"
+    main(["prepare-backtest", "--raw-root", str(raw), "--output", str(output),
+          "--folds", "3", "--min-stations", "2", "--window-policy", "masked"])
+    path, = output.glob("*/backtest_manifest.json")
+    log = path.with_name("prepare.log").read_text()
+    assert "INFO" in log and "Analizando 2 CSV" in log
+    assert "WARNING" in log and "Histórico inicial de train reducido" in log
+    assert "No caben las duraciones solicitadas con 3 folds" in log
+    assert "validación 672 → 48 h, test 672 → 96 h" in log
+    for number in range(1, 4):
+        assert f"fold={number}/3 train [" in log
+        assert f"fold={number}/3 estaciones elegibles=2; mínimo de ventanas" in log
+    assert "Panel preparado: 2 estaciones" in log
+
+
+def test_prepare_backtest_logs_critical_calendar_failure_before_building_folds(temporal_family, tmp_path, capsys):
+    raw, _ = temporal_family
+    output = tmp_path / "prepared"
+    with pytest.raises(SystemExit) as exc:
+        main(["prepare-backtest", "--raw-root", str(raw), "--output", str(output),
+              "--folds", "10", "--min-stations", "2", "--log-level", "ERROR"])
+    assert exc.value.code == 2
+    log_path, = (output / "logs").glob("*/run.log")
+    log = log_path.read_text()
+    assert "CRITICAL" in log and "El calendario de 576 h no alcanza para 10 folds" in log
+    assert "train inicial 102 h" in log and "validación 48 h, test 96 h" in log
+    assert "Máximo teórico: 3 folds" in log
+    assert "Analizando 2 CSV" not in log
+    assert f"Log de preparación: {log_path}" in capsys.readouterr().err
+    assert not list(output.glob("*/fold_*"))
+
+
+def test_prepare_backtest_distinguishes_lack_of_observed_windows_from_calendar_space(temporal_family, tmp_path):
+    raw, _ = temporal_family
+    output = tmp_path / "prepared"
+    # The strict protocol cannot make a 90 h context from the short observed runs.
+    with pytest.raises(SystemExit) as exc:
+        main(["prepare-backtest", "--raw-root", str(raw), "--output", str(output), "--folds", "1",
+              "--min-stations", "2"])
+    assert exc.value.code == 2
+    log_path, = (output / "logs").glob("*/run.log")
+    log = log_path.read_text()
+    assert "CRITICAL" in log and "fold=1/1 No se pudo preparar el fold" in log
+    assert "Ninguna estación es elegible" in log and "excluded_stations.csv" in log
+    assert "El calendario de 576 h no alcanza" not in log
+    assert not list(output.glob("*/backtest_manifest.json"))
+
+
+def test_backtest_validates_all_contexts_before_starting_any_run(single_fold_manifest, tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *_: pytest.fail("No debe entrenar"))
+    monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
+    with pytest.raises(SystemExit) as exc:
+        main(["backtest", "--manifest", str(single_fold_manifest), "--models", "mlp", "ttm-r3",
+              "--output-dir", str(tmp_path / "runs")])
+    assert exc.value.code == 2
+    assert "exige contexto 90" in capsys.readouterr().err
+    report, = (tmp_path / "runs").glob("*/backtest.json")
+    assert json.loads(report.read_text())["results"] == [{"fold": 1, "status": "failed"}]
+    assert not list((tmp_path / "runs").glob("**/test_metrics.json"))
+
+
+def test_backtest_validates_adapter_ranks_before_training_classics(
+    single_fold_manifest, tmp_path, monkeypatch, mock_granite,
 ):
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *_: pytest.fail("No debe entrenar"))
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
-    path, _ = global_prepared
     with pytest.raises(SystemExit) as exc:
-        main(["benchmark", "--manifest", str(path), "--models", "mlp", "ttm-r3", "--lora-targets", "proj",
-              "--lora-ranks", "99", "--output-dir", str(tmp_path / "runs")])
+        main(["backtest", "--manifest", str(single_fold_manifest), "--models", "mlp", "flowstate-r1",
+              "--lora-targets", "proj", "--lora-ranks", "99", "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
-    log, = (tmp_path / "runs").glob("*/benchmark.log")
+    log, = (tmp_path / "runs").glob("*/fold_001/fold.log")
     assert "Run failed" in log.read_text()
     assert not list((tmp_path / "runs").glob("**/test_metrics.json"))
 
 
-def test_benchmark_rejects_empty_effective_panel_before_any_training(global_prepared, tmp_path, monkeypatch):
-    path, manifest = global_prepared
+def test_backtest_rejects_empty_effective_panel_before_any_training(single_fold_manifest, tmp_path, monkeypatch):
+    family = json.loads(single_fold_manifest.read_text())
+    fold, = family["folds"]
+    path = Path(fold["manifest"])
+    manifest = json.loads(path.read_text())
     for client in manifest["clients"]:
         client["validation_mase_defined"] = False
     path.write_text(json.dumps(manifest))
+    fold["sha256"] = file_digest(path)
+    single_fold_manifest.write_text(json.dumps(family))
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", lambda *_: pytest.fail("No debe entrenar"))
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
     with pytest.raises(SystemExit) as exc:
-        main(["benchmark", "--manifest", str(path), "--models", "mlp", "--modes", "federated", "local",
-              "--output-dir", str(tmp_path / "runs")])
+        main(["backtest", "--manifest", str(single_fold_manifest), "--models", "mlp",
+              "--modes", "federated", "local", "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
-    report, = (tmp_path / "runs").glob("*/excluded_stations.csv")
-    assert "station-a" in report.read_text() and "station-b" in report.read_text()
+    report, = (tmp_path / "runs").glob("*/temporal_exclusions.csv")
+    for client in manifest["clients"]:
+        assert client["station"] in report.read_text()
+    log = report.with_name("backtest.log").read_text()
+    assert "WARNING" in log and "2 estaciones sin macro-mase de validación definida" in log
+    assert "CRITICAL" in log and "Panel común insuficiente: 0 estaciones; mínimo exigido: 2" in log
 
 
 def test_inspect_reports_zero_denominators_even_when_pairs_exist(global_prepared, capsys):
@@ -145,7 +245,7 @@ def test_cuda_fallback_does_not_reserve_ray_gpu_resources(prepared, tmp_path, mo
         assert tomllib.load(stream)["device"] == "cpu"
 
 
-def test_benchmark_model_concurrency_cap_does_not_limit_federated_clients(prepared, tmp_path, monkeypatch, capsys):
+def test_backtest_model_concurrency_cap_does_not_limit_federated_clients(prepared, tmp_path, monkeypatch, capsys):
     from io import StringIO
 
     from fd_airquality.execution import execute_plan

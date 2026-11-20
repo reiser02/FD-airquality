@@ -1,4 +1,5 @@
 # Se carga automáticamente al ejecutar fd-airquality desde este directorio.
+# --config ruta.toml usa otro archivo, sin heredar los valores de este.
 # Prioridad: argumentos CLI > sección del comando > [run] > valores internos.
 # Las rutas relativas se interpretan desde el directorio de ejecución, como en CLI.
 
@@ -7,6 +8,7 @@
 raw-root = "data/raw/datos_estaciones_5m"
 # Raíz donde se guardan las preparaciones inmutables, inventarios y manifests.
 output = "data/federated"
+# Único contaminante admitido: "PM25" (también "pm25").
 pollutant = "PM25"
 # Horas históricas que recibe el modelo en cada ventana de entrada.
 context = 90
@@ -25,45 +27,58 @@ min-test-windows = 15
 # Cuota opcional por estación y época: se vuelve a sortear del conjunto admisible.
 # Si se omite, se usan todas las ventanas admisibles en cada época.
 # max-train-windows = 128
-# Todas las estaciones. Para una prueba pequeña usa experiments/smoke.toml.
+# Lista de nombres exactos de directorio; si se omite, se usan todas las estaciones.
 # station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
-# Conserva las ausencias en calendario; cada modelo trata su propio contexto.
+# "masked" conserva huecos y enmascara los targets ausentes; "strict" exige ventanas completas.
 window-policy = "masked"
-# Solo entrenamiento: both añade contexto izquierdo y targets derechos enmascarados.
-# none lo desactiva; right conserva únicamente el padding derecho.
+# Solo en entrenamiento global con ventanas "masked": "both" añade contexto izquierdo
+# y targets derechos enmascarados; "right" solo a la derecha; "none" lo desactiva.
 window-padding = "both"
+# Mínimos de horas realmente observadas por ventana "masked", también en validación y test.
+# No pueden superar context y horizon, respectivamente. El padding no cuenta.
 min-context-observed = 1
 min-target-observed = 1
 # Periodicidad estacional en horas (24 = ciclo diario), usada para MASE/RMSSE.
 seasonality = 24
-# Horas de referencia previas a cada periodo evaluado para calcular la escala de MASE/RMSSE.
-# No limita el entrenamiento ni cambia context.
+# Longitud en horas de la referencia de MASE/RMSSE. Debe superar seasonality;
+# no limita el entrenamiento ni modifica context.
 error-scale-hours = 672
-# Diferencias estacionales en horas reales: sin suelo o con suelo ε.
+# "unfloored" deja indefinida una escala nula; "epsilon" aplica un suelo.
 error-scale-policy = "unfloored"
+# "training" usa el final del entrenamiento para ambos splits;
+# "pre-evaluation" usa el inicio de cada split (la referencia de test puede incluir validación).
 error-scale-reference = "training"
+# Suelo con la política "epsilon": ε para MASE y ε² para RMSSE, si hay suficientes pares.
 error-scale-epsilon = 0.01
+# Mínimo de pares con ambos extremos observados; si no se alcanza, la escala queda indefinida.
 min-scale-pairs = 24
 # Número de lecturas consecutivas e iguales de 5 minutos para marcar una racha no nula congelada.
 # En modo causal se conservan las primeras min-run - 1 lecturas.
 min-run = 6
 # Mínimo de lecturas de 5 minutos válidas y no congeladas necesarias para calcular la media horaria.
 min-useful = 9
-# No interpretar dos medias iguales como prueba suficiente de congelación.
-# El filtro de congelación de cinco minutos sigue activo.
+# 1 marca como congelada una media horaria no nula igual a la de la hora anterior;
+# 0 desactiva solo ese filtro, no el de cinco minutos ni el de rachas de ceros.
 hourly-repeat-filter = 0
+# Desviación máxima en segundos al redondear a la rejilla de 5 min (entero de 0 a 149).
+# Si algún timestamp la supera, se descarta el CSV con un aviso.
 grid-tolerance-seconds = 30
-# Configurar únicamente tras confirmar el significado de los flags del proveedor.
+# Solo para CSV de UPCT: códigos de calidad válidos separados por comas en una cadena.
+# Vacío no filtra por flags. Configúralos solo tras confirmar su significado con el proveedor.
 upct-valid-flags = ""
 # Horas observadas con media cero acumuladas antes de marcarlas como congeladas.
 # Las horas ausentes pausan el contador; una hora no nula lo reinicia.
 zero-run-hours = 24
 # Política temporal: global usa los mismos cortes de calendario para todas las estaciones;
-# station construye holdouts al final de cada serie y usa validation-hours/test-hours.
+# station usa holdouts por estación con validation-hours/test-hours y exige window-policy = "strict".
 split-mode = "global"
 # Filtrado de calidad causal (sin eliminar datos pasados usando observaciones futuras).
 # El protocolo global requiere causal; retrospective solo se admite con split-mode = "station".
 quality-mode = "causal"
+# Cortes globales de prepare: fechas entre comillas, alineadas a la hora y sin zona horaria.
+# Límite inferior inclusivo para targets de entrenamiento; debe preceder a validation-start.
+# Si se omite, se usa todo el pasado admisible.
+# train-start = "2026-01-01"
 # Inicio de los objetivos de validación en modo global; el intervalo termina en test-start.
 validation-start = "2026-03-01"
 # Inicio de los objetivos de test; también es el final exclusivo del periodo de validación.
@@ -74,26 +89,38 @@ test-end = "2026-04-26"
 validation-hours = 48
 # Duración horaria del holdout de test; solo se usa con split-mode = "station".
 test-hours = 96
+# Opciones de log que también hereda prepare-backtest; ver [run] para los valores admitidos.
+# log-level = "INFO"
+# heartbeat-seconds = 60.0
 
-# Opciones compartidas por simulate, baseline, benchmark y backtest. Las opciones de la sección
+# Opciones compartidas por simulate, baseline y backtest. Las opciones de la sección
 # específica del comando prevalecen sobre estas si se repite una clave.
 [run]
-# Manifest de una preparación concreta; si se omite, se selecciona la preparación más reciente.
+# Se pueden compartir las rutas, pero es preferible fijarlas en cada comando:
+# backtest necesita un backtest_manifest.json, no el manifest.json de prepare.
 # manifest = "data/federated/<preparacion>/manifest.json"
-# Número de rondas de comunicación federada; en benchmark se aplica a cada candidato federado.
+# output-dir = "reports/experimentos"
+# Rondas federadas o etapas de entrenamiento de los controles no federados por candidato y fold.
 num-server-rounds = 5
-# Pasadas locales por los datos de cada cliente en cada ronda.
+# Máximo de épocas por ajuste de cliente o por etapa de un baseline entrenado.
 local-epochs = 50
-# Máximo de épocas por ajuste local; parada por MSE observado de validación interna.
+# 1 permite parar por MSE de validación interna; 0 desactiva la parada.
+# Ni la parada ni el scheduler se aplican con local-epochs = 1.
 early-stopping = 1
+# Épocas consecutivas sin mejora antes de parar y restaurar los mejores pesos.
 early-stopping-patience = 5
+# Mejora absoluta mínima de MSE (unidades al cuadrado), también usada por el scheduler.
 early-stopping-min-delta = 0.0
-# ReduceLROnPlateau de PyTorch, en esas mismas épocas y sin consultar test.
+# "plateau" usa ReduceLROnPlateau de PyTorch con ese MSE; "none" lo desactiva.
 lr-scheduler = "plateau"
+# El LR baja cuando las épocas sin mejora superan esta paciencia (0: en la primera).
 lr-scheduler-patience = 2
+# Multiplicador de la tasa al reducirla, estrictamente entre 0 y 1.
 lr-scheduler-factor = 0.5
+# Suelo positivo de la tasa de aprendizaje; no debe superar learning-rate.
 min-learning-rate = 0.000001
-# En federado: reserva dentro del prefijo anterior a la primera ronda.
+# En federado con llegadas y control de épocas: horas reservadas para monitorizar
+# antes de la primera ronda. Se usa al menos horizon y no se entrena con esos targets.
 round-validation-hours = 24
 # Ventanas por actualización; el último lote corto se completa repitiendo ventanas de esa época.
 batch-size = 128
@@ -101,27 +128,28 @@ batch-size = 128
 learning-rate = 0.001
 # Penalización weight decay de AdamW; 0 la desactiva.
 weight-decay = 0.01
-# Ancho de las capas ocultas del MLP y del autoencoder.
+# Ancho de las capas ocultas de MLP, NHITS y el autoencoder estándar.
 hidden-size = 64
 # Agregación federada: FedAvg o FedProx.
 strategy = "fedavg"
 # Intensidad de la penalización proximal; solo tiene efecto con strategy = "fedprox".
 proximal-mu = 0.01
-# Semilla para inicialización y aleatoriedad; benchmark puede sustituirla con [benchmark].seeds.
+# Semilla para inicialización y aleatoriedad; backtest puede sustituirla con [backtest].seeds.
 seed = 42
-# Dispositivo de entrenamiento; CUDA no utilizable se resuelve como CPU.
+# Dispositivo de entrenamiento: "cpu" o "cuda"; si CUDA no es utilizable, se usa CPU.
 # En federado se ejecuta un cliente simultáneo por GPU utilizable; en CPU, uno cada vez.
 device = "cuda"
 # Hilos internos de PyTorch (también limita OMP/MKL en los procesos lanzados).
 torch-threads = 1
-# Modelo predeterminado; opciones: mlp, autoencoder, nlinear, nhits, ttm-r3,
-# patchtst-fm-r2 y flowstate-r1. benchmark usa su lista [benchmark].models.
+# Modelo predeterminado; opciones: mlp, autoencoder, nlinear, nhits,
+# ttm-r3, flowstate-r1 y patchtst-fm-r2. backtest usa su lista [backtest].models.
 model = "mlp"
 # Dimensión del cuello de botella latente del autoencoder.
 latent-size = 16
-# Peso de la pérdida auxiliar de reconstrucción del autoencoder; no afecta a otros modelos.
+# Peso de la pérdida auxiliar de reconstrucción del autoencoder.
 reconstruction-weight = 0.1
-# Revisión SHA opcional del modelo de Hugging Face; vacío conserva la revisión fijada por el proyecto.
+# SHA inmutable de 40 caracteres hexadecimales en minúscula para Granite en Hugging Face;
+# vacío conserva la revisión fijada por el proyecto.
 hf-revision = ""
 # Escala temporal de FlowState (patch base de 24 h); puede cambiar la geometría admisible.
 flowstate-scale-factor = 1.0
@@ -133,7 +161,8 @@ mlflow-experiment = "fd-airquality"
 # 1 registra los checkpoints .pt como artefactos de MLflow; 0 no los registra.
 mlflow-log-models = 1
 # Adaptación predeterminada: auto entrena completo los modelos clásicos y aplica LoRA a Granite.
-# También admite none (solo zero-shot) y lora, ffa-lora, flora o lora-fair.
+# Para Granite: "lora", "ffa-lora", "flora" y "lora-fair"; "none" solo en zero-shot.
+# "flora" y "lora-fair" requieren modo federado con FedAvg. La matriz usa [backtest].adaptations.
 adaptation = "auto"
 # Rango (dimensión interna) de los adaptadores LoRA; un rango mayor añade parámetros entrenables.
 lora-rank = 4
@@ -150,29 +179,48 @@ fair-iterations = 1000
 fair-learning-rate = 0.01
 # Peso de la regularización L2 del refinamiento LoRA-FAIR.
 fair-lambda = 1.0
-# Métrica de validación para elegir el mejor checkpoint; menor es mejor.
-# macro-mase y macro-rmsse ponderan por igual las estaciones con escala definida.
+# Métrica de validación para elegir el mejor checkpoint: "macro-mase" o "macro-rmsse".
+# Menor es mejor; en métricas macro, las estaciones con escala definida pesan igual.
 selection-metric = "macro-mase"
-# Intervalo en segundos entre mensajes de progreso durante trabajos largos.
+# Intervalo positivo en segundos entre señales de actividad; no estima el avance.
 heartbeat-seconds = 60.0
 # Nivel de detalle de los logs: DEBUG, INFO, WARNING o ERROR.
 log-level = "INFO"
-# auto resuelve la política mediante [missing]; --missing-policy fuerza una concreta.
+# "auto" consulta [missing] y, si no hay entrada, usa la política interna del modelo.
+# Cualquier otra política admitida (ver [missing]) fuerza su uso en todos los modelos de la ejecución.
 missing-policy = "auto"
-# Activación explícita; no se promete reproducibilidad bit a bit entre dispositivos.
+# Alternativa avanzada: mapa JSON en una cadena TOML; si se indica, reemplaza [missing].
+# missing-policies = '{"mlp": "native"}'
+# 1 activa el modo determinista de PyTorch; 0 no lo fuerza.
+# No se promete reproducibilidad bit a bit entre dispositivos.
 deterministic = 0
-# Entrena cuantiles en NeuralForecast; evalúa cuantiles nativos en Granite si existen.
+# 1 entrena cuantiles de MLP/NHITS/NLinear y evalúa los nativos de Granite.
 probabilistic = 1
-# TemporalNorm del paquete: cada contexto observado, nunca sus targets futuros.
+# "window": TemporalNorm sobre el contexto observado de cada ventana; "fixed": media y
+# desviación por estación con el histórico autorizado; "none": sin normalización externa.
 normalization = "window"
+# Solo con normalization = "window": "identity", "standard", "robust" o "minmax".
 scaler-type = "standard"
+# Solo con normalización "fixed" y cortes globales: fin exclusivo del tramo para ajustar
+# el escalador, como fecha horaria sin zona. Si se omite, se calcula por fold.
+# No puede superar la primera llegada, invadir la reserva de monitorización ni dejar el ajuste sin datos.
+# normalization-reference-end = "2026-02-20 00:00"
+# Umbral por defecto de entrenamiento: un decimal para ambos mínimos o dos
+# [contexto, targets], entre 0.0 y 1.0. 0.0 todavía exige una observación real de
+# cada parte; la tabla [availability] puede sobrescribirlo por modelo.
 training-data-availability-threshold = [0.0, 0.0]
-# Llegada horaria de calendario dentro del entrenamiento de cada fold federado.
+# Alternativa avanzada: mapa JSON en una cadena TOML; si se indica, reemplaza [availability].
+# training-availability = '{"mlp": [0.5, 1.0]}'
+# Horas de calendario por bloque nuevo en federado con cortes globales; 0 desactiva las llegadas.
+# Primera ronda: histórico inicial. Las siguientes ajustan solo con targets del bloque nuevo,
+# conservando los pesos agregados.
 arrival-period-hours = 24
-# Primera ronda: histórico inicial. Después: solo targets del bloque nuevo,
-# conservando los pesos agregados. No vuelve a entrenar con bloques anteriores.
 
 [missing]
+# Política de contexto por modelo cuando missing-policy = "auto"; nunca se imputan targets.
+# "native" usa el tratamiento del modelo (solo NeuralForecast y Granite); "strict" exige
+# contexto completo. "ffill" arrastra el último valor, "linear" interpola huecos interiores,
+# "mean" usa la media del contexto y "zero" rellena con cero en la escala del modelo.
 mlp = "native"
 autoencoder = "ffill"
 nlinear = "native"
@@ -181,7 +229,16 @@ ttm-r3 = "native"
 patchtst-fm-r2 = "native"
 flowstate-r1 = "native"
 
+# Umbrales opcionales por modelo, solo para entrenamiento; la evaluación no cambia.
+# Tienen prioridad sobre training-data-availability-threshold para ese modelo.
+# Usa decimales de 0.0 a 1.0, no enteros. Ejemplos:
+# [availability]
+# mlp = [0.75, 1.0]
+# nlinear = 0.5
+
 [simulate]
+# Manifest de prepare. Si se omite, se busca el más reciente bajo data/federated/.
+# manifest = "data/federated/<preparacion>/manifest.json"
 # Directorio base para los resultados de las simulaciones Flower.
 output-dir = "reports/federated"
 # Paralelismo automático: un cliente por GPU utilizable, hasta el número de estaciones.
@@ -189,17 +246,48 @@ output-dir = "reports/federated"
 print-command = false
 
 [baseline]
+# Manifest de prepare. Si se omite, se busca el más reciente bajo data/federated/.
+# manifest = "data/federated/<preparacion>/manifest.json"
 # Directorio base de resultados para ejecuciones sin Flower.
 output-dir = "reports/non_federated"
 # Método de control: local entrena por estación; centralized junta entrenamiento;
 # zero-shot evalúa Granite sin adaptación ni entrenamiento.
 mode = "local"
 
-[benchmark]
-# Directorio base; cada matriz se guarda en una subcarpeta con fecha y hora.
-output-dir = "reports/benchmarks"
-# MLP/NLinear/NHITS del paquete NeuralForecast; autoencoder propio y Granite.
-models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
+[prepare-backtest]
+# Hereda opciones de [prepare] salvo output, las fechas fijas y las duraciones por estación.
+# Requiere split-mode = "global" y quality-mode = "causal".
+# Raíz para los folds y su backtest_manifest.json; no cambia la búsqueda de backtest.
+output = "data/backtests"
+# INFO muestra el reparto; DEBUG añade detalles por estación. Los avisos y errores se guardan en el log.
+# log-level = "INFO"
+# Número de folds; usa 1 para un solo corte. El calendario se calcula a partir de los CSV.
+folds = 3
+# Mínimo de estaciones en el panel común al usar todas. Con una selección explícita basta una.
+min-stations = 15
+# Horas objetivo de validación y test por fold (672 = 28 días cada uno). Se reducen si no caben.
+validation-hours = 672
+test-hours = 672
+# Todos los folds reinician modelos y escaladores; solo se reutilizan datos.
+# "expanding" conserva todo el pasado; "sliding" limita el histórico de targets.
+train-history = "expanding"
+# Horas de histórico de targets si train-history = "sliding".
+history-hours = 672
+
+[backtest]
+# Directorio base; cada backtest se guarda en una subcarpeta con fecha y hora.
+output-dir = "reports/backtests"
+# "evaluation" evalúa todos los folds sin elegir configuración.
+# "development" selecciona sin usar el último fold; "final" solo evalúa ese fold con la selección previa.
+# "all" selecciona como "development", pero también puntúa el último fold de forma exploratoria.
+# "development" y "final" requieren al menos 2 folds. Si ya se evaluó el último, no se puede usar "final".
+stage = "evaluation"
+# Solo con stage = "final": ruta al selection.json generado por el desarrollo de esta preparación.
+# selection = "reports/backtests/<desarrollo>/selection.json"
+# Si se omite, se busca el último manifest bajo data/backtests/. Fíjalo si cambiaste output.
+# manifest = "data/backtests/<preparacion>/backtest_manifest.json"
+# Controles clásicos y Granite. PatchTST-FM-R2 queda fuera salvo selección explícita.
+models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "flowstate-r1"]
 # Métodos comparados: entrenamiento local por estación, centralizado, federado y zero-shot.
 # Zero-shot solo se genera para los modelos Granite.
 modes = ["local", "centralized", "federated", "zero-shot"]
@@ -207,9 +295,8 @@ modes = ["local", "centralized", "federated", "zero-shot"]
 # (acumulación por apilado) y LoRA-FAIR (refinamiento en servidor); local/centralizado
 # usan LoRA y FFA-LoRA como controles. Los modelos clásicos se entrenan completos.
 adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
-# En federado se usa un cliente simultáneo por GPU utilizable; en CPU, secuencial.
 # Semillas a comparar; si se omite, se usa [run].seed. Zero-shot no se duplica por semilla.
-seeds = [42, 43, 44]
+seeds = [42]
 # Rangos LoRA a comparar en Granite; si se omite, se usa [run].lora-rank.
 # lora-ranks = [4, 8]
 # Estrategias federadas a comparar (FedAvg/FedProx); FLoRA y LoRA-FAIR requieren FedAvg.
@@ -219,22 +306,19 @@ seeds = [42, 43, 44]
 # En CPU se ejecutan secuencialmente; no limita los clientes simultáneos de una federación.
 # max-parallel-models = 2
 
-[prepare-backtest]
-# Hereda [prepare] salvo output. Sus fechas son las del ÚLTIMO fold.
-output = "data/backtests"
-folds = 3
-step-hours = 672
-# Todos los folds reinician modelos y escaladores; solo se reutilizan datos.
-# expanding conserva todo el pasado; sliding conserva history-hours de targets.
-train-history = "expanding"
-history-hours = 672
+# [inspect]
+# Manifest individual o de backtest. Si se omite, busca la última preparación de data/federated/.
+# manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 
-[backtest]
-output-dir = "reports/backtests"
-# Normal: evaluar todos los folds, sin buscar ni elegir una configuración.
-# Opt-in de búsqueda: stage = "development"; después stage = "final" con --selection.
-stage = "evaluation"
-models = ["mlp", "autoencoder", "nlinear", "nhits", "ttm-r3", "patchtst-fm-r2", "flowstate-r1"]
-modes = ["local", "centralized", "federated", "zero-shot"]
-adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
-seeds = [42, 43, 44]
+# [compare]
+# Directorios de al menos dos ejecuciones distintas y completas.
+# runs = ["reports/<ejecucion-a>", "reports/<ejecucion-b>"]
+# Directorio de salida; si se omite, se crea uno nuevo bajo reports/comparisons/.
+# output = "reports/mi-comparacion"
+# false exige el mismo manifest; true permite otro solo si la firma de evaluación es idéntica.
+# allow-training-differences = false
+
+# [plot]
+# La fuente (fold, directorio de comparación o comparison.csv) se pasa en la CLI.
+# Directorio nuevo para las gráficas; por defecto <directorio_de_comparacion>/plots.
+# output = "reports/graficas-pm25"

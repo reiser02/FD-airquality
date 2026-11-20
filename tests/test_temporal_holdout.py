@@ -45,7 +45,7 @@ def test_default_evaluation_uses_all_folds_without_selecting_configuration(
     temporal_family, tmp_path, monkeypatch, folds,
 ):
     raw, geometry = temporal_family
-    family = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=folds, step_hours=48)
+    family = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=folds, min_stations=2)
     assert json.loads(family.read_text())["final_holdout_fold"] is None
     monkeypatch.setattr("fd_airquality.backtesting.select_configuration",
                         lambda *_: pytest.fail("La evaluación normal no selecciona configuraciones"))
@@ -72,8 +72,7 @@ def test_development_does_not_score_holdout_and_final_uses_only_frozen_selection
     temporal_family, tmp_path, mode, in_process_federation,
 ):
     raw, geometry = temporal_family
-    path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry,
-                            folds=3, step_hours=48)
+    path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=3, min_stations=2)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
                            num_server_rounds=2, hidden_size=8, batch_size=8,
                            probabilistic=1, mlflow_tracking_uri="disabled")
@@ -111,7 +110,7 @@ def test_development_does_not_score_holdout_and_final_uses_only_frozen_selection
 
 def test_final_stage_requires_selection_before_any_training(temporal_family, tmp_path):
     raw, geometry = temporal_family
-    path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, step_hours=48)
+    path = prepare_backtest(raw, tmp_path / "prepared", "PM25", geometry, folds=2, min_stations=2)
     settings = RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"))
     with pytest.raises(ValueError, match="selección"):
         run_backtest(settings, ["mlp"], ["local"], stage="final")

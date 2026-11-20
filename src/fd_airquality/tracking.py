@@ -61,17 +61,20 @@ def tracking_uri(settings: RunSettings) -> str:
     return f"sqlite:///{database}"
 
 
-def benchmark_tags(output_dir: str | Path, pollutant: str) -> dict[str, str]:
-    """Find the matrix launch time from the case layout without changing its paths."""
+def backtest_tags(output_dir: str | Path, pollutant: str) -> dict[str, str]:
+    """Group all folds of a backtest without changing the child process settings."""
     case = Path(output_dir)
-    stamp = re.fullmatch(r"benchmark_([0-9]{8}_[0-9]{6})(?:_[0-9]{6})?", case.parent.parent.name)
-    if case.parent.name != "runs" or not re.fullmatch(r"case_[0-9]{4,}", case.name) or stamp is None:
+    fold_dir = case.parent.parent
+    fold = re.fullmatch(r"fold_([0-9]{3,})", fold_dir.name)
+    stamp = re.fullmatch(r"backtest_([0-9]{8}_[0-9]{6})(?:_[0-9]+)?", fold_dir.parent.name)
+    if (case.parent.name != "runs" or not re.fullmatch(r"case_[0-9]{4,}", case.name)
+            or fold is None or stamp is None):
         return {}
     try:
         started = datetime.strptime(stamp[1], "%Y%m%d_%H%M%S")
     except ValueError:
         return {}
-    return {"benchmark": f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC"}
+    return {"backtest": f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC", "fold": str(int(fold[1]))}
 
 
 def run_labels(settings: RunSettings, mode: str, pollutant: str, adaptation: str,
@@ -82,9 +85,9 @@ def run_labels(settings: RunSettings, mode: str, pollutant: str, adaptation: str
     if mode == "federated":
         parts.append("FedProx" if settings.strategy == "fedprox" else "FedAvg")
     candidate = " | ".join(parts)
-    tags = benchmark_tags(settings.output_dir, pollutant)
+    tags = backtest_tags(settings.output_dir, pollutant)
     started = (started_at or datetime.now(UTC)).astimezone(UTC)
-    origin = tags.get("benchmark", f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC")
+    origin = f"{tags['backtest']} | fold {tags['fold']}" if tags else f"{pollutant} | {started:%Y-%m-%d %H:%M:%S} UTC"
     return tags | {"candidate": candidate, "mlflow.runName": f"{candidate} | {origin}"}
 
 

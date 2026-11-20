@@ -15,14 +15,14 @@ from dataclasses import asdict, fields, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
-from fd_airquality.configuration import parse_configured_args
+from fd_airquality.backtesting import DEFAULT_EVALUATION_HOURS, DEFAULT_MIN_STATIONS
+from fd_airquality.configuration import STANDALONE_PREPARE_FIELDS, parse_configured_args
 from fd_airquality.data import DataConfig, prepare, read_manifest
 from fd_airquality.execution import usable_gpu_slots
 from fd_airquality.loaders import POLLUTANT
 from fd_airquality.models import (
     GRANITE,
     MODEL_NAMES,
-    model_metadata,
     validate_model_geometry,
     validate_run_mode,
 )
@@ -31,7 +31,9 @@ from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
 from fd_airquality.settings import RunSettings, resolve_manifest
 from fd_airquality.task import validate_selection_coverage
-from fd_airquality.tracking import initialize_tracking, tracking_uri
+from fd_airquality.tracking import tracking_uri
+
+DEFAULT_MATRIX_MODELS = tuple(name for name in MODEL_NAMES if name != "patchtst-fm-r2")
 
 
 def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
@@ -40,7 +42,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
                         help="Archivo TOML; por defecto fd-airquality.toml en el directorio actual.")
     commands = parser.add_subparsers(dest="command", required=True)
     data = commands.add_parser("prepare", help="Preprocesar y auditar cada estación por separado.")
-    temporal_data = commands.add_parser("prepare-backtest", help="Preparar folds globales con datos progresivos.")
+    temporal_data = commands.add_parser("prepare-backtest", help="Repartir el calendario observado en folds globales.")
     for command in (data, temporal_data):
         command.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"))
         command.add_argument("--output", type=Path, default=Path("data/backtests" if command is temporal_data else "data/federated"))
@@ -48,6 +50,8 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
                              help="Único contaminante admitido: PM25 (PM2.5).")
         command.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
         for field in fields(DataConfig):
+            if command is temporal_data and field.name in STANDALONE_PREPARE_FIELDS:
+                continue
             value = getattr(DataConfig(), field.name)
             options = {}
             if field.name == "window_padding":
@@ -58,8 +62,14 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
             command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value) if value is not None else int, **options)
         command.add_argument("--heartbeat-seconds", type=float, default=60.0)
         command.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
-    temporal_data.add_argument("--folds", type=int, default=3)
-    temporal_data.add_argument("--step-hours", type=int, default=672)
+    temporal_data.add_argument("--folds", type=int, default=3,
+                               help="Número de cortes temporales; usa 1 para evaluar un solo corte.")
+    temporal_data.add_argument("--min-stations", type=int, default=DEFAULT_MIN_STATIONS,
+                                help="Mínimo de estaciones comunes al usar todas (15); con selección explícita basta una.")
+    temporal_data.add_argument("--validation-hours", type=int, default=DEFAULT_EVALUATION_HOURS,
+                               help="Horas objetivo de validación por fold (672 por defecto).")
+    temporal_data.add_argument("--test-hours", type=int, default=DEFAULT_EVALUATION_HOURS,
+                               help="Horas objetivo de test por fold (672 por defecto).")
     temporal_data.add_argument("--train-history", choices=["expanding", "sliding"], default="expanding")
     temporal_data.add_argument("--history-hours", type=int, default=672)
     audit = commands.add_parser("inspect", help="Resumen del soporte y las exclusiones, sin entrenar.")
@@ -73,31 +83,29 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     baseline.add_argument("--mode", choices=["local", "centralized", "zero-shot"], default="local")
     baseline.add_argument("--manifest")
     baseline.add_argument("--output-dir", default="reports/non_federated")
-    benchmark = commands.add_parser("benchmark", help="Matriz de modelos y métodos sobre un único manifest.")
-    backtest = commands.add_parser("backtest", help="CV temporal: reiniciar los modelos en cada fold.")
+    backtest = commands.add_parser("backtest", help="Comparar modelos y métodos en uno o varios folds temporales.")
     backtest.add_argument("--stage", choices=["evaluation", "development", "final", "all"], default="evaluation",
                           help="evaluation evalúa todos los folds sin seleccionar configuración; development/final son opt-in; all es exploratorio.")
     backtest.add_argument("--selection", type=Path, help="selection.json del desarrollo para consultar el holdout.")
-    for command in (benchmark, backtest):
-        command.add_argument("--manifest")
-        command.add_argument("--output-dir", default="reports/backtests" if command is backtest else "reports/benchmarks")
-        command.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(MODEL_NAMES))
-        command.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
-                           default=["local", "centralized", "federated", "zero-shot"])
-        command.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
-                            default=["lora", "ffa-lora", "flora", "lora-fair"])
-        command.add_argument("--seeds", nargs="+", type=int)
-        command.add_argument("--lora-ranks", nargs="+", type=int)
-        command.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
-        command.add_argument("--max-parallel-models", type=int,
-                            help="Límite de candidatos por modo no federado; por defecto uno por GPU. CPU: secuencial.")
+    backtest.add_argument("--manifest", help="backtest_manifest.json de prepare-backtest; por defecto el más reciente.")
+    backtest.add_argument("--output-dir", default="reports/backtests")
+    backtest.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(DEFAULT_MATRIX_MODELS))
+    backtest.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
+                          default=["local", "centralized", "federated", "zero-shot"])
+    backtest.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
+                          default=["lora", "ffa-lora", "flora", "lora-fair"])
+    backtest.add_argument("--seeds", nargs="+", type=int)
+    backtest.add_argument("--lora-ranks", nargs="+", type=int)
+    backtest.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
+    backtest.add_argument("--max-parallel-models", type=int,
+                          help="Límite de candidatos por modo no federado; por defecto uno por GPU. CPU: secuencial.")
     comparison = commands.add_parser("compare", help="Comparar resultados completos del mismo manifest.")
     comparison.add_argument("runs", nargs="*", type=Path)
     comparison.add_argument("--output", type=Path)
     comparison.add_argument("--allow-training-differences", action="store_true",
                             help="Permitir distinto entrenamiento solo con firma de evaluación idéntica.")
     plots = commands.add_parser("plot", help="Graficar resultados de test federados y centralizados sin entrenar.")
-    plots.add_argument("source", type=Path, help="Directorio del benchmark o de la comparación, o comparison.csv.")
+    plots.add_argument("source", type=Path, help="Directorio del fold o de la comparación, o comparison.csv.")
     plots.add_argument("--output", type=Path, help="Directorio nuevo; por defecto <comparación>/plots.")
     commands.add_parser("models", help="Listar modelos, adaptación y requisitos sin descargarlos.")
     for command in commands.choices.values():
@@ -108,7 +116,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
         if field.name in {"manifest", "output_dir"}:
             continue
         value = getattr(defaults, field.name)
-        for command in (simulation, baseline, benchmark, backtest):
+        for command in (simulation, baseline, backtest):
             command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value), default=value)
     return parser, commands.choices
 
@@ -217,108 +225,32 @@ def _launch_simulation(settings, dry_run, home, overrides):
     return None
 
 
-def build_benchmark_matrix(models: list[str], modes: list[str], adaptations: list[str],
-                           strategies: tuple | list = ("fedavg",)) -> list[dict]:
-    for values in (models, modes, adaptations, strategies):
-        if not values or len(set(values)) != len(values):
-            raise ValueError("La matriz no admite listas vacías ni valores repetidos.")
-    if (set(models) - set(MODEL_NAMES) or set(modes) - {"federated", "local", "centralized", "zero-shot"}
-            or set(adaptations) - {"lora", "ffa-lora", "flora", "lora-fair"}
-            or set(strategies) - {"fedavg", "fedprox"}):
-        raise ValueError("Combinación desconocida en la matriz.")
-    matrix = []
-    controls = (["lora"] if set(adaptations) - {"ffa-lora"} else []) + (["ffa-lora"] if "ffa-lora" in adaptations else [])
-    for mode in modes:
-        for model in models:
-            foundation = model in GRANITE
-            if mode == "zero-shot":
-                if foundation:
-                    matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
-                continue
-            algorithms = adaptations if foundation and mode == "federated" else controls if foundation else ["auto"]
-            for algorithm in algorithms:
-                if algorithm in {"flora", "lora-fair"} and "fedavg" not in strategies:
-                    raise ValueError("FLoRA/LoRA-FAIR requieren su agregación sin FedProx; incluye fedavg en --strategies.")
-                choices = ["fedavg"] if mode != "federated" or algorithm in {"flora", "lora-fair"} else strategies
-                for strategy in choices:
-                    matrix.append({"model": model, "mode": mode, "adaptation": algorithm, "strategy": strategy})
-    return matrix
-
-
-def run_benchmark(settings: RunSettings, models: list[str], modes: list[str],
-                  adaptations: list[str] | None = None, seeds: list[int] | None = None,
-                  lora_ranks: list[int] | None = None, strategies: list[str] | None = None,
-                  max_parallel_models: int | None = None, *,
-                  allow_single: bool = False) -> Path:
-    from fd_airquality.baselines import run_baseline
-    from fd_airquality.comparison import compare_runs
-    from fd_airquality.execution import execute_plan
-
-    if max_parallel_models is not None and (type(max_parallel_models) is not int or max_parallel_models < 1):
-        raise ValueError("max-parallel-models debe ser un entero positivo.")
-    manifest = read_manifest(settings.manifest)
-    matrix = build_benchmark_matrix(models, modes, adaptations or ["lora", "ffa-lora", "flora", "lora-fair"], strategies or [settings.strategy])
-    seeds, ranks = seeds or [settings.seed], lora_ranks or [settings.lora_rank]
-    if len(set(seeds)) != len(seeds) or len(set(ranks)) != len(ranks):
-        raise ValueError("No repitas semillas ni rangos.")
-    plan = []
-    for case in matrix:
-        for seed in seeds[:1] if case["mode"] == "zero-shot" else seeds:
-            for rank in ranks if case["model"] in GRANITE and case["mode"] != "zero-shot" else ranks[:1]:
-                plan.append(case | {"seed": seed, "lora_rank": rank})
-    if len(plan) < (1 if allow_single else 2):
-        raise ValueError("benchmark requiere al menos dos combinaciones válidas.")
-    for case in plan:
-        current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
-        validate_model_geometry(manifest["geometry"], current)
-        validate_run_mode(current, case["mode"])
-    root = Path(settings.output_dir).resolve() / f"benchmark_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
-    root.mkdir(parents=True, exist_ok=False)
-    with RunLogging(root, "benchmark", filename="benchmark.log", level=settings.log_level,
-                    heartbeat_seconds=settings.heartbeat_seconds) as progress_log:
-        settings, manifest = prepare_runtime_panel(settings, root)
-        checked = set()
-        for case in plan:
-            if case["model"] in GRANITE and case["mode"] != "zero-shot":
-                key = (case["model"], case["lora_rank"])
-                if key not in checked:
-                    report_progress("preflight", f"loading model={case['model']} rank={case['lora_rank']}")
-                    current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
-                    model_metadata(manifest["geometry"], current)
-                    checked.add(key)
-        settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
-        report_progress("tracking", "initializing MLflow before concurrent candidates")
-        initialize_tracking(settings, root / "mlflow-artifacts")
-        paths = execute_plan(settings, plan, root,
-                             max_parallel_models=max_parallel_models, baseline=run_baseline,
-                             launch=launch_simulation, progress_log=progress_log)
-        report_progress("comparison", f"completed_candidates={len(paths)}")
-        return compare_runs(paths, root / "comparison", **({"allow_single": True} if allow_single else {}))
-
-
 def main(argv: list[str] | None = None) -> None:
     parser, commands = _parser()
+    preparation_log = None
     try:
         args = parse_configured_args(parser, commands, argv)
         if getattr(args, "config", None) is not None:
             print(f"Configuración: {args.config}", flush=True)
         if args.command in {"prepare", "prepare-backtest"}:
-            overrides = {
-                field.name: getattr(args, field.name)
-                for field in fields(DataConfig) if getattr(args, field.name) is not None
-            }
+            standalone_fields = STANDALONE_PREPARE_FIELDS if args.command == "prepare-backtest" else set()
+            overrides = {field.name: value for field in fields(DataConfig) if field.name not in standalone_fields
+                         and (value := getattr(args, field.name, None)) is not None}
             log_dir = args.output / "logs" / f"prepare_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
-            with RunLogging(log_dir, f"prepare pollutant={args.pollutant}", level=args.log_level,
-                            heartbeat_seconds=args.heartbeat_seconds) as log:
+            with RunLogging(log_dir, f"{args.command} pollutant={args.pollutant}", level=args.log_level,
+                             heartbeat_seconds=args.heartbeat_seconds) as log:
+                preparation_log = log.path
                 report_progress("prepare", f"raw_root={args.raw_root} pollutant={args.pollutant}")
                 parameters = (args.raw_root.expanduser().resolve(), args.output, args.pollutant,
                               DataConfig(**overrides), set(args.station) if args.station else None)
                 if args.command == "prepare-backtest":
                     from fd_airquality.backtesting import prepare_backtest
 
-                    manifest = prepare_backtest(*parameters, folds=args.folds, step_hours=args.step_hours,
-                                               train_history=args.train_history,
-                                               history_hours=args.history_hours)
+                    manifest = prepare_backtest(
+                        *parameters, folds=args.folds, validation_hours=args.validation_hours,
+                        test_hours=args.test_hours, min_stations=args.min_stations,
+                        train_history=args.train_history, history_hours=args.history_hours,
+                    )
                 else:
                     manifest = prepare(*parameters)
                 report_progress("prepare", f"manifest={manifest}")
@@ -330,7 +262,12 @@ def main(argv: list[str] | None = None) -> None:
             _inspect(resolve_manifest(args.manifest))
         elif args.command == "models":
             for name in MODEL_NAMES:
-                details = "LoRA / FFA-LoRA / FLoRA / LoRA-FAIR internos; zero-shot disponible" if name in GRANITE else "entrenamiento completo"
+                if name in GRANITE:
+                    details = "LoRA / FFA-LoRA / FLoRA / LoRA-FAIR internos; zero-shot disponible"
+                    if name not in DEFAULT_MATRIX_MODELS:
+                        details += "; fuera de las matrices predeterminadas"
+                else:
+                    details = "entrenamiento completo"
                 print(f"{name}: {details}")
             print("TTM-R3 (90-30-dec-90-r3): context=90, horizon<=30; PatchTST-FM-R2: context=16..8192; FlowState-R1: context<=2048.")
             print("FlowState: adaptación interna experimental, validada por las pruebas de integración reales, no soporte oficial de fine-tuning.")
@@ -352,7 +289,8 @@ def main(argv: list[str] | None = None) -> None:
                     else getattr(args, field.name)
                 ) for field in fields(RunSettings)
             })
-            settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
+            if args.command != "backtest":
+                settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
             if args.command == "simulate":
                 launch_simulation(settings, args.print_command)
             elif args.command == "baseline":
@@ -367,20 +305,31 @@ def main(argv: list[str] | None = None) -> None:
                                        max_parallel_models=args.max_parallel_models,
                                        stage=args.stage, selection=args.selection)
                 print(f"Resultados temporales: {result}")
-            else:
-                run_benchmark(settings, args.models, args.modes,
-                               args.adaptations, args.seeds, args.lora_ranks, args.strategies,
-                               args.max_parallel_models)
     except (ValueError, FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
-        parser.exit(2, f"Error: {exc}\n")
+        log_hint = f"\nLog de preparación: {preparation_log}" if preparation_log is not None else ""
+        parser.exit(2, f"Error: {exc}{log_hint}\n")
 
 
 def _inspect(path: Path) -> None:
     document = json.loads(path.read_text(encoding="utf-8"))
     if "folds" in document:
         print(f"Protocolo temporal: {document['protocol']}; historial={document['train_history']}")
+        block_start = document.get("initial_history_end")
+        if block_start is not None:
+            print(f"  Calendario observado: [{document['calendar_start']}, {document['calendar_end']}); "
+                  f"histórico inicial hasta {block_start}")
+        if "requested_validation_hours" in document:
+            print(f"  Por fold: validación {document['validation_hours']}/{document['requested_validation_hours']} h; "
+                  f"test {document['test_hours']}/{document['requested_test_hours']} h (efectivo/solicitado)")
+        if "min_stations" in document:
+            print(f"  Mínimo de estaciones comunes: {document['min_stations']}")
         for entry in document["folds"]:
-            print(f"  Fold {entry['fold']}: train < {entry['validation_start']}; test [{entry['test_start']}, {entry['test_end']})")
+            validation, test, end = (entry[key] for key in ("validation_start", "test_start", "test_end"))
+            block = f"bloque [{block_start}, {end}); " if block_start is not None else ""
+            print(f"  Fold {entry['fold']}: {block}train < {validation}; "
+                  f"validación [{validation}, {test}); test [{test}, {end})")
+            if block_start is not None:
+                block_start = end
         return
     manifest = read_manifest(path)
     print(f"{manifest['pollutant']}: {len(manifest['clients'])} estaciones elegibles")

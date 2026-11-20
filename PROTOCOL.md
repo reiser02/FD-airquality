@@ -276,9 +276,10 @@ El servidor combina sumas escaladas y recuentos para las métricas agrupadas;
 
 MASE/RMSSE usan una **referencia previa de 28 días naturales** (`error_scale_hours=672`,
 opción `prepare --error-scale-hours`), separada del contexto de entrada y del
-historial usado para ajustar pesos. En modo global se fija por los cortes comunes:
+historial usado para ajustar pesos. En modo global se fija por los cortes de cada
+fold. Por ejemplo, con las fechas de `prepare` y la política `pre-evaluation`:
 
-| Evaluación | Referencia predeterminada, extremo derecho exclusivo |
+| Evaluación | Referencia de ejemplo, extremo derecho exclusivo |
 | --- | --- |
 | Validación | [2026-02-01, 2026-03-01) |
 | Test | [2026-03-01, 2026-03-29) |
@@ -307,7 +308,7 @@ recuentos. Las métricas locales incluyen `error-scale-pairs`. Escalas nulas o s
 pares se excluyen con cobertura explícita, no se sustituyen por uno ni producen
 errores cero ficticios. Los esquemas
 históricos 2/3 no se reinterpretan como esta nueva referencia: los experimentos
-nuevos requieren `prepare` y el mismo manifest para todos los candidatos.
+nuevos requieren `prepare-backtest` y el mismo manifest para todos los candidatos de un fold.
 
 Con selección por `macro-mase` o `macro-rmsse`, en tiempo de ejecución se descarta
 cada estación sin escala válida de **validación**, antes de entrenar. Se aplica la
@@ -325,8 +326,9 @@ estación, se escribe ese informe y se aborta antes del entrenamiento.
 consecutivamente las particiones conservando `source_partition_id`. No modifica
 la preparación ni los NPZ, ventanas, normalización o denominadores. Dos ejecuciones
 con la misma preparación y regla generan el mismo contenido y hash del panel efectivo.
-`benchmark` fija ese panel una sola vez para todos sus casos. Un panel ya filtrado
-por otra métrica debe sustituirse por el manifest original para ejecutar otra selección.
+`backtest` fija un panel común para los folds de evaluación y documenta sus
+descartes en `temporal_exclusions.csv`. Un panel ya filtrado por otra métrica
+debe sustituirse por el manifest original para ejecutar otra selección.
 En la simulación, el servidor comunica el manifest efectivo y la partición asignada
 a cada nodo; esa asociación permanece fija desde la primera evaluación hasta test.
 Los descartes no ocultan corrupción de artefactos, errores de modelo o fallos de
@@ -395,8 +397,14 @@ existente, ajustado con entrenamiento, por lo que no representa un protocolo sin
 ningún acceso a historia de entrenamiento. Se evalúa validación una vez y después
 test, sin seleccionar escala, revisión o hiperparámetros con este último.
 
-`benchmark` fija un manifest y ejecuta los modos secuencialmente en el orden
-solicitado: por defecto local, centralizado, federado y zero-shot. Entre modos hay
+`backtest` repite la matriz de candidatos en cada fold, con un manifest común a
+sus candidatos e inicialización independiente. Con `folds = 1`, se ejecuta la
+misma matriz sobre un único corte. Los bloques se reparten automáticamente
+en el calendario observado tras el histórico inicial. Con historial expansivo,
+el entrenamiento de un fold incluye lo que fue test antes y las horas nuevas
+hasta que empieza su propia validación.
+Los modos se ejecutan en el orden solicitado:
+por defecto local, centralizado, federado y zero-shot. Entre modos hay
 una barrera: no comienza el siguiente hasta completar todos los candidatos del anterior.
 Dentro de local/centralizado/zero-shot, los candidatos completos pueden ejecutarse
 en procesos independientes, uno por GPU utilizable, sin cambiar ventanas, semillas,
@@ -410,7 +418,7 @@ cliente. La concurrencia es el mínimo entre las GPUs utilizables y las estacion
 del panel efectivo; en CPU/fallback se ejecuta un cliente cada vez y no se reservan
 GPUs. No hay ajustes manuales `workers`/`client-gpus`. No se presupone coordinación
 de GPUs entre runtimes Ray independientes ni se reconfigura un SuperLink ya iniciado.
-Un fallo detiene/cancela los procesos del benchmark, marca los casos no finalizados
+Un fallo detiene/cancela los procesos del fold, marca los casos no finalizados
 y evita comparar un panel o una matriz incompletos. El orden de terminación de
 candidatos no cambia la identidad ni el orden de las filas de resultados.
 `compare` requiere el mismo SHA del manifest, clientes completos y recuentos de
@@ -431,7 +439,7 @@ sobre diferencias de MASE agrupado con soporte de test idéntico.
 
 ## Trazabilidad con MLflow
 
-El logging operativo es independiente del tracking: `benchmark.log` global,
+El logging operativo es independiente del tracking: `fold.log` por fold,
 logs por candidato y `run.log` se actualizan durante la ejecución. Una cola
 serializa los registros en el coordinador; los subprocesos envían su salida por
 pipes y cada uno recibe una única GPU visible. El flujo externo de Flower se
@@ -439,7 +447,8 @@ captura expresamente en `flower.log`, no se presupone que los handlers Python de
 coordinador capturen automáticamente procesos externos. Los actores guardan su
 detalle por partición en `clients/`. Los logs no incluyen series ni predicciones.
 El heartbeat informa de estado y tiempo sin nuevos eventos; no mide avance real,
-porcentaje de cómputo o ETA. `benchmark.json` se actualiza con reemplazo atómico.
+porcentaje de cómputo o ETA. `candidates.json` y `backtest.json` registran los
+estados de candidatos y folds, respectivamente, y se actualizan con reemplazo atómico.
 
 Cada ejecución registra un run MLflow desde el servidor o coordinador del control,
 no desde cada actor Ray. Se indexan parámetros aplicables, geometría, hash del

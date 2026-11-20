@@ -10,7 +10,7 @@ from fd_airquality.plotting import cross_pairs, load_comparison, matched_pairs, 
 
 @pytest.fixture
 def comparison(tmp_path):
-    source = tmp_path / "benchmark" / "comparison"
+    source = tmp_path / "fold_001" / "comparison"
     source.mkdir(parents=True)
     records = []
     for model, adaptations in (("nlinear", ("full",)), ("ttm-r3", ("lora", "ffa-lora", "flora", "lora-fair"))):

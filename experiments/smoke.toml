@@ -24,15 +24,9 @@ batch-size = 8
 mlflow-tracking-uri = "disabled"
 selection-metric = "macro-mase"
 
-[benchmark]
-models = ["mlp", "autoencoder", "nlinear", "nhits"]
-modes = ["local", "centralized", "federated"]
-seeds = [42]
-
 [prepare-backtest]
 output = "data/smoke_backtests"
 folds = 2
-step-hours = 672
 train-history = "expanding"
 
 [backtest]

@@ -173,7 +173,9 @@ def verify_backtest(output: Path, *, classical: bool) -> dict:
 def verify_foundation_quantiles(root: Path) -> dict:
     from fd_airquality.missing import forecast_distribution
 
-    comparison, = (root / "foundation_quantiles").glob("benchmark_*/comparison/comparison.csv")
+    backtest, = (root / "foundation_quantiles").glob("backtest_*")
+    fold, = json.loads((backtest / "backtest.json").read_text())["results"]
+    comparison = Path(fold["comparison"]) / "comparison.csv"
     scores = pd.read_csv(comparison)
     available = scores.loc[scores["probabilistic-available"] > 0]
     assert set(available.model) == {"ttm-r3", "patchtst-fm-r2", "flowstate-r1"}
@@ -257,10 +259,13 @@ def main() -> None:
                     "--num-server-rounds", "2", "--probabilistic", "0")
             backtest, = results.glob("backtest_*")
             report["foundation"] = verify_backtest(backtest, classical=False)
-            family = json.loads(family_path.read_text())
+            quantile_data = root / "prepared_quantiles"
+            run_cli(root, "prepare_quantiles", "prepare-backtest", "--config", "experiments/smoke.toml",
+                    "--output", str(quantile_data), "--folds", "1")
+            quantile_manifest, = quantile_data.glob("*/backtest_manifest.json")
             results = root / "foundation_quantiles"
-            run_cli(root, "foundation_quantiles", "benchmark", "--config", "experiments/smoke.toml",
-                    "--manifest", family["folds"][0]["manifest"], "--output-dir", str(results),
+            run_cli(root, "foundation_quantiles", "backtest", "--config", "experiments/smoke.toml",
+                    "--manifest", str(quantile_manifest), "--output-dir", str(results),
                     "--models", "ttm-r3", "patchtst-fm-r2", "flowstate-r1", "--modes", "zero-shot")
             report["foundation_quantiles"] = verify_foundation_quantiles(root)
         report.update(status="passed", finished=datetime.now(UTC).isoformat())

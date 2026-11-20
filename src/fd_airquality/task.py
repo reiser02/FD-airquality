@@ -420,6 +420,6 @@ def validate_selection_coverage(manifest: dict, settings: RunSettings, mode: str
         raise ValueError(
             f"Selección {settings.selection_metric} indefinida en {undefined}/{len(clients)} "
             f"estaciones con esta referencia de validación (modo {mode}). "
-            "Ejecuta fd-airquality simulate/baseline/benchmark para descartar estas estaciones "
+            "Ejecuta fd-airquality simulate/baseline/backtest para descartar estas estaciones "
             "antes de entrenar, con el mismo panel para todos los candidatos."
         )

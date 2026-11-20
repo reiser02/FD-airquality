@@ -46,13 +46,13 @@ def test_logging_preserves_errors_and_interruptions(tmp_path, exception, marker)
 
 
 def test_nested_runs_do_not_duplicate_records_or_close_parent_handlers(tmp_path):
-    with RunLogging(tmp_path, "outer", filename="benchmark.log", stream=StringIO()) as parent:
+    with RunLogging(tmp_path, "outer", filename="fold.log", stream=StringIO()) as parent:
         for index in range(2):
             with RunLogging(tmp_path / str(index), "inner"):
                 report_progress("train", f"unique-event-{index}")
         report_progress("finalizing", "parent-still-open")
         parent.flush()
-    text = (tmp_path / "benchmark.log").read_text()
+    text = (tmp_path / "fold.log").read_text()
     assert text.count("unique-event-0") == text.count("unique-event-1") == 1
     assert "[inner] stage=train  unique-event-0" in text
     assert text.count("parent-still-open") == 1
@@ -60,7 +60,7 @@ def test_nested_runs_do_not_duplicate_records_or_close_parent_handlers(tmp_path)
 
 
 def test_nested_logs_share_one_heartbeat_monitor_and_keep_parent_state_current(tmp_path):
-    with RunLogging(tmp_path, "outer", filename="benchmark.log", stream=StringIO()) as parent:
+    with RunLogging(tmp_path, "outer", filename="fold.log", stream=StringIO()) as parent:
         parent.update(stage="local", completed=1, total=3)
         with RunLogging(tmp_path / "child", "candidate") as child:
             assert parent._thread is not None and child._thread is None
@@ -68,7 +68,7 @@ def test_nested_logs_share_one_heartbeat_monitor_and_keep_parent_state_current(t
             parent.emit_heartbeat()
             child.flush()
             parent.flush()
-    text = (tmp_path / "benchmark.log").read_text()
+    text = (tmp_path / "fold.log").read_text()
     heartbeat, = [line for line in text.splitlines() if "[heartbeat]" in line]
     assert "[outer]" in heartbeat and "stage=local" in heartbeat
     assert "completed=1" in heartbeat and "epoch=2/4" in heartbeat

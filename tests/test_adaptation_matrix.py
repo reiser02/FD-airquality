@@ -1,12 +1,12 @@
 import pytest
 
-from fd_airquality.cli import build_benchmark_matrix
+from fd_airquality.backtesting import build_candidate_matrix
 from fd_airquality.models import GRANITE, validate_run_mode
 from fd_airquality.settings import RunSettings
 
 
 def test_full_foundation_matrix_has_12_federated_and_meaningful_controls():
-    matrix = build_benchmark_matrix(list(GRANITE), ["federated", "local", "centralized", "zero-shot"],
+    matrix = build_candidate_matrix(list(GRANITE), ["federated", "local", "centralized", "zero-shot"],
                                     ["lora", "ffa-lora", "flora", "lora-fair"])
     assert len(matrix) == 27
     for model in GRANITE:
@@ -19,7 +19,7 @@ def test_full_foundation_matrix_has_12_federated_and_meaningful_controls():
 
 
 def test_classic_models_are_not_assigned_lora_or_zero_shot():
-    matrix = build_benchmark_matrix(["mlp", "autoencoder", "nlinear"],
+    matrix = build_candidate_matrix(["mlp", "autoencoder", "nlinear"],
                                     ["federated", "local", "centralized", "zero-shot"], ["lora", "ffa-lora", "flora", "lora-fair"])
     assert len(matrix) == 9
     assert all(row["adaptation"] == "auto" and row["mode"] != "zero-shot" for row in matrix)

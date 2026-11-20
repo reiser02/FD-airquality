@@ -9,7 +9,7 @@ producción ni el worktree de origen.
 
 | Antes | Ahora |
 |---|---|
-| Dos benchmarks reales (con y sin MLflow) y un tercer test solo para comprobar el proceso hijo | Un benchmark con MLflow real verifica PID, configuración aislada, logs y comparación; el modo sin tracking se comprueba en baselines. |
+| Dos benchmarks reales (con y sin MLflow) y un tercer test solo para comprobar el proceso hijo | Un backtest de un fold con MLflow real verifica PID, configuración aislada, logs y comparación; el modo sin tracking se comprueba en baselines. |
 | Entrenar modelos para provocar un error en `compare` | Archivos de resultado sintéticos. El rechazo de recuentos erróneos mantiene intacto el total del panel, de forma que exige validar cada estación. |
 | Cruces completos de modo, modelo, adaptador o padding en pruebas de orquestación | Casos representativos: se conservan las rutas que difieren y se prueban las máscaras, las pérdidas y la agregación donde se implementan. El control de épocas pasa de 45 a 5 casos de integración. |
 | Un segundo enumerador de ventanas dentro de un test de padding | Calendario pequeño con orígenes esperados explícitos: stride, hueco horario, mínimos observados y cortes de evaluación. |
