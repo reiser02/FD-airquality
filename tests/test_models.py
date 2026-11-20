@@ -203,13 +203,17 @@ def test_patchtst_fp32_fallback_overrides_outer_autocast_without_cutting_gradien
     assert layer.weight.grad is not None and torch.isfinite(layer.weight.grad).all()
 
 
-def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(monkeypatch, granite_template):
+@pytest.mark.parametrize("pinned", [True, False])
+def test_patchtst_loader_scopes_reconstruction_to_pinned_checkpoint(monkeypatch, granite_template, pinned):
     import tsfm_public
     from tsfm_public.models.patchtst_fm import modeling_patchtst_fm
 
     from fd_airquality.models import _load_granite, _patchtst_autocast_context
+    from fd_airquality.patchtst import _overlap_add
 
     called = []
+    granite_template.backbone = nn.Identity()
+    revision = GRANITE["patchtst-fm-r2"][1] if pinned else "a" * 40
 
     class Loader:
         @classmethod
@@ -223,12 +227,16 @@ def test_patchtst_loader_installs_precision_helper_without_changing_checkpoint(m
     monkeypatch.setattr(modeling_patchtst_fm, "get_autocast_context", lambda _: None)
     _load_granite.cache_clear()
     try:
-        model = _load_granite("patchtst-fm-r2", GRANITE["patchtst-fm-r2"][1])
+        model = _load_granite("patchtst-fm-r2", revision)
         assert not model.training
         assert not any(parameter.requires_grad for parameter in model.parameters())
+        if pinned:
+            assert model.backbone._overlap_add.__func__ is _overlap_add
+        else:
+            assert not hasattr(model.backbone, "_overlap_add")
     finally:
         _load_granite.cache_clear()
     assert called == [(GRANITE["patchtst-fm-r2"][0], {
-        "revision": GRANITE["patchtst-fm-r2"][1],
+        "revision": revision,
         "use_safetensors": True, "output_loading_info": True,
     })]

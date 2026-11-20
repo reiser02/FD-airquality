@@ -145,6 +145,10 @@ def _load_granite(name: str, revision: str) -> nn.Module:
     if any(info.get(key) for key in ("missing_keys", "unexpected_keys", "mismatched_keys", "error_msgs")):
         counts = {key: len(value) for key, value in info.items() if value}
         raise RuntimeError(f"Checkpoint Granite incompatible; no se aceptan pesos aleatorios: {counts}")
+    if name == "patchtst-fm-r2" and revision == GRANITE[name][1]:
+        from fd_airquality.patchtst import install_overlap_add
+
+        install_overlap_add(backbone.backbone)
     return backbone.requires_grad_(False).eval()
 
 
