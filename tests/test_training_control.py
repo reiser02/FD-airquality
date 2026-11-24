@@ -212,7 +212,9 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
               run_baseline(settings, mode))
     frame = pd.read_csv(output / ("round_metrics.csv" if mode == "centralized" else "station_metrics.csv"))
     train = frame.loc[frame.split == "train"]
-    assert set(train["round"]) == {1, 2, 3}
+    assert sorted(train["round"]) == {
+        "centralized": [1], "local": [1, 1], "federated": [1, 1, 2, 2, 3, 3],
+    }[mode]
     assert train["early-stopped"].gt(0).all()
     assert train["epochs-completed"].eq(2).all()
     assert train["learning-rate-reductions"].eq(2).all()
@@ -227,4 +229,6 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
         assert train["learning-rate-final"].eq(settings.learning_rate / 4).all()
     run = json.loads((output / "run.json").read_text())
     assert run["training_controls"]["monitor"] == "pooled_observed_mse_original_units"
+    assert run["training_budget"]["stages"] == (3 if mode == "federated" else 1)
+    assert run["training_budget"]["optimizer_reset_each_stage"] is (mode == "federated")
     assert (output / "test_metrics.json").is_file()

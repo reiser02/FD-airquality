@@ -214,8 +214,9 @@ La pérdida optimizada puede ser MSE o multicuantil normalizada y no es esa mét
   es la del scheduler de PyTorch: reduce cuando sus épocas malas **superan**
   `lr-scheduler-patience` (con cero, en la primera).
 - En los controles local y centralizado se usa la validación interna ya separada
-  del entrenamiento. El límite de etapas sigue siendo `num-server-rounds`; los
-  controles de épocas se reinician al comenzar cada etapa.
+  del entrenamiento. Solo se ajusta una vez por modelo y fold, con todas las
+  ventanas elegibles de `train` disponibles para el muestreo. AdamW, scheduler
+  y paciencia se mantienen durante el ajuste; `local-epochs` es su límite total.
 - En federado se detienen **las épocas locales del bloque actual**, no las rondas.
   El siguiente bloque sigue llegando y parte de los pesos globales agregados.
   AdamW, scheduler, paciencia y LR inicial se reinician por ronda; no se promete

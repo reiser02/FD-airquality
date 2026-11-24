@@ -372,22 +372,24 @@ Se ofrecen dos controles entrenados, además de la persistencia en todas las mé
 
 1. **Local:** un modelo independiente por estación, con la misma inicialización
    y las mismas ventanas locales. No hay agregación ni intercambio entre modelos;
-    cada estación selecciona por su MASE de validación predeterminada. Se guardan las
-   etapas seleccionadas por estación, que pueden diferir.
+   cada estación selecciona por su MASE de validación predeterminada. Se guarda
+   el estado seleccionado por estación, que puede ser el inicial o el ajustado.
 2. **Centralizado:** un único modelo accede a todas las ventanas de entrenamiento
    mediante `ConcatDataset`. Se concatena el índice de muestras, **no las series
    raw**; ninguna ventana cruza una estación, hueco o split. Conserva exactamente
    el escalador de entrenamiento de cada estación, por lo que el objetivo sigue
    siendo MSE normalizado por estación, ponderado por ventanas. Selecciona por
-    la misma MASE macro de validación que FL. Es un control metodológico que
+   la misma MASE macro de validación que FL. Es un control metodológico que
    deliberadamente elimina la restricción de acceso local a los datos.
 
 Los controles usan las mismas funciones `train_local` y `evaluate_local` que
-Flower. Una etapa aplica `local-epochs` a cada ventana; se ejecutan
-`num-server-rounds` etapas y se reinicia AdamW en cada una. Esto iguala exposición
-a datos entre métodos, pero no número/orden de actualizaciones globales, velocidad
-ni costo de comunicación. FedProx aplica su penalización solo al caso federado;
-no se añade esa penalización a los controles sin FL.
+Flower. Cada modelo local o centralizado se ajusta una sola vez por fold,
+durante hasta `local-epochs` épocas y sin reiniciar AdamW. Todo su `train`
+autorizado está disponible para muestreo desde la primera época. Se comparan
+los estados antes y después del ajuste en validación. Solo en federado se
+programan `num-server-rounds` rondas de entrenamiento; no se equipara la
+exposición a datos ni el presupuesto entre métodos. FedProx aplica su
+penalización solo al caso federado.
 
 Para Granite se ejecutan cuatro algoritmos federados por foundation y controles
 local/centralizado con LoRA o A congelada. FLoRA/FAIR no tienen modalidades sin

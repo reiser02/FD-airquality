@@ -46,25 +46,32 @@ def test_classical_baselines_write_test_metrics_and_checkpoints(prepared, tmp_pa
         names = ["best_model.pt"]
     for name, stage in zip(names, stages, strict=True):
         checkpoint = torch.load(output / name, weights_only=True)
-        assert 0 <= checkpoint["round"] == stage <= settings.num_server_rounds
+        assert checkpoint["round"] == stage and stage in {0, 1}
         assert checkpoint["model"]["name"] == model
 
 
-def test_centralized_restores_validation_winner_and_tests_once(prepared, tmp_path, monkeypatch):
+@pytest.mark.parametrize("selected_step", [0, 1])
+def test_centralized_fits_full_fold_once_and_restores_validation_winner(
+    arrival_prepared, tmp_path, monkeypatch, selected_step,
+):
     from fd_airquality.baselines import evaluate_local
 
-    path, manifest = prepared
+    path, manifest = arrival_prepared
     geometry, clients = manifest["geometry"], manifest["clients"]
     model = torch.nn.Linear(geometry["context"], geometry["horizon"], bias=False)
     torch.nn.init.zeros_(model.weight)
     evaluations = []
 
-    def train(model, dataset, *args, **kwargs):
+    def train(model, dataset, settings, *args, **kwargs):
         assert [(station.split, len(station)) for station in dataset.datasets] == [
             ("train", client["num_train_windows"]) for client in clients
         ]
+        assert all(station.available_through is None for station in dataset.datasets)
+        assert settings.local_epochs == 4
+        assert all(station.split == "validation" for station in kwargs["validation_data"].datasets)
         with torch.no_grad():
             model.weight.add_(1)
+        evaluations.append(("train", model.weight[0, 0].item()))
         return {"num-examples": len(dataset), "train-mse-normalized": 1.}
 
     def evaluate(model, dataset, *args):
@@ -72,7 +79,7 @@ def test_centralized_restores_validation_winner_and_tests_once(prepared, tmp_pat
         evaluations.append((dataset.split, stage))
         metrics = evaluate_local(model, dataset, *args)
         if dataset.split == "validation":
-            mase, rmsse = {0.: (2., 3.), 1.: (1., 2.), 2.: (3., 1.)}[stage]
+            mase, rmsse = (1., 2.) if stage == selected_step else (2., 1.)
             metrics.update({"mase": mase, "mase-sum": mase * metrics["mase-count"],
                             "rmsse": rmsse, "rmsse-sum": rmsse * metrics["rmsse-count"]})
         return metrics
@@ -81,17 +88,19 @@ def test_centralized_restores_validation_winner_and_tests_once(prepared, tmp_pat
     monkeypatch.setattr("fd_airquality.baselines.train_local", train)
     monkeypatch.setattr("fd_airquality.baselines.evaluate_local", evaluate)
     output = run_baseline(RunSettings(manifest=str(path), output_dir=str(tmp_path / "runs"),
-                                      num_server_rounds=2, mlflow_tracking_uri="disabled"), "centralized")
-    assert evaluations == [
-        (split, stage)
-        for split, stage in (("validation", 0), ("validation", 1), ("validation", 2), ("test", 1))
-        for _ in clients
-    ]
+                                      num_server_rounds=5, arrival_period_hours=24, local_epochs=4,
+                                      missing_policy="ffill", mlflow_tracking_uri="disabled"),
+                          "centralized")
+    assert evaluations == ([("validation", 0)] * len(clients) + [("train", 1)]
+                           + [("validation", 1)] * len(clients) + [("test", selected_step)] * len(clients))
     result = json.loads((output / "test_metrics.json").read_text())
     checkpoint = torch.load(output / "best_model.pt", weights_only=True)
     assert result["selection_metric"] == "validation_macro-mase"
-    assert result["selected_round"] == checkpoint["round"] == 1
-    torch.testing.assert_close(checkpoint["model_state_dict"]["weight"], torch.ones_like(model.weight))
+    assert result["selected_round"] == checkpoint["round"] == selected_step
+    torch.testing.assert_close(checkpoint["model_state_dict"]["weight"], torch.full_like(model.weight, selected_step))
+    last = torch.load(output / "last_model.pt", weights_only=True)
+    assert last["round"] == 1
+    torch.testing.assert_close(last["model_state_dict"]["weight"], torch.ones_like(model.weight))
 
 
 def test_zero_shot_never_trains(prepared, tmp_path, monkeypatch, mock_granite):
@@ -145,7 +154,7 @@ def test_foundation_controls_use_internal_adapters_on_identical_global_test(
 def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints(
     prepared, tmp_path, monkeypatch,
 ):
-    path, _ = prepared
+    path, manifest = prepared
     models, residents, calls = [], set(), []
 
     class ResidentModel(torch.nn.Module):
@@ -165,6 +174,8 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
 
     def train(model, dataset, *args, **kwargs):
         assert residents == {model.index}
+        assert dataset.split == "train"
+        assert len(dataset) == manifest["clients"][model.index]["num_train_windows"]
         with torch.no_grad():
             model.weight.add_(1)
         calls.append((model.index, "train", model.weight.item()))
@@ -176,8 +187,8 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
         calls.append((model.index, dataset.split, weight))
         count = len(dataset)
         targets = count * dataset.horizon
-        # Station 0 prefers the earlier round, station 1 the last one.
-        scaled_error = float(1 + abs(weight - (2, 4)[model.index]))
+        # Each station independently chooses initial or fitted weights.
+        scaled_error = float(1 + abs(weight - (1, 3)[model.index]))
         return {
             "num-examples": count, "num-targets": targets,
             "mase-sum": count * scaled_error, "mase-count": count,
@@ -197,15 +208,15 @@ def test_local_cuda_keeps_only_active_station_in_gpu_and_independent_checkpoints
     result = json.loads((output / "test_metrics.json").read_text())
     assert result["selection_metric"] == "station_validation_macro-mase"
     assert result["selected_round"] is None
-    assert pd.read_csv(output / "station_metrics.csv").query("split == 'test'")["round"].tolist() == [1, 2]
-    for index, (best_round, best_weight) in enumerate(((1, 2.0), (2, 4.0))):
+    assert pd.read_csv(output / "station_metrics.csv").query("split == 'test'")["round"].tolist() == [0, 1]
+    for index, (selected_step, best_weight) in enumerate(((0, 1.0), (1, 3.0))):
         assert [(split, weight) for i, split, weight in calls if i == index] == [
             ("validation", index + 1), ("train", index + 2), ("validation", index + 2),
-            ("train", index + 3), ("validation", index + 3), ("test", best_weight),
+            ("test", best_weight),
         ]
         saved = torch.load(output / f"client_{index:03d}_best_model.pt", weights_only=True)
         assert saved["model_state_dict"]["weight"].item() == best_weight
-        assert saved["round"] == best_round
+        assert saved["round"] == selected_step
 
 
 @pytest.mark.parametrize("fails", [False, True])

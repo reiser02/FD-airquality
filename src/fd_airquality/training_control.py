@@ -1,4 +1,4 @@
-"""Epoch-local validation controls; never stop the federated arrival calendar."""
+"""Training budgets and epoch-level controls; never stop the federated arrival calendar."""
 
 from __future__ import annotations
 
@@ -8,7 +8,15 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.models import load_shared_state, shared_state
+
+
+def training_stage_count(settings, mode: str) -> int:
+    """Count training fits, not validation checkpoints."""
+    if mode == "zero-shot" or settings.model in STATION_CONTROLS:
+        return 0
+    return settings.num_server_rounds if mode == "federated" else 1
 
 
 def controls_enabled(settings) -> bool:

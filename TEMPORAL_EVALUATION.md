@@ -138,7 +138,8 @@ réplicas independientes.
 **Todos los folds son ajustes nuevos.** No hay una opción de continuidad entre
 folds ni un argumento `--protocol`. Cada fold reinicia pesos, adaptadores e
 historia FLoRA; en Granite se parte del mismo backbone preentrenado fijado, con
-adaptación nueva. Los optimizadores se reinician por etapa/ronda.
+adaptación nueva. Local y centralizado mantienen un optimizador durante su único
+ajuste por modelo y fold; en federado se reinicia cada ronda.
 
 `train-history = expanding | sliding` controla **datos**, no pesos:
 
@@ -354,9 +355,10 @@ objetivo. El modo retrospectivo por estación no comparte un reloj global y no
 activa esta simulación. Los retrasos reales de transmisión/revisión no se
 inventan: el contrato actual supone disponibilidad de la hora completada.
 
-Esta política de bloques se aplica al entrenamiento federado. Los controles
-local y centralizado siguen usando todo su entrenamiento autorizado por etapa;
-no se ha cambiado su operativa ni los cortes entre folds.
+Esta política de bloques solo se aplica al entrenamiento federado. Local y
+centralizado tienen todo su entrenamiento autorizado disponible desde el inicio:
+un ajuste por modelo y fold, con hasta `local-epochs` épocas. Se compara el
+estado inicial con el ajustado mediante validación antes de acceder a test.
 
 ## MASE y RMSSE
 

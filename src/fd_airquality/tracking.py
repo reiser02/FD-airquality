@@ -33,6 +33,7 @@ from fd_airquality.neural import trained_quantiles
 from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import RunSettings
+from fd_airquality.training_control import training_stage_count
 
 MODEL_LABELS = {
     "mlp": "MLP", "autoencoder": "Autoencoder", "autoencoder-tiny": "Autoencoder Tiny",
@@ -198,6 +199,10 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         round_epoch_limit(manifest["geometry"], settings, 2)
         if progressive and settings.num_server_rounds > 1 else None
     )
+    stages = training_stage_count(settings, mode)
+    validation_schedule = "after_final_arrival" if progressive else "each_stage"
+    if mode != "federated":
+        validation_schedule = "before_and_after_fit" if stages else "reference_only"
     metadata = model_metadata(manifest["geometry"], settings)
     (output / "run.json").write_text(json.dumps({
         "mode": mode, "settings": asdict(settings),
@@ -233,19 +238,19 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                               "history": "new-only" if progressive else None,
                               "training_targets": "current_block_only" if progressive else "full_fold_training",
                               "block_schedule": "initial_prefix_then_calendar_increments" if progressive else None,
-                              "validation": "after_final_arrival" if progressive else "each_stage",
-                              "weight_continuity": "within_fold_rounds_only"},
+                               "validation": validation_schedule,
+                               "weight_continuity": "within_fold_rounds_only" if mode == "federated" else None},
         "metric_protocol": {"implementation": "masked_seasonal_errors_v2",
                              "reference": manifest["geometry"].get("error_scale_reference", "pre-evaluation"),
                              "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
         "training_budget": {
-            "stages": 0 if mode == "zero-shot" or settings.model in STATION_CONTROLS else settings.num_server_rounds,
+            "stages": stages,
             "epochs_per_stage": settings.local_epochs,
             "federated_update_epochs": update_epochs,
-            "optimizer_reset_each_stage": True,
+            "optimizer_reset_each_stage": mode == "federated",
         },
         "training_controls": {
-            "scope": "local_epochs_per_stage_or_round",
+            "scope": "local_epochs_per_stage_or_round" if mode == "federated" else ("single_fit" if stages else None),
             "monitor": "pooled_observed_mse_original_units",
             "early_stopping": settings.early_stopping,
             "patience": settings.early_stopping_patience,
@@ -315,10 +320,10 @@ class RunTracker:
         keys = ["seed", "device", "output_dir", "selection_metric", "probabilistic", "normalization"]
         if settings.normalization != "none":
             keys.append("scaler_type")
-        if self.mode != "zero-shot" and settings.model not in STATION_CONTROLS:
-            keys.extend(("num_server_rounds", "local_epochs", "batch_size", "pad_last_batch", "learning_rate", "weight_decay"))
+        if training_stage_count(settings, self.mode):
+            keys.extend(("local_epochs", "batch_size", "pad_last_batch", "learning_rate", "weight_decay"))
         if self.mode == "federated":
-            keys.append("strategy")
+            keys.extend(("num_server_rounds", "strategy"))
             if settings.strategy == "fedprox":
                 keys.append("proximal_mu")
         if adaptation in {"lora", "ffa-lora", "flora", "lora-fair"}:

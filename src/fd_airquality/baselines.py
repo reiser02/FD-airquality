@@ -17,7 +17,7 @@ from fd_airquality.arrival import audit_normalization, normalization_artifact, t
 from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.calibration import calibration_options, validation_view
 from fd_airquality.data import WindowDataset, load_client_data, read_manifest
-from fd_airquality.lightweight import HOLT_GRID, STATION_CONTROLS
+from fd_airquality.lightweight import HOLT_GRID
 from fd_airquality.models import (
     GRANITE,
     checkpoint_payload,
@@ -40,7 +40,7 @@ from fd_airquality.task import (
     validate_selection_coverage,
 )
 from fd_airquality.tracking import RunTracker, write_run
-from fd_airquality.training_control import controls_enabled
+from fd_airquality.training_control import controls_enabled, training_stage_count
 
 
 def _copy_state(model):
@@ -113,6 +113,7 @@ def _run_baseline(settings, mode, manifest, output):
     settings, manifest = prepare_runtime_panel(settings, output)
     validate_selection_coverage(manifest, settings, mode)
     settings = replace(settings, device=configure_torch(settings, settings.seed).type)
+    train = bool(training_stage_count(settings, mode))
     report_progress("loading-data", f"stations={len(manifest['clients'])} device={settings.device}")
     artifacts, datasets = [], []
     for partition in range(len(manifest["clients"])):
@@ -124,7 +125,7 @@ def _run_baseline(settings, mode, manifest, output):
         artifacts.append(artifact)
         data = {"validation": validation_view(artifact, geometry, settings),
                 "test": WindowDataset(artifact, "test", geometry["context"], geometry["horizon"])}
-        if mode != "zero-shot" and settings.model not in STATION_CONTROLS:
+        if train:
             data["train"] = training_view(artifact, geometry, settings)
             if not len(data["train"]):
                 raise ValueError(f"Sin ventanas de entrenamiento para {manifest['clients'][partition]['station']} tras el umbral.")
@@ -132,12 +133,12 @@ def _run_baseline(settings, mode, manifest, output):
     report_progress("loading-model", f"model={settings.model} device={settings.device}")
     write_run(output, settings, manifest, mode)
     with RunTracker(settings, output, mode, manifest) as tracker:
-        _fit(settings, mode, manifest, artifacts, datasets, output, tracker)
+        _fit(settings, mode, manifest, artifacts, datasets, output, tracker, train=train)
     print(f"Resultados {mode}: {output}", flush=True)
     return output
 
 
-def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
+def _fit(settings, mode, manifest, artifacts, datasets, output, tracker, *, train: bool):
     geometry = manifest["geometry"]
     count = len(datasets)
     independent = mode == "local"
@@ -151,9 +152,8 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
         report_progress("model-residency", "local_models=cpu active_gpu_models=1")
     recorder = Recorder(output, manifest, tracker)
     best_scores = [float("inf")] * len(models)
-    best_rounds = [-1] * len(models)
+    selected_steps = [-1] * len(models)
     selected_states = [None] * len(models)
-    stages = 0 if mode == "zero-shot" or settings.model in STATION_CONTROLS else settings.num_server_rounds
     if settings.model == "holt":
         for index, model in enumerate(models):
             with _model_on_device(model, device, offload=offload):
@@ -186,60 +186,67 @@ def _fit(settings, mode, manifest, artifacts, datasets, output, tracker):
                 ))
         return records
 
-    for stage in range(stages + 1):
-        report_progress("round", f"round={stage}/{stages} mode={mode}")
-        if stage:
-            if independent:
-                records = []
-                for partition, (model, data) in enumerate(zip(models, datasets, strict=True)):
-                    seed = settings.seed + 100_003 * stage + partition
-                    configure_torch(settings, seed)
-                    with (
-                        progress_context(station=manifest["clients"][partition]["station"],
-                                         partition=partition, round=stage),
-                        _model_on_device(model, device, offload=offload),
-                    ):
-                        records.append(train_local(
-                            model, data["train"], settings, device, seed,
-                            max_train_windows=geometry.get("max_train_windows"),
-                            **({"validation_data": data["validation"]} if controls_enabled(settings) else {}),
-                        ))
-                recorder.record(stage, "train", records)
-            else:
-                # ConcatDataset concatenates window samples, NEVER raw series or timestamps.
-                seed = settings.seed + 100_003 * stage
-                configure_torch(settings, seed)
-                metrics = train_local(models[0], ConcatDataset([data["train"] for data in datasets]),
-                                      settings, device, seed,
-                                      max_train_windows=geometry.get("max_train_windows"),
-                                      **({"validation_data": ConcatDataset([data["validation"] for data in datasets])}
-                                         if controls_enabled(settings) else {}))
-                recorder.rounds.append({"round": stage, "split": "train", **metrics})
-                tracker.log_metrics("train", metrics, stage)
+    def validate_checkpoint(step, label):
         validation = evaluate("validation")
-        pooled = recorder.record(stage, "validation", validation)
-        report_progress("validation", f"round={stage} {settings.selection_metric}={pooled.get(settings.selection_metric)}")
-        candidates = [selection_value(record, settings, local=True) for record in validation] if independent else [selection_value(pooled, settings)]
+        pooled = recorder.record(step, "validation", validation)
+        report_progress("validation", f"checkpoint={label} {settings.selection_metric}={pooled.get(settings.selection_metric)}")
+        candidates = ([selection_value(record, settings, local=True) for record in validation]
+                      if independent else [selection_value(pooled, settings)])
         for index, candidate in enumerate(candidates):
             if candidate < best_scores[index]:
-                best_scores[index], best_rounds[index] = candidate, stage
+                best_scores[index], selected_steps[index] = candidate, step
                 selected_states[index] = _copy_state(models[index])
-                report_progress("checkpoint", f"model_index={index} selected_round={stage} score={candidate:.6g}")
+                report_progress("checkpoint", f"model_index={index} selected={label} score={candidate:.6g}")
+
+    # Keep the historical "round" fields as checkpoint indices: 0 initial, 1 fitted.
+    validate_checkpoint(0, "initial" if train else "reference")
+    fit_step = int(train)
+    if train:
+        report_progress("train", f"single-fit mode={mode} max_epochs={settings.local_epochs}")
+        fit_seed = settings.seed + 100_003
+        monitor = controls_enabled(settings)
+        if independent:
+            records = []
+            for partition, (model, data) in enumerate(zip(models, datasets, strict=True)):
+                seed = fit_seed + partition
+                configure_torch(settings, seed)
+                with (
+                    progress_context(station=manifest["clients"][partition]["station"], partition=partition),
+                    _model_on_device(model, device, offload=offload),
+                ):
+                    records.append(train_local(
+                        model, data["train"], settings, device, seed,
+                        max_train_windows=geometry.get("max_train_windows"),
+                        validation_data=data["validation"] if monitor else None,
+                    ))
+            recorder.record(fit_step, "train", records)
+        else:
+            # ConcatDataset concatenates window samples, NEVER raw series or timestamps.
+            configure_torch(settings, fit_seed)
+            metrics = train_local(
+                models[0], ConcatDataset([data["train"] for data in datasets]), settings, device, fit_seed,
+                max_train_windows=geometry.get("max_train_windows"),
+                validation_data=ConcatDataset([data["validation"] for data in datasets]) if monitor else None,
+            )
+            recorder.rounds.append({"round": fit_step, "split": "train", **metrics})
+            tracker.log_metrics("train", metrics, fit_step)
+        validate_checkpoint(fit_step, "fitted")
+
     for index, model in enumerate(models):
         last_filename = f"client_{index:03d}_last_model.pt" if independent else "last_model.pt"
-        torch.save(checkpoint_payload(geometry, settings, _copy_state(model), stages, state_role="training"), output / last_filename)
+        torch.save(checkpoint_payload(geometry, settings, _copy_state(model), fit_step, state_role="training"), output / last_filename)
         load_shared_state(model, selected_states[index])
         filename = f"client_{index:03d}_best_model.pt" if independent else "best_model.pt"
-        torch.save(checkpoint_payload(geometry, settings, selected_states[index], best_rounds[index]), output / filename)
+        torch.save(checkpoint_payload(geometry, settings, selected_states[index], selected_steps[index]), output / filename)
     # Test is accessed once, only after validation-only checkpoint selection finishes.
     tests = evaluate("test")
-    metrics = recorder.record(max(best_rounds), "test", tests, best_rounds if independent else None)
+    metrics = recorder.record(max(selected_steps), "test", tests, selected_steps if independent else None)
     report_progress("test", f"macro-mase={metrics.get('macro-mase', '-')} "
                     f"macro-rmsse={metrics.get('macro-rmsse', '-')}; test final único")
     if not independent:
-        tracker.log_metrics("selection", {"round": best_rounds[0], "validation_score": best_scores[0]}, best_rounds[0])
+        tracker.log_metrics("selection", {"round": selected_steps[0], "validation_score": best_scores[0]}, selected_steps[0])
     (output / "test_metrics.json").write_text(json.dumps({
-        "selected_round": None if independent else best_rounds[0],
+        "selected_round": None if independent else selected_steps[0],
         "selection_metric": f"{'station_' if independent else ''}validation_{settings.selection_metric}",
         "validation_score": None if independent else best_scores[0], "test": metrics,
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")

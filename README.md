@@ -371,17 +371,23 @@ uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
   apila actualizaciones y LoRA-FAIR refina la agregación.
 - **Zero-shot:** inferencia del checkpoint Granite sin adaptación con estos datos.
 
-Local y centralizado disponen de su entrenamiento autorizado en cada etapa.
+Por fold, el modo local ajusta una sola vez cada modelo y el centralizado ajusta
+una sola vez el modelo común. Ambos tienen acceso a todo su `train` autorizado
+desde el inicio y conservan AdamW durante hasta `local-epochs` épocas, con
+parada temprana. En los informes, `round=0` y `round=1` identifican el modelo
+antes y después del ajuste, no rondas de comunicación.
+
 En federado, la primera ronda ajusta con el histórico inicial (hasta **40
 épocas**). Las siguientes parten de los pesos globales agregados y ajustan solo
-el bloque que acaba de llegar (**10 días**, hasta **20 épocas**). Se sortean
-hasta **256 ventanas distintas por estación y época** en el backtest. Los
-targets fuera del bloque no se entrenan; las lecturas antiguas solo pueden
-servir de contexto. Si una estación no tiene ventanas nuevas, no actualiza.
-Esta separación es interna al fold: el siguiente fold reinicia el modelo.
-AdamW se reinicia por etapa/ronda.
-Igualar rondas **no iguala ejemplos utilizados, optimización ni tiempo**.
-Todos evalúan el test una vez por fold después de seleccionar exclusivamente con validación.
+el bloque que acaba de llegar (**10 días**, hasta **20 épocas**). Los targets
+fuera del bloque no se entrenan; las lecturas antiguas solo pueden servir de
+contexto. Si una estación no tiene ventanas nuevas, no actualiza. AdamW se
+reinicia cada ronda; `num-server-rounds` fija las rondas federadas, no repite
+los ajustes local ni centralizado. El siguiente fold reinicia el modelo.
+
+En el backtest se sortean hasta **256 ventanas distintas por estación y época**.
+Cada modo evalúa el test una vez por fold después de seleccionar exclusivamente
+con validación; los presupuestos de entrenamiento no son equivalentes.
 
 La configuración principal añade early stopping con paciencia y
 `ReduceLROnPlateau` en las épocas locales, con MSE observado en unidades cuadradas.

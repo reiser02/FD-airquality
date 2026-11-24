@@ -121,8 +121,12 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
         if field.name in {"manifest", "output_dir"}:
             continue
         value = getattr(defaults, field.name)
+        options = {}
+        if field.name == "num_server_rounds":
+            options["help"] = "Número de rondas federadas; no repite el ajuste local ni centralizado."
         for command in (simulation, baseline, backtest):
-            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value), default=value)
+            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value), default=value,
+                                 **options)
     return parser, commands.choices
 
 

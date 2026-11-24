@@ -100,9 +100,9 @@ test-hours = 96
 # backtest necesita un backtest_manifest.json, no el manifest.json de prepare.
 # manifest = "data/federated/<preparacion>/manifest.json"
 # output-dir = "reports/experimentos"
-# Rondas federadas o etapas de entrenamiento de los controles no federados por candidato y fold.
+# Número de rondas federadas por candidato y fold. No repite los ajustes local ni centralizado.
 num-server-rounds = 5
-# Máximo de épocas en el ajuste inicial de cada cliente o por etapa de un baseline entrenado.
+# Máximo de épocas en el ajuste inicial federado o en el ajuste único local/centralizado.
 local-epochs = 40
 # 1 permite parar por MSE de validación interna; 0 desactiva la parada.
 # Ni la parada ni el scheduler se aplican con local-epochs = 1.

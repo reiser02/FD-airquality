@@ -14,7 +14,7 @@ from fd_airquality.tracking import RunTracker, backtest_tags, run_labels, tracki
 def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepared, tmp_path, monkeypatch, failure, mlflow_uri):
     path, _ = prepared
     output_dir = tmp_path / "backtest_20261104_091836" / "fold_001" / "runs" / "case_0001"
-    settings = RunSettings(manifest=str(path), output_dir=str(output_dir), num_server_rounds=1,
+    settings = RunSettings(manifest=str(path), output_dir=str(output_dir), num_server_rounds=5,
                            mlflow_tracking_uri=mlflow_uri, mlflow_experiment="test-airquality")
     if failure:
         def fail(*_, **__):
@@ -39,7 +39,7 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
     assert run.data.tags["candidate"] == "MLP | centralizado | completo"
     assert run.info.run_name == "MLP | centralizado | completo | PM25 | 2026-11-04 09:18:36 UTC | fold 1"
     assert run.data.params["seed"] == "42"
-    assert not {"model", "model.name", "model.context", "adaptation", "strategy", "proximal_mu",
+    assert not {"model", "model.name", "model.context", "adaptation", "strategy", "proximal_mu", "num_server_rounds",
                 "mlflow_tracking_uri", "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level",
                 "data.validation_hours", "data.test_hours"} & run.data.params.keys()
     assert not any(key.startswith(("lora_", "fair_")) for key in run.data.params)
@@ -72,10 +72,11 @@ def test_tracking_does_not_publish_per_station_selection_or_unused_parameters(pr
     assert "model.revision" in data.params
     assert ("lora_rank" in data.params) == (mode == "local")
     assert "fair_iterations" not in data.params
+    assert "num_server_rounds" not in data.params
     assert not any(key.startswith("station_") for key in data.metrics)
     assert ("selection/round" in data.metrics) == (mode == "zero-shot")
     if mode == "zero-shot":
-        assert not {"learning_rate", "local_epochs", "num_server_rounds"} & data.params.keys()
+        assert not {"learning_rate", "local_epochs"} & data.params.keys()
     else:
         test = json.loads((output / "test_metrics.json").read_text())
         assert test["selected_round"] is test["validation_score"] is None
@@ -114,6 +115,7 @@ def test_cpu_run_metadata_never_initializes_cuda_or_cudnn(prepared, tmp_path, mo
     assert "gpus" not in hardware
     assert run["arrival_protocol"]["period_hours"] == 0
     assert run["arrival_protocol"]["training_targets"] == "full_fold_training"
+    assert run["arrival_protocol"]["validation"] == "before_and_after_fit"
 
 
 @pytest.mark.parametrize("directory,expected", [
