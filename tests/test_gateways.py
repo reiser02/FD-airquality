@@ -15,7 +15,7 @@ from fd_airquality.gateways import (
     gateway_partitions,
     write_gateway_topology,
 )
-from fd_airquality.settings import GATEWAY_MODE, RunSettings
+from fd_airquality.settings import GATEWAY_MODE, RUN_MODES, RunSettings
 
 
 def test_gateway_map_uses_the_configured_or_saved_cartagena_topology(tmp_path):
@@ -86,4 +86,34 @@ def test_gateway_backtest_keeps_the_topology_and_station_support(
         expected = {row["station"]: row["gateway_id"] for row in topology["stations"]}
         assert stations["station"].map(expected).eq(stations["gateway-id"]).all()
         assert stations.query("split == 'train'")["num-examples"].le(config.max_train_windows).all()
-        assert evaluation["macro-mase"] == pytest.approx(stations.query("split == 'test'")["mase"].mean())
+    assert evaluation["macro-mase"] == pytest.approx(stations.query("split == 'test'")["mase"].mean())
+
+
+def test_zero_shot_runs_in_all_modes_with_identical_support_and_no_training(
+    single_fold_manifest, in_process_federation, mock_granite, tmp_path, monkeypatch,
+):
+    monkeypatch.setattr("fd_airquality.gateways._station_locations", lambda: {
+        "station-a": (37.600, -.99), "station-b": (37.601, -.99), "offline": (37.620, -.95),
+    })
+    settings = RunSettings(
+        manifest=str(single_fold_manifest), output_dir=str(tmp_path / "results"),
+        mlflow_tracking_uri="disabled", gateway_num_clients=3, missing_policy="ffill",
+    )
+    output = run_backtest(settings, ["flowstate-r1"], RUN_MODES, adaptations=["zero-shot"])
+    comparison = pd.read_csv(output / "temporal_comparison.csv")
+    assert comparison["mode"].tolist() == list(RUN_MODES)
+    assert comparison["adaptation"].eq("zero-shot").all()
+    assert comparison["strategy"].eq("none").all()
+    assert comparison["num-targets"].nunique() == 1
+    assert comparison["macro-mase"].to_numpy() == pytest.approx([comparison["macro-mase"].iloc[0]] * 4)
+
+    cases = json.loads((output / "fold_001" / "candidates.json").read_text())
+    for case in cases:
+        run = Path(case["output"])
+        metadata = json.loads((run / "run.json").read_text())
+        assert metadata["model"]["trainable_parameters"] == metadata["training_budget"]["stages"] == 0
+        assert metadata["arrival_protocol"]["validation"] == "reference_only"
+        history = pd.read_csv(run / "round_metrics.csv")
+        assert list(zip(history["split"], history["round"], strict=True)) == [("validation", 0), ("test", 0)]
+    gateways = pd.read_csv(Path(cases[-1]["output"]) / "gateway_metrics.csv")
+    assert sorted(gateways.query("split == 'test'")["num-stations"]) == [0, 1, 1]

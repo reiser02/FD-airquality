@@ -9,13 +9,13 @@ import torch
 from torch.utils.data import Dataset
 
 from fd_airquality.lightweight import STATION_CONTROLS
-from fd_airquality.models import load_shared_state, shared_state
+from fd_airquality.models import is_zero_shot, load_shared_state, shared_state
 from fd_airquality.settings import FEDERATED_MODES
 
 
 def training_stage_count(settings, mode: str) -> int:
     """Count training fits, not validation checkpoints."""
-    if mode == "zero-shot" or settings.model in STATION_CONTROLS:
+    if is_zero_shot(settings) or settings.model in STATION_CONTROLS:
         return 0
     return settings.num_server_rounds if mode in FEDERATED_MODES else 1
 

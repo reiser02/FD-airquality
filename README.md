@@ -324,13 +324,14 @@ uv run fd-airquality prepare-backtest --context 90
 uv run fd-airquality backtest --num-server-rounds 5
 ```
 
-En cada fold, `backtest` ejecuta para **cada foundation**: zero-shot, cuatro algoritmos federados
-(LoRA, FFA-LoRA, FLoRA y LoRA-FAIR), y controles local/centralizado con LoRA y A
-congelada. Con TTM-R3 y FlowState-R1 por defecto son **18 configuraciones de foundations**,
-**21 controles entrenables** y **2 referencias locales** (SeasonalNaive y Holt):
-**41 ejecuciones por fold** con la semilla y el rango predeterminados. Zero-shot
-y las referencias se ejecutan una sola vez por fold aunque se indiquen varias
-semillas; los clásicos no se duplican por rango. Por defecto el backtest evalúa
+En cada fold, `backtest` evalúa cada modelo Granite en **zero-shot dentro de los
+cuatro modos**. Los dos modos federados añaden LoRA, FFA-LoRA, FLoRA y LoRA-FAIR;
+local y centralizado añaden LoRA y FFA-LoRA. Con TTM-R3 y FlowState-R1 por defecto
+son **32 configuraciones de Granite**, **28 controles entrenables** y **2
+referencias locales** (SeasonalNaive y Holt): **62 ejecuciones por fold**.
+Zero-shot se ejecuta una vez por modelo, modo y fold, aunque se indiquen varias
+semillas, rangos o estrategias; los clásicos no se duplican por rango.
+Por defecto el backtest evalúa
 todos los folds y publica su media, sin seleccionar una configuración.
 El flujo de desarrollo/holdout requiere
 `--stage development` explícito. FLoRA y LoRA-FAIR no tienen modalidades
@@ -374,16 +375,16 @@ pico de RAM y bytes de flash en el hardware objetivo.
 ### Modos secuenciales y candidatos paralelos por GPU
 
 En cada fold, la matriz respeta el orden de `--modes` / `[backtest].modes`; por defecto:
-**local → centralizado → federado → zero-shot**. Todos los casos de un modo deben
+**local → centralizado → federado por estación → federado por gateways**. Todos los casos de un modo deben
 terminar antes de comenzar el siguiente.
 
-- **Local, centralizado y zero-shot:** con `--device cuda`, se comprueba cada GPU
+- **Local y centralizado:** con `--device cuda`, se comprueba cada GPU
   visible y se ejecuta como máximo un candidato completo por GPU utilizable, en
   procesos independientes. Un candidato incluye modelo, adaptación, semilla y rango;
   no se reparten las estaciones de un mismo candidato local entre GPUs.
-- **Federado:** un candidato cada vez. Flower/Ray reparte sus clientes entre las
+- **Federado por estación o por gateway:** un candidato cada vez. Flower/Ray reparte sus clientes entre las
   GPUs utilizables, una GPU completa por cliente: dos GPUs permiten dos clientes
-  simultáneos, cuatro GPUs permiten cuatro, hasta el número de estaciones.
+  simultáneos, cuatro GPUs permiten cuatro, hasta el número de clientes.
   No se lanzan federaciones de modelos distintos simultáneamente.
 - **CPU o CUDA no utilizable:** los candidatos se ejecutan secuencialmente; el
   fallback y el dispositivo efectivo quedan registrados.
@@ -452,7 +453,8 @@ uv run fd-airquality prepare-backtest --folds 1
 uv run fd-airquality simulate --model autoencoder
 uv run fd-airquality baseline --model autoencoder --mode local
 uv run fd-airquality baseline --model autoencoder --mode centralized
-uv run fd-airquality baseline --model ttm-r3 --mode zero-shot
+uv run fd-airquality baseline --model ttm-r3 --mode local --adaptation zero-shot
+uv run fd-airquality simulate --model ttm-r3 --mode federated-gateways --adaptation zero-shot
 uv run fd-airquality simulate --model ttm-r3 --adaptation flora
 uv run fd-airquality simulate --model patchtst-fm-r2 --adaptation lora-fair
 uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
@@ -465,7 +467,14 @@ uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
   no concatena series raw a través de huecos o estaciones.
 - **Federado:** modelo compartido; LoRA promedia factores, FFA agrega B, FLoRA
   apila actualizaciones y LoRA-FAIR refina la agregación.
-- **Zero-shot:** inferencia del checkpoint Granite sin adaptación con estos datos.
+- **Federado por gateways:** las estaciones agrupadas por proximidad forman los
+  clientes de Flower.
+
+`--adaptations zero-shot` evalúa los checkpoints Granite sin adaptar sus pesos,
+una vez por cada modo elegido. En federado, Flower distribuye la evaluación entre
+los clientes correspondientes y no inicia rondas de entrenamiento.
+Para un backtest solo de referencias zero-shot, usa
+`backtest --models ttm-r3 flowstate-r1 --adaptations zero-shot`.
 
 Por fold, el modo local ajusta una sola vez cada modelo y el centralizado ajusta
 una sola vez el modelo común. Ambos tienen acceso a todo su `train` autorizado
@@ -506,7 +515,7 @@ pares insuficientes queda indefinida. El TOML raíz exige al menos 24 pares;
 `epsilon` aplica suelos ε y ε² sin inventar pares.
 Antes de entrenar, `simulate`, `baseline` y `backtest` descartan las estaciones
 cuya **métrica de selección de validación** no esté definida. La regla es común a
-local, centralizado, federado y zero-shot: no se deja una estación en unos candidatos
+los cuatro modos y sus adaptaciones: no se deja una estación en unos candidatos
 y fuera de otros. En `backtest` se fija un panel común a los folds de evaluación
 y se audita en `temporal_exclusions.csv`. Para una ejecución individual, los
 descartes aparecen en el log y en `excluded_stations.csv`. Se distingue
@@ -522,8 +531,8 @@ Las evaluaciones nuevas calculan MASE/RMSSE sobre los targets observados en
 unidades originales, sin calcular MAE/RMSE no escalados. En MLP/NLinear/NHITS se ordenan los cuantiles de cada lado
 sin mover la mediana; se registran los cruces antes y después del ajuste. Esto
 evita intervalos invertidos, **no los calibra**. `comparison.csv` compara candidatos
-agregados e incluye mejoras frente a un único zero-shot con revisión y configuración
-de inferencia compatibles.
+agregados e incluye mejoras frente a un único zero-shot del mismo modo con revisión
+y configuración de inferencia compatibles.
 `pairwise_comparison.csv` compara **todos contra todos**, en ambas direcciones,
 para macro-MASE, macro-RMSSE, CRPS y CRPS escalado cuando se dispone de cuantiles. Delta = A − B:
 negativo favorece A; mejora (%) = `100 × (1 − A/B)`: positiva favorece A y queda vacía si B=0.

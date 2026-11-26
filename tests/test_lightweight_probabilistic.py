@@ -83,12 +83,12 @@ def test_linear_lags_and_nlinear_point_have_small_point_heads_even_with_probabil
 def test_station_controls_are_not_duplicated_by_seed_or_federated_modes():
     settings = RunSettings()
     plan = _candidate_plan(settings, ["seasonal-naive", "holt", "linear-6lags", "nlinear-point"],
-                           ["local", "centralized", "federated", "zero-shot"], None, [5, 6], None, None)
+                            ["local", "centralized", "federated", "federated-gateways"], None, [5, 6], None, None)
     for name in ("seasonal-naive", "holt"):
         assert [(c["mode"], c["seed"]) for c in plan if c["model"] == name] == [("local", 5)]
         with pytest.raises(ValueError, match="solo en local"):
             validate_run_mode(replace(settings, model=name), "federated")
-    assert len(plan) == 14
+    assert len(plan) == 18
 
 
 def test_scaled_crps_preserves_standard_crps_and_equals_mase_for_degenerate_forecasts():

@@ -85,7 +85,8 @@ def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_another_pa
     original_hash = file_digest(path)
     local = run_baseline(settings, "local")
     central = run_baseline(foundation, "centralized")
-    zero = run_baseline(foundation, "zero-shot")
+    zero_shot = replace(foundation, adaptation="zero-shot")
+    zero = run_baseline(zero_shot, "centralized")
     for run in (local, central, zero):
         test = json.loads((run / "test_metrics.json").read_text())["test"]
         assert test["num-clients"] == test["macro-mase-stations"] == 1
@@ -96,11 +97,12 @@ def test_filtered_baselines_share_a_panel_and_cannot_be_compared_with_another_pa
 
     output = compare_runs([local, central, zero], tmp_path / "comparison")
     comparison = pd.read_csv(output / "comparison.csv")
-    assert set(comparison["mode"]) == {"centralized", "local", "zero-shot"}
+    assert set(comparison["mode"]) == {"centralized", "local"}
+    assert comparison.loc[comparison["adaptation"] == "zero-shot", "mode"].item() == "centralized"
     assert comparison["num-clients"].eq(1).all()
-    assert comparison.loc[comparison["mode"] == "centralized",
-                          "macro_mase_improvement_vs_zero_shot_pct"].notna().item()
-    other = run_baseline(replace(foundation, manifest=str(prepared[0])), "zero-shot")
+    assert comparison.loc[comparison["adaptation"] == "lora",
+                           "macro_mase_improvement_vs_zero_shot_pct"].notna().item()
+    other = run_baseline(replace(zero_shot, manifest=str(prepared[0])), "centralized")
     with pytest.raises(ValueError, match="manifests/paneles"):
         compare_runs([central, other], tmp_path / "invalid")
 

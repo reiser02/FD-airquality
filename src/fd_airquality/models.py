@@ -26,7 +26,7 @@ from fd_airquality.lightweight import (
     LagLinear,
     SeasonalNaive,
 )
-from fd_airquality.settings import FEDERATED_MODES, RunSettings
+from fd_airquality.settings import FEDERATED_MODES, RUN_MODES, ZERO_SHOT, RunSettings
 
 # Immutable Hugging Face revisions; never silently substitute R2 for TTM-R3.
 GRANITE = {
@@ -178,21 +178,26 @@ def effective_adaptation(settings: RunSettings) -> str:
     return ("lora" if settings.model in GRANITE else "full") if settings.adaptation == "auto" else settings.adaptation
 
 
+def is_zero_shot(settings: RunSettings) -> bool:
+    # "none" is also accepted for Granite checkpoints produced before zero-shot
+    # was selectable as an adaptation.
+    return settings.model in GRANITE and settings.adaptation in {"none", ZERO_SHOT}
+
+
 def validate_run_mode(settings: RunSettings, mode: str) -> None:
+    if mode not in RUN_MODES:
+        raise ValueError(f"Modo de ejecución desconocido: {mode}.")
     if settings.model in STATION_CONTROLS:
         if mode != "local" or settings.adaptation not in {"auto", "none"}:
             raise ValueError(f"{settings.model} se evalúa solo en local, sin adaptación federada.")
         return
     algorithm = effective_adaptation(settings)
     if settings.model not in GRANITE:
-        if algorithm != "full" or mode == "zero-shot":
+        if algorithm != "full":
             raise ValueError("Los modelos clásicos se entrenan completos; no admiten LoRA ni zero-shot.")
         return
-    if mode == "zero-shot":
-        if algorithm != "none":
-            raise ValueError("zero-shot exige adaptation=none.")
-    elif algorithm == "none":
-        raise ValueError("adaptation=none está reservado a zero-shot.")
+    if algorithm == "none":
+        raise ValueError("Usa adaptation=zero-shot para evaluar Granite sin entrenamiento.")
     if algorithm in {"flora", "lora-fair"} and (mode not in FEDERATED_MODES or settings.strategy != "fedavg"):
         raise ValueError("FLoRA/LoRA-FAIR especifican su agregación y solo se ejecutan en federación, sin FedProx.")
 
@@ -237,7 +242,7 @@ class GraniteForecaster(nn.Module):
         self.layer_paths = []
         self.layers = {}
         self.history = {}
-        if self.algorithm != "none":
+        if not is_zero_shot(settings):
             for i, (path, linear) in enumerate(target_linears(template, self.name, settings.lora_targets).items()):
                 factor = LoRAFactors(linear.in_features, linear.out_features, rank=settings.lora_rank,
                                      alpha=settings.lora_alpha, dropout=settings.lora_dropout,
@@ -462,7 +467,7 @@ def model_metadata(geometry: dict, settings: RunSettings) -> dict:
             config = _template(settings).config
             levels = getattr(config, "quantiles" if settings.model == "flowstate-r1" else "quantile_levels", None)
             metadata["quantiles"] = list(levels) if levels is not None else []
-        if effective_adaptation(settings) != "none":
+        if not is_zero_shot(settings):
             targets = target_linears(_template(settings), settings.model, settings.lora_targets)
             if any(settings.lora_rank > min(layer.in_features, layer.out_features) for layer in targets.values()):
                 raise ValueError("El rango LoRA excede las dimensiones de una capa target; no se recorta.")

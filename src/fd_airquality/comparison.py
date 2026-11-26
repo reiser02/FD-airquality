@@ -14,7 +14,7 @@ from fd_airquality.artifacts import file_digest
 from fd_airquality.gateways import TOPOLOGY_FILENAME, gateway_partitions, read_gateway_topology
 from fd_airquality.leaderboard import WEEKLY_COLUMNS, WEEKLY_IDENTITY, station_weekly_scores
 from fd_airquality.missing import resolve_missing_policy
-from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, ZERO_SHOT
 from fd_airquality.temporal_results import OPERATIONAL_SETTINGS, candidate_identity
 
 _MACRO_ERRORS = ("macro-mase", "macro-rmsse")
@@ -104,8 +104,10 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         mode = run.get("mode", "federated")
         model = run["settings"].get("model", "mlp")
         adaptation = run.get("model", {}).get("adaptation", "full")
-        strategy = run["settings"]["strategy"] if mode in FEDERATED_MODES else "none"
-        method = strategy if mode == "federated" else f"{mode}/{strategy}" if mode == GATEWAY_MODE else mode
+        strategy = run["settings"]["strategy"] if mode in FEDERATED_MODES and adaptation != ZERO_SHOT else "none"
+        method = mode
+        if strategy != "none":
+            method = f"{mode}/{strategy}" if mode == GATEWAY_MODE else strategy
         label = f"{model}/{adaptation}/{method}/{path.name}"
         metrics = result["test"]
         protocol = run.get("probabilistic_protocol", {})
@@ -149,7 +151,8 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         blocks.append({"run": label} | {key: value for key, value in metrics.items() if key.startswith("block-")})
         rows.append({
             "run": label, "model": model, "mode": mode, "adaptation": adaptation,
-            "seed": run["settings"].get("seed"), "lora_rank": run["settings"].get("lora_rank"),
+             "seed": run["settings"].get("seed"),
+             "lora_rank": run["settings"].get("lora_rank") if adaptation != ZERO_SHOT else None,
             "flowstate_scale_factor": run["settings"].get("flowstate_scale_factor") if model == "flowstate-r1" else None,
             "revision": run.get("model", {}).get("revision"),
             "selection_metric": result.get("selection_metric"),
@@ -180,9 +183,13 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         warnings.append("CRPS: las rejillas de cuantiles se conservan por modelo; "
                         "las comparaciones incluyen el efecto de la discretización.")
     for row, run in zip(rows, runs, strict=True):
-        references = [ref for ref, reference_run in zip(rows, runs, strict=True)
-                       if ref["model"] == row["model"] and ref["mode"] == "zero-shot"
-                       and _same_inference(run, reference_run)]
+        candidates = [(ref, reference_run) for ref, reference_run in zip(rows, runs, strict=True)
+                      if ref["model"] == row["model"]
+                      and (ref["adaptation"] == ZERO_SHOT and ref["mode"] == row["mode"]
+                           and ref["gateway_topology_sha256"] == row["gateway_topology_sha256"]
+                           or ref["mode"] == ZERO_SHOT)]
+        references = [ref for ref, reference_run in candidates if _same_inference(run, reference_run)]
+        references = [ref for ref in references if ref["mode"] == row["mode"]] or references
         if len(references) == 1:
             for metric in _MACRO_ERRORS:
                 denominator = references[0].get(metric)
@@ -191,7 +198,7 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
                 )
         elif len(references) > 1:
             warnings.append(f"Varias referencias zero-shot para {row['model']}; no se elige una silenciosamente.")
-        elif any(ref["model"] == row["model"] and ref["mode"] == "zero-shot" for ref in rows):
+        elif candidates:
             warnings.append(f"Sin zero-shot con la misma configuración de inferencia para {row['run']}; "
                             "se conserva en todas las comparaciones por pares.")
     output = output.expanduser().resolve()

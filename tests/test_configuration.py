@@ -81,7 +81,7 @@ def test_default_matrix_includes_the_tiny_model_and_requires_opt_in_for_patchtst
 
 
 @pytest.mark.parametrize("filename,modes,seeds,folds", [
-    ("fd-airquality.toml", ["local", "centralized", "federated", "zero-shot"], [42], 4),
+    ("fd-airquality.toml", ["local", "centralized", "federated", "federated-gateways"], [42], 4),
     ("experiments/smoke.toml", ["local", "centralized", "federated"], [42], 2),
 ])
 def test_shipped_backtest_configs_keep_modes_seeds_and_fold_counts(filename, modes, seeds, folds):
@@ -89,7 +89,7 @@ def test_shipped_backtest_configs_keep_modes_seeds_and_fold_counts(filename, mod
     evaluation = arguments(["backtest", "--config", str(config)])
     assert evaluation.modes == modes
     assert evaluation.seeds == seeds
-    assert evaluation.adaptations == ["lora", "ffa-lora", "flora", "lora-fair"]
+    assert evaluation.adaptations == ["lora", "ffa-lora", "flora", "lora-fair", "zero-shot"]
     preparation = arguments(["prepare-backtest", "--config", str(config)])
     assert preparation.folds == folds
     assert preparation.min_stations == 15
@@ -308,11 +308,11 @@ def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_pat
     (tmp_path / "fd-airquality.toml").write_text(
         '[run]\nheartbeat-seconds = 15\nlog-level = "DEBUG"\n'
         '[backtest]\nmax-parallel-models = 2\n'
-        'modes = ["centralized", "local", "zero-shot", "federated"]\n'
+        'modes = ["centralized", "local", "federated-gateways", "federated"]\n'
         'lora-ranks = [4, 8]\nstrategies = ["fedprox", "fedavg"]\n'
     )
     args = arguments(["backtest", "--max-parallel-models", "1", "--heartbeat-seconds", "30"])
     assert (args.max_parallel_models, args.heartbeat_seconds, args.log_level) == (1, 30.0, "DEBUG")
-    assert args.modes == ["centralized", "local", "zero-shot", "federated"]
+    assert args.modes == ["centralized", "local", "federated-gateways", "federated"]
     assert args.lora_ranks == [4, 8]
     assert args.strategies == ["fedprox", "fedavg"]

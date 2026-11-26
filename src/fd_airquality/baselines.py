@@ -17,9 +17,8 @@ from fd_airquality.arrival import audit_normalization, normalization_artifact, t
 from fd_airquality.artifacts import source_fingerprints
 from fd_airquality.calibration import calibration_options, validation_view
 from fd_airquality.data import WindowDataset, load_client_data, read_manifest
-from fd_airquality.lightweight import HOLT_GRID
+from fd_airquality.lightweight import HOLT_GRID, STATION_CONTROLS
 from fd_airquality.models import (
-    GRANITE,
     checkpoint_payload,
     effective_adaptation,
     load_shared_state,
@@ -30,7 +29,7 @@ from fd_airquality.models import (
 )
 from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.run_logging import RunLogging, progress_context, report_progress, run_label
-from fd_airquality.settings import RunSettings
+from fd_airquality.settings import BASELINE_MODES, RunSettings
 from fd_airquality.strategy import aggregate_evaluation, aggregate_training, coverage_metrics
 from fd_airquality.task import (
     configure_torch,
@@ -86,12 +85,8 @@ class Recorder:
 
 
 def run_baseline(settings: RunSettings, mode: str) -> Path:
-    if mode not in {"local", "centralized", "zero-shot"}:
-        raise ValueError("El baseline debe ser local, centralized o zero-shot.")
-    if mode == "zero-shot" and settings.model not in GRANITE:
-        raise ValueError("zero-shot está reservado a los checkpoints Granite preentrenados.")
-    if mode == "zero-shot":
-        settings = replace(settings, adaptation="none")
+    if mode not in BASELINE_MODES:
+        raise ValueError("El baseline debe ser local o centralized.")
     validate_run_mode(settings, mode)
     manifest = read_manifest(settings.manifest)
     geometry = manifest["geometry"]
@@ -141,7 +136,7 @@ def _run_baseline(settings, mode, manifest, output):
 def _fit(settings, mode, manifest, artifacts, datasets, output, tracker, *, train: bool):
     geometry = manifest["geometry"]
     count = len(datasets)
-    independent = mode == "local"
+    independent = mode == "local" and (train or settings.model in STATION_CONTROLS)
     offload = independent and settings.device == "cuda"
     models = []
     for index in range(count if independent else 1):

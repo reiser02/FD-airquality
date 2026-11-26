@@ -20,7 +20,7 @@ from fd_airquality.settings import RunSettings
 
 
 def candidate(model, mode):
-    return {"model": model, "mode": mode, "adaptation": "none" if mode == "zero-shot" else "auto",
+    return {"model": model, "mode": mode, "adaptation": "auto",
             "strategy": "fedavg", "seed": 42, "lora_rank": 4}
 
 
@@ -32,7 +32,7 @@ def result(root, index, device="cuda"):
 
 
 def test_matrix_groups_modes_in_requested_order():
-    modes = ["local", "centralized", "federated", "zero-shot"]
+    modes = ["local", "centralized", "federated", "federated-gateways"]
     matrix = build_candidate_matrix(["mlp", "ttm-r3"], modes, ["lora", "ffa-lora"])
     assert list(dict.fromkeys(case["mode"] for case in matrix)) == modes
     assert [modes.index(case["mode"]) for case in matrix] == sorted(modes.index(case["mode"]) for case in matrix)
@@ -40,7 +40,7 @@ def test_matrix_groups_modes_in_requested_order():
 
 def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path, monkeypatch):
     monkeypatch.setattr("fd_airquality.execution.usable_gpu_slots", lambda _: ["3", "7"])
-    modes = ["local", "centralized", "federated", "zero-shot"]
+    modes = ["local", "centralized", "federated", "federated-gateways"]
     plan = [candidate(model, mode) for mode in modes for model in ("mlp", "autoencoder")]
     active, seen, barrier = {}, [], threading.Barrier(2)
     lock = threading.Lock()
@@ -63,8 +63,8 @@ def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path
     def launch(settings, dry_run):
         assert not active
         launches.append((settings.device, dry_run))
-        seen.append(("federated", "Ray"))
-        return result(tmp_path, f"federated-{settings.model}")
+        seen.append((settings.federation_mode, "Ray"))
+        return result(tmp_path, f"{settings.federation_mode}-{settings.model}")
 
     monkeypatch.setattr("fd_airquality.execution._candidate_process", parallel)
     with RunLogging(tmp_path, "test", stream=StringIO()) as log:
@@ -73,11 +73,11 @@ def test_parallel_candidates_have_exclusive_gpu_slots_and_mode_barriers(tmp_path
                              launch=launch, progress_log=log)
     assert len(paths) == 8
     assert [mode for mode, _ in seen] == [mode for mode in modes for _ in range(2)]
-    assert launches == [("cuda", False)] * 2
+    assert launches == [("cuda", False)] * 4
     assert os.environ.get("CUDA_VISIBLE_DEVICES") == original_visible
     rows = json.loads((tmp_path / "candidates.json").read_text())
     assert all(row["status"] == "completed" for row in rows)
-    assert {row["gpu"] for row in rows if row["mode"] != "federated"} == {"3", "7"}
+    assert {row["gpu"] for row in rows if row["mode"] in {"local", "centralized"}} == {"3", "7"}
 
 
 def test_concurrency_cap_limits_non_federated_candidates(tmp_path, monkeypatch):

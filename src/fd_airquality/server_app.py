@@ -23,6 +23,7 @@ from fd_airquality.settings import GATEWAY_MODE, RunSettings
 from fd_airquality.strategy import AuditedStrategy
 from fd_airquality.task import configure_torch, validate_selection_coverage
 from fd_airquality.tracking import RunTracker, write_run
+from fd_airquality.training_control import training_stage_count
 
 
 def run_server(grid: Grid, settings: RunSettings) -> Path:
@@ -71,12 +72,13 @@ def _fit(grid: Grid, settings: RunSettings, manifest: dict, strategy: AuditedStr
     validation_config = ConfigRecord({"split": "validation"})
     initial_messages = strategy.configure_evaluate(0, arrays, validation_config, grid)
     strategy.aggregate_evaluate(0, grid.send_and_receive(initial_messages, timeout=3600))
-    strategy.start(
-        grid=grid, initial_arrays=arrays,
-        num_rounds=settings.num_server_rounds,
-        train_config=ConfigRecord(),
-        evaluate_config=ConfigRecord({"split": "validation"}),
-    )
+    if rounds := training_stage_count(settings, settings.federation_mode):
+        strategy.start(
+            grid=grid, initial_arrays=arrays,
+            num_rounds=rounds,
+            train_config=ConfigRecord(),
+            evaluate_config=ConfigRecord({"split": "validation"}),
+        )
     return strategy.evaluate_test(grid)
 
 

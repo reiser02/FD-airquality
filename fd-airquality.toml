@@ -163,7 +163,7 @@ mlflow-experiment = "fd-airquality"
 # 1 registra los checkpoints .pt como artefactos de MLflow; 0 no los registra.
 mlflow-log-models = 1
 # Adaptación predeterminada: auto entrena completo los modelos clásicos y aplica LoRA a Granite.
-# Para Granite: "lora", "ffa-lora", "flora" y "lora-fair"; "none" solo en zero-shot.
+# Para Granite: "lora", "ffa-lora", "flora", "lora-fair" y "zero-shot" (sin entrenamiento).
 # "flora" y "lora-fair" requieren modo federado con FedAvg. La matriz usa [backtest].adaptations.
 adaptation = "auto"
 # Rango (dimensión interna) de los adaptadores LoRA; un rango mayor añade parámetros entrenables.
@@ -273,8 +273,7 @@ print-command = false
 # manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # Directorio base de resultados para ejecuciones sin Flower.
 output-dir = "reports/non_federated"
-# Método de control: local entrena por estación; centralized junta entrenamiento;
-# zero-shot evalúa Granite sin adaptación ni entrenamiento.
+# Método de control: local entrena por estación; centralized junta entrenamiento.
 mode = "local"
 
 [backtest]
@@ -294,13 +293,13 @@ stage = "evaluation"
 # Controles clásicos y Granite. PatchTST-FM-R2 queda fuera salvo selección explícita.
 models = ["mlp", "autoencoder", "autoencoder-tiny", "nlinear", "nlinear-point", "nhits",
           "linear-6lags", "seasonal-naive", "holt", "ttm-r3", "flowstate-r1"]
-# Añade "federated-gateways" para incluir la federación por gateways geográficos.
-# Zero-shot solo se genera para los modelos Granite.
-modes = ["local", "centralized", "federated", "zero-shot"]
+# Dos modos no federados y dos federados (por estación o por gateway geográfico).
+modes = ["local", "centralized", "federated", "federated-gateways"]
 # Adaptaciones Granite: en federado compara LoRA, FFA-LoRA (A congelada), FLoRA
 # (acumulación por apilado) y LoRA-FAIR (refinamiento en servidor); local/centralizado
-# usan LoRA y FFA-LoRA como controles. Los modelos clásicos se entrenan completos.
-adaptations = ["lora", "ffa-lora", "flora", "lora-fair"]
+# usan LoRA y FFA-LoRA como controles. Zero-shot evalúa Granite en cada modo.
+# Los modelos clásicos entrenables se entrenan completos.
+adaptations = ["lora", "ffa-lora", "flora", "lora-fair", "zero-shot"]
 # Semillas a comparar; si se omite, se usa [run].seed. Zero-shot, Holt y SeasonalNaive no se duplican.
 seeds = [42]
 # Rangos LoRA a comparar en Granite; si se omite, se usa [run].lora-rank.

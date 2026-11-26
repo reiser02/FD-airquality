@@ -33,7 +33,7 @@ from fd_airquality.models import GRANITE, model_metadata
 from fd_airquality.neural import trained_quantiles
 from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.run_logging import flush_run_logs
-from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, ZERO_SHOT, RunSettings
 from fd_airquality.training_control import controls_enabled, training_stage_count
 
 MODEL_LABELS = {
@@ -44,9 +44,9 @@ MODEL_LABELS = {
     "ttm-r3": "TTM-R3", "patchtst-fm-r2": "PatchTST-FM-R2", "flowstate-r1": "FlowState-R1",
 }
 MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "federado",
-               GATEWAY_MODE: "federado por gateways", "zero-shot": "zero-shot"}
+               GATEWAY_MODE: "federado por gateways"}
 ADAPTATION_LABELS = {
-    "full": "completo", "none": "sin adaptación", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
+    "full": "completo", "none": "sin adaptación", ZERO_SHOT: "zero-shot", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
     "flora": "FLoRA", "lora-fair": "LoRA-FAIR",
 }
 
@@ -101,7 +101,7 @@ def run_labels(settings: RunSettings, mode: str, pollutant: str, adaptation: str
     """Use the effective method in the display name; seed and rank stay in params."""
     parts = [MODEL_LABELS.get(settings.model, settings.model), MODE_LABELS.get(mode, mode),
              ADAPTATION_LABELS.get(adaptation, adaptation)]
-    if mode in FEDERATED_MODES:
+    if mode in FEDERATED_MODES and adaptation != ZERO_SHOT:
         parts.append("FedProx" if settings.strategy == "fedprox" else "FedAvg")
     candidate = " | ".join(parts)
     tags = backtest_tags(settings.output_dir, pollutant)
@@ -196,14 +196,14 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         hardware["gpus"] = [{"name": torch.cuda.get_device_properties(index).name,
                              "total_memory": torch.cuda.get_device_properties(index).total_memory}
                             for index in range(torch.cuda.device_count())]
-    federated = mode in FEDERATED_MODES
+    stages = training_stage_count(settings, mode)
+    federated = mode in FEDERATED_MODES and bool(stages)
     progressive = bool(federated and settings.arrival_period_hours
                        and manifest["geometry"].get("split_mode") == "global")
     update_epochs = (
         round_epoch_limit(manifest["geometry"], settings, 2)
         if progressive and settings.num_server_rounds > 1 else None
     )
-    stages = training_stage_count(settings, mode)
     validation_schedule = "after_final_arrival" if progressive else "each_stage"
     if not federated:
         validation_schedule = "before_and_after_fit" if stages else "reference_only"
@@ -242,7 +242,8 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         "probabilistic_protocol": uncertainty_protocol(settings, metadata),
         "arrival_protocol": {"period_hours": settings.arrival_period_hours if progressive else 0,
                               "history": "new-only" if progressive else None,
-                              "training_targets": "current_block_only" if progressive else "full_fold_training",
+                              "training_targets": ("current_block_only" if progressive else
+                                                   "full_fold_training" if stages else None),
                               "block_schedule": "initial_prefix_then_calendar_increments" if progressive else None,
                                "validation": validation_schedule,
                                 "weight_continuity": "within_fold_rounds_only" if federated else None},
@@ -251,7 +252,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                              "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
         "training_budget": {
             "stages": stages,
-            "epochs_per_stage": settings.local_epochs,
+            "epochs_per_stage": settings.local_epochs if stages else 0,
             "federated_update_epochs": update_epochs,
             "optimizer_reset_each_stage": federated,
         },
@@ -327,9 +328,11 @@ class RunTracker:
         keys = ["seed", "device", "output_dir", "selection_metric", "probabilistic", "normalization"]
         if settings.normalization != "none":
             keys.append("scaler_type")
-        if training_stage_count(settings, self.mode):
+        stages = training_stage_count(settings, self.mode)
+        federated_training = self.mode in FEDERATED_MODES and bool(stages)
+        if stages:
             keys.extend(("local_epochs", "batch_size", "pad_last_batch", "learning_rate", "weight_decay"))
-        if self.mode in FEDERATED_MODES:
+        if federated_training:
             keys.extend(("num_server_rounds", "strategy"))
             if settings.strategy == "fedprox":
                 keys.append("proximal_mu")
@@ -349,7 +352,7 @@ class RunTracker:
                            "num_stations": len(self.manifest["clients"]),
                            "gateway_seed": settings.gateway_seed,
                            "gateway_topology_sha256": file_digest(self.output / TOPOLOGY_FILENAME)})
-        if self.mode in FEDERATED_MODES and geometry.get("split_mode") == "global":
+        if federated_training and geometry.get("split_mode") == "global":
             params["arrival_period_hours"] = settings.arrival_period_hours
             if settings.arrival_period_hours and controls_enabled(settings):
                 params["round_validation_fallback_epochs"] = settings.round_validation_fallback_epochs

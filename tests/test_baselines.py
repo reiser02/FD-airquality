@@ -103,19 +103,21 @@ def test_centralized_fits_full_fold_once_and_restores_validation_winner(
     torch.testing.assert_close(last["model_state_dict"]["weight"], torch.ones_like(model.weight))
 
 
-def test_zero_shot_never_trains(prepared, tmp_path, monkeypatch, mock_granite):
+@pytest.mark.parametrize("mode", ["local", "centralized"])
+def test_zero_shot_never_trains(prepared, tmp_path, monkeypatch, mock_granite, mode):
     path, _ = prepared
     monkeypatch.setattr("fd_airquality.baselines.train_local",
                         lambda *args, **kwargs: pytest.fail("zero-shot entrenó"))
     output = run_baseline(RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "runs"), model="flowstate-r1",
-        mlflow_tracking_uri="disabled",
-    ), "zero-shot")
+        adaptation="zero-shot", mlflow_tracking_uri="disabled",
+    ), mode)
     history = pd.read_csv(output / "round_metrics.csv")
     assert list(history["split"]) == ["validation", "test"]
     metadata = json.loads((output / "run.json").read_text())
     assert metadata["training_budget"]["stages"] == 0
-    assert metadata["model"]["adaptation"] == "none"
+    assert metadata["mode"] == mode
+    assert metadata["model"]["adaptation"] == "zero-shot"
 
 
 def test_baseline_is_reproducible(prepared, tmp_path):

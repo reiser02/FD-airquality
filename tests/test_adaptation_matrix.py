@@ -1,28 +1,35 @@
 import pytest
 
-from fd_airquality.backtesting import build_candidate_matrix
+from fd_airquality.backtesting import _candidate_plan, build_candidate_matrix
 from fd_airquality.models import GRANITE, validate_run_mode
-from fd_airquality.settings import RunSettings
+from fd_airquality.settings import FEDERATED_MODES, GRANITE_ADAPTATIONS, RUN_MODES, RunSettings
 
 
-def test_full_foundation_matrix_has_12_federated_and_meaningful_controls():
-    matrix = build_candidate_matrix(list(GRANITE), ["federated", "local", "centralized", "zero-shot"],
-                                    ["lora", "ffa-lora", "flora", "lora-fair"])
-    assert len(matrix) == 27
+def test_full_foundation_matrix_includes_zero_shot_in_each_mode():
+    matrix = build_candidate_matrix(list(GRANITE), RUN_MODES, GRANITE_ADAPTATIONS)
+    assert len(matrix) == 48
     for model in GRANITE:
         rows = [row for row in matrix if row["model"] == model]
-        assert {row["adaptation"] for row in rows if row["mode"] == "federated"} == {"lora", "ffa-lora", "flora", "lora-fair"}
-        assert [row["adaptation"] for row in rows if row["mode"] == "zero-shot"] == ["none"]
+        for mode in FEDERATED_MODES:
+            assert {row["adaptation"] for row in rows if row["mode"] == mode} == set(GRANITE_ADAPTATIONS)
         for mode in ("local", "centralized"):
-            assert {row["adaptation"] for row in rows if row["mode"] == mode} == {"lora", "ffa-lora"}
+            assert {row["adaptation"] for row in rows if row["mode"] == mode} == {"lora", "ffa-lora", "zero-shot"}
     assert len({tuple(sorted(row.items())) for row in matrix}) == len(matrix)
 
 
 def test_classic_models_are_not_assigned_lora_or_zero_shot():
     matrix = build_candidate_matrix(["mlp", "autoencoder", "autoencoder-tiny", "nlinear"],
-                                    ["federated", "local", "centralized", "zero-shot"], ["lora", "ffa-lora", "flora", "lora-fair"])
-    assert len(matrix) == 12
-    assert all(row["adaptation"] == "auto" and row["mode"] != "zero-shot" for row in matrix)
+                                    RUN_MODES, GRANITE_ADAPTATIONS)
+    assert len(matrix) == 16
+    assert all(row["adaptation"] == "auto" for row in matrix)
+
+
+def test_zero_shot_only_does_not_add_lora_or_repeat_over_training_hyperparameters():
+    plan = _candidate_plan(RunSettings(), ["ttm-r3"], RUN_MODES, ["zero-shot"],
+                           [42, 43], [4, 8], ["fedavg", "fedprox"])
+    assert [(case["mode"], case["adaptation"]) for case in plan] == [
+        (mode, "zero-shot") for mode in RUN_MODES
+    ]
 
 
 @pytest.mark.parametrize("adaptation,mode,strategy", [

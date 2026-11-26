@@ -39,7 +39,14 @@ from fd_airquality.panels import EXCLUSION_COLUMNS, prepare_runtime_panel, selec
 from fd_airquality.preprocessing import QUALITY_EXCLUSION_COLUMNS, TFG_SOURCE, quality_policy
 from fd_airquality.quality import evaluation_identity
 from fd_airquality.run_logging import RunLogging, report_progress
-from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings
+from fd_airquality.settings import (
+    FEDERATED_MODES,
+    GATEWAY_MODE,
+    GRANITE_ADAPTATIONS,
+    RUN_MODES,
+    ZERO_SHOT,
+    RunSettings,
+)
 from fd_airquality.temporal_results import (
     select_configuration,
     summarize_cv,
@@ -386,12 +393,15 @@ def build_candidate_matrix(models: list[str], modes: list[str], adaptations: lis
     for values in (models, modes, adaptations, strategies):
         if not values or len(set(values)) != len(values):
             raise ValueError("La matriz no admite listas vacías ni valores repetidos.")
-    if (set(models) - set(MODEL_NAMES) or set(modes) - {*FEDERATED_MODES, "local", "centralized", "zero-shot"}
-            or set(adaptations) - {"lora", "ffa-lora", "flora", "lora-fair"}
+    if (set(models) - set(MODEL_NAMES) or set(modes) - set(RUN_MODES)
+            or set(adaptations) - set(GRANITE_ADAPTATIONS)
             or set(strategies) - {"fedavg", "fedprox"}):
         raise ValueError("Combinación desconocida en la matriz.")
     matrix = []
-    controls = (["lora"] if set(adaptations) - {"ffa-lora"} else []) + (["ffa-lora"] if "ffa-lora" in adaptations else [])
+    controls = []
+    if set(adaptations) & {"lora", "flora", "lora-fair"}:
+        controls.append("lora")
+    controls.extend(method for method in ("ffa-lora", ZERO_SHOT) if method in adaptations)
     for mode in modes:
         for model in models:
             if model in STATION_CONTROLS:
@@ -399,31 +409,28 @@ def build_candidate_matrix(models: list[str], modes: list[str], adaptations: lis
                     matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
                 continue
             foundation = model in GRANITE
-            if mode == "zero-shot":
-                if foundation:
-                    matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
-                continue
             algorithms = adaptations if foundation and mode in FEDERATED_MODES else controls if foundation else ["auto"]
             for algorithm in algorithms:
                 if algorithm in {"flora", "lora-fair"} and "fedavg" not in strategies:
                     raise ValueError("FLoRA/LoRA-FAIR requieren su agregación sin FedProx; incluye fedavg en --strategies.")
-                choices = ["fedavg"] if mode not in FEDERATED_MODES or algorithm in {"flora", "lora-fair"} else strategies
+                choices = ["fedavg"] if mode not in FEDERATED_MODES or algorithm in {"flora", "lora-fair", ZERO_SHOT} else strategies
                 for strategy in choices:
                     matrix.append({"model": model, "mode": mode, "adaptation": algorithm, "strategy": strategy})
     return matrix
 
 
 def _candidate_plan(settings: RunSettings, models, modes, adaptations, seeds, lora_ranks, strategies) -> list[dict]:
-    matrix = build_candidate_matrix(models, modes, adaptations or ["lora", "ffa-lora", "flora", "lora-fair"],
+    matrix = build_candidate_matrix(models, modes, adaptations or GRANITE_ADAPTATIONS,
                                     strategies or [settings.strategy])
     seeds, ranks = seeds or [settings.seed], lora_ranks or [settings.lora_rank]
     if len(set(seeds)) != len(seeds) or len(set(ranks)) != len(ranks):
         raise ValueError("No repitas semillas ni rangos.")
     plan = []
     for case in matrix:
-        once = case["mode"] == "zero-shot" or case["model"] in STATION_CONTROLS
+        zero_shot = case["adaptation"] == ZERO_SHOT
+        once = zero_shot or case["model"] in STATION_CONTROLS
         for seed in seeds[:1] if once else seeds:
-            for rank in ranks if case["model"] in GRANITE and case["mode"] != "zero-shot" else ranks[:1]:
+            for rank in ranks if case["model"] in GRANITE and not zero_shot else ranks[:1]:
                 plan.append(case | {"seed": seed, "lora_rank": rank})
     if not plan:
         raise ValueError("La matriz del backtest no contiene candidatos válidos.")
@@ -445,9 +452,11 @@ def _run_fold(settings: RunSettings, plan: list[dict], max_parallel_models: int 
             validate_run_mode(current, case["mode"])
         checked = set()
         for case in plan:
-            key = (case["model"], case["lora_rank"])
-            if case["model"] in GRANITE and case["mode"] != "zero-shot" and key not in checked:
-                report_progress("preflight", f"loading model={case['model']} rank={case['lora_rank']}")
+            rank = None if case["adaptation"] == ZERO_SHOT else case["lora_rank"]
+            key = (case["model"], rank)
+            if case["model"] in GRANITE and key not in checked:
+                variant = ZERO_SHOT if rank is None else f"rank={rank}"
+                report_progress("preflight", f"loading model={case['model']} {variant}")
                 current = replace(settings, **{key: value for key, value in case.items() if key != "mode"})
                 model_metadata(manifest["geometry"], current)
                 checked.add(key)
@@ -513,7 +522,7 @@ def run_backtest(settings: RunSettings, models: list[str], modes: list[str], *, 
             "manifest": settings.manifest, "output_dir": settings.output_dir,
         }))
         models, modes = [settings.model], [recipe["mode"]]
-        adaptations = [settings.adaptation] if settings.adaptation in {"lora", "ffa-lora", "flora", "lora-fair"} else None
+        adaptations = [settings.adaptation] if settings.adaptation in GRANITE_ADAPTATIONS else None
         seeds, lora_ranks, strategies = recipe["seeds"], [settings.lora_rank], [settings.strategy]
     elif selection is not None:
         raise ValueError("--selection solo se utiliza con --stage final.")

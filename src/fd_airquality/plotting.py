@@ -13,7 +13,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
-from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, ZERO_SHOT
 
 METRICS = {
     "macro-mase": "MASE macro",
@@ -34,7 +34,7 @@ MODELS = {
 }
 ADAPTATIONS = {
     "full": "Completo", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
-    "flora": "FLoRA", "lora-fair": "LoRA-FAIR",
+    "flora": "FLoRA", "lora-fair": "LoRA-FAIR", ZERO_SHOT: "Zero-shot",
 }
 COLORS = {
     "full": "#64748b", "lora": "#2563eb", "ffa-lora": "#0891b2",
@@ -78,7 +78,7 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
     labels = []
     for _, row in rows.iterrows():
         label = f"{MODELS.get(row['model'], row['model'])} · {ADAPTATIONS.get(row['adaptation'], row['adaptation'])}"
-        if row["mode"] in FEDERATED_MODES:
+        if row["mode"] in FEDERATED_MODES and row["adaptation"] != ZERO_SHOT:
             label += f" · {row['strategy']}"
         if row["mode"] == GATEWAY_MODE:
             label += " · gateways"

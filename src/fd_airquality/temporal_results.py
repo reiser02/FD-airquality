@@ -9,6 +9,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from fd_airquality.settings import ZERO_SHOT
+
 OPERATIONAL_SETTINGS = {
     "seed", "manifest", "output_dir", "mlflow_tracking_uri",
     "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level",
@@ -32,11 +34,12 @@ def temporal_run_rows(paths: list[Path], fold: int) -> tuple[list[dict], list[di
     for path in paths:
         run = json.loads((path / "run.json").read_text())
         result = json.loads((path / "test_metrics.json").read_text())
+        adaptation = run["model"].get("adaptation", "full")
         identity = {
             "temporal_configuration": candidate_identity(run), "seed": run["settings"]["seed"],
             "model": run["settings"]["model"], "mode": run["mode"],
-            "adaptation": run["model"].get("adaptation", "full"),
-            "strategy": run["settings"]["strategy"], "fold": fold, "run_path": str(path),
+            "adaptation": adaptation, "strategy": "none" if adaptation == ZERO_SHOT else run["settings"]["strategy"],
+            "fold": fold, "run_path": str(path),
         }
         rows.append(identity | result["test"])
         frame = pd.read_csv(path / "station_metrics.csv")

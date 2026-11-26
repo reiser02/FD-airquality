@@ -154,7 +154,7 @@ def test_backtest_validates_all_contexts_before_starting_any_run(single_fold_man
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
     with pytest.raises(SystemExit) as exc:
         main(["backtest", "--manifest", str(single_fold_manifest), "--models", "mlp", "ttm-r3",
-              "--output-dir", str(tmp_path / "runs")])
+              "--modes", "local", "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
     assert "exige contexto 90" in capsys.readouterr().err
     report, = (tmp_path / "runs").glob("*/backtest.json")
@@ -169,7 +169,8 @@ def test_backtest_validates_adapter_ranks_before_training_classics(
     monkeypatch.setattr("fd_airquality.baselines.run_baseline", lambda *_: pytest.fail("No debe entrenar"))
     with pytest.raises(SystemExit) as exc:
         main(["backtest", "--manifest", str(single_fold_manifest), "--models", "mlp", "flowstate-r1",
-              "--lora-targets", "proj", "--lora-ranks", "99", "--output-dir", str(tmp_path / "runs")])
+              "--modes", "local", "--lora-targets", "proj", "--lora-ranks", "99",
+              "--output-dir", str(tmp_path / "runs")])
     assert exc.value.code == 2
     log, = (tmp_path / "runs").glob("*/fold_001/fold.log")
     assert "Run failed" in log.read_text()

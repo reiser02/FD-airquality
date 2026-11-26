@@ -59,23 +59,23 @@ def test_mlflow_tracks_metrics_artifacts_and_status_without_measurements(prepare
         assert client.list_artifacts(run.info.run_id, "checkpoints")[0].path.endswith("best_model.pt")
 
 
-@pytest.mark.parametrize("mode", ["local", "zero-shot"])
-def test_tracking_does_not_publish_per_station_selection_or_unused_parameters(prepared, tmp_path, mlflow_uri, mock_granite, mode):
+@pytest.mark.parametrize("adaptation", ["lora", "zero-shot"])
+def test_tracking_does_not_publish_per_station_selection_or_unused_parameters(prepared, tmp_path, mlflow_uri, mock_granite, adaptation):
     path, _ = prepared
     output = run_baseline(RunSettings(
         manifest=str(path), output_dir=str(tmp_path / "runs"), num_server_rounds=1,
-        model="flowstate-r1", lora_targets="proj", mlflow_tracking_uri=mlflow_uri,
-    ), mode)
+        model="flowstate-r1", adaptation=adaptation, lora_targets="proj", mlflow_tracking_uri=mlflow_uri,
+    ), "local")
     run_id = json.loads((output / "mlflow.json").read_text())["run_id"]
     data = MlflowClient(tracking_uri=mlflow_uri).get_run(run_id).data
-    assert data.tags["adaptation"] == ("none" if mode == "zero-shot" else "lora")
+    assert data.tags["adaptation"] == adaptation
     assert "model.revision" in data.params
-    assert ("lora_rank" in data.params) == (mode == "local")
+    assert ("lora_rank" in data.params) == (adaptation == "lora")
     assert "fair_iterations" not in data.params
     assert "num_server_rounds" not in data.params
     assert not any(key.startswith("station_") for key in data.metrics)
-    assert ("selection/round" in data.metrics) == (mode == "zero-shot")
-    if mode == "zero-shot":
+    assert ("selection/round" in data.metrics) == (adaptation == "zero-shot")
+    if adaptation == "zero-shot":
         assert not {"learning_rate", "local_epochs"} & data.params.keys()
     else:
         test = json.loads((output / "test_metrics.json").read_text())
@@ -140,7 +140,7 @@ def test_backtest_tags_derive_the_group_and_fold_without_reading_paths(directory
     ("nlinear", "federated", "full", "fedprox", "NLinear | federado | completo | FedProx"),
     ("nhits", "centralized", "full", "fedavg", "NHITS | centralizado | completo"),
     ("ttm-r3", "local", "ffa-lora", "fedavg", "TTM-R3 | local | FFA-LoRA"),
-    ("flowstate-r1", "zero-shot", "none", "fedavg", "FlowState-R1 | zero-shot | sin adaptación"),
+    ("flowstate-r1", "federated-gateways", "zero-shot", "fedavg", "FlowState-R1 | federado por gateways | zero-shot"),
 ])
 def test_standalone_run_labels_use_readable_model_mode_and_adaptation(model, mode, adaptation, strategy, candidate):
     settings = RunSettings(model=model, strategy=strategy, output_dir="reports/non_federated")

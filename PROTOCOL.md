@@ -392,13 +392,14 @@ programan `num-server-rounds` rondas de entrenamiento; no se equipara la
 exposición a datos ni el presupuesto entre métodos. FedProx aplica su
 penalización solo al caso federado.
 
-Para Granite se ejecutan cuatro algoritmos federados por foundation y controles
+Para Granite se ejecutan cuatro algoritmos por modo federado y controles
 local/centralizado con LoRA o A congelada. FLoRA/FAIR no tienen modalidades sin
-federación nativas. **Zero-shot** no instala adaptadores ni llama al bucle
-de entrenamiento. No consume sus
-ventanas de entrenamiento para ajustar pesos; sigue empleando el escalador local
-existente, ajustado con entrenamiento, por lo que no representa un protocolo sin
-ningún acceso a historia de entrenamiento. Se evalúa validación una vez y después
+federación nativas. **Zero-shot** está disponible dentro de cada modo: no instala
+adaptadores ni llama al bucle de entrenamiento. Los dos modos federados envían
+solo tareas de evaluación a sus clientes. Zero-shot no consume
+ventanas de entrenamiento para ajustar pesos; con normalización fija sigue
+empleando el escalador por estación ajustado con el histórico autorizado.
+Se evalúa validación una vez y después
 test, sin seleccionar escala, revisión o hiperparámetros con este último.
 
 `backtest` repite la matriz de candidatos en cada fold, con un manifest común a
@@ -408,9 +409,9 @@ en el calendario observado tras el histórico inicial. Con historial expansivo,
 el entrenamiento de un fold incluye lo que fue test antes y las horas nuevas
 hasta que empieza su propia validación.
 Los modos se ejecutan en el orden solicitado:
-por defecto local, centralizado, federado y zero-shot. Entre modos hay
+por defecto local, centralizado, federado por estación y federado por gateways. Entre modos hay
 una barrera: no comienza el siguiente hasta completar todos los candidatos del anterior.
-Dentro de local/centralizado/zero-shot, los candidatos completos pueden ejecutarse
+Dentro de local y centralizado, los candidatos completos pueden ejecutarse
 en procesos independientes, uno por GPU utilizable, sin cambiar ventanas, semillas,
 presupuestos ni criterios de selección. `max-parallel-models` limita esa concurrencia;
 no distribuye estaciones de un mismo candidato local ni implementa entrenamiento
@@ -418,8 +419,8 @@ de un modelo entre varias GPUs. CPU/fallback se mantiene secuencial.
 
 En federado los candidatos permanecen secuenciales: Ray gestiona el paralelismo de
 clientes de una sola federación automáticamente, reservando una GPU completa por
-cliente. La concurrencia es el mínimo entre las GPUs utilizables y las estaciones
-del panel efectivo; en CPU/fallback se ejecuta un cliente cada vez y no se reservan
+cliente. La concurrencia es el mínimo entre las GPUs utilizables y el número de
+clientes (estaciones del panel efectivo o gateways); en CPU/fallback se ejecuta un cliente cada vez y no se reservan
 GPUs. No hay ajustes manuales `workers`/`client-gpus`. No se presupone coordinación
 de GPUs entre runtimes Ray independientes ni se reconfigura un SuperLink ya iniciado.
 Un fallo detiene/cancela los procesos del fold, marca los casos no finalizados
@@ -433,8 +434,8 @@ disponible, sin filtrar familias, adaptaciones ni hiperparámetros.
 Delta = A − B (negativo favorece A); mejora (%) = `100 × (1 − A/B)`
 (positiva favorece A, indefinida si B=0 o falta una métrica).
 La mejora atribuible a adaptación frente a zero-shot solo se añade cuando hay una
-única referencia del mismo modelo, revisión y configuración de inferencia, incluida
-la escala de FlowState. Su ausencia o ambigüedad no bloquea las comparaciones
+única referencia del mismo modo, modelo, revisión y configuración de inferencia,
+incluida la escala de FlowState. Su ausencia o ambigüedad no bloquea las comparaciones
 generales. Se registran escala de FlowState y revisión en la tabla global; avisa cuando las
 versiones de ejecución, semillas o presupuestos difieren. Las comparaciones son
 descriptivas, sin afirmar significación estadística ni independencia de los

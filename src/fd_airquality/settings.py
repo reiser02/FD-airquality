@@ -9,6 +9,10 @@ from pathlib import Path
 
 GATEWAY_MODE = "federated-gateways"
 FEDERATED_MODES = ("federated", GATEWAY_MODE)
+BASELINE_MODES = ("local", "centralized")
+RUN_MODES = (*BASELINE_MODES, *FEDERATED_MODES)
+ZERO_SHOT = "zero-shot"
+GRANITE_ADAPTATIONS = ("lora", "ffa-lora", "flora", "lora-fair", ZERO_SHOT)
 
 
 @dataclass(frozen=True)
@@ -104,7 +108,7 @@ class RunSettings:
             raise ValueError("hf_revision debe ser un SHA inmutable de 40 caracteres hexadecimales.")
         if self.mlflow_log_models not in {0, 1} or not self.mlflow_experiment.strip():
             raise ValueError("mlflow_log_models debe ser 0/1 y mlflow_experiment no puede estar vacío.")
-        if self.adaptation not in {"auto", "none", "lora", "ffa-lora", "flora", "lora-fair"}:
+        if self.adaptation not in {"auto", "none", *GRANITE_ADAPTATIONS}:
             raise ValueError("Adaptación desconocida.")
         if (not all(isfinite(value) for value in (self.lora_alpha, self.lora_dropout, self.fair_learning_rate, self.fair_lambda))
                 or self.lora_alpha <= 0 or not 0 <= self.lora_dropout < 1

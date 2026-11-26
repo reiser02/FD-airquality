@@ -18,7 +18,7 @@ from flwr.serverapp.strategy import FedAvg, FedProx, Strategy
 from fd_airquality.arrival import round_bounds, round_epoch_limit, round_validation_bounds
 from fd_airquality.calibration import calibration_enabled
 from fd_airquality.federated_adapters import aggregate_adapter_updates
-from fd_airquality.models import GRANITE, checkpoint_payload
+from fd_airquality.models import GRANITE, checkpoint_payload, is_zero_shot
 from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import selection_value
@@ -242,7 +242,7 @@ class AuditedStrategy(Strategy):
 
     @property
     def progressive(self) -> bool:
-        return bool(self.settings.arrival_period_hours
+        return bool(not is_zero_shot(self.settings) and self.settings.arrival_period_hours
                     and self.manifest["geometry"].get("split_mode") == "global")
 
     def _runtime_messages(self, messages: Iterable[Message]) -> list[Message]:

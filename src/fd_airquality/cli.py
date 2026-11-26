@@ -38,7 +38,15 @@ from fd_airquality.models import (
 from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
-from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings, resolve_manifest
+from fd_airquality.settings import (
+    BASELINE_MODES,
+    FEDERATED_MODES,
+    GATEWAY_MODE,
+    GRANITE_ADAPTATIONS,
+    RUN_MODES,
+    RunSettings,
+    resolve_manifest,
+)
 from fd_airquality.task import validate_selection_coverage
 from fd_airquality.tracking import tracking_uri
 
@@ -96,7 +104,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     simulation.add_argument("--print-command", action=argparse.BooleanOptionalAction, default=False,
                             help="Preparar el comando sin lanzarlo.")
     baseline = commands.add_parser("baseline", help="Control sin Flower, con las mismas ventanas y métricas.")
-    baseline.add_argument("--mode", choices=["local", "centralized", "zero-shot"], default="local")
+    baseline.add_argument("--mode", choices=BASELINE_MODES, default="local")
     baseline.add_argument("--manifest")
     baseline.add_argument("--output-dir", default="reports/non_federated")
     backtest = commands.add_parser("backtest", help="Comparar modelos y métodos en uno o varios folds temporales.")
@@ -106,10 +114,10 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     backtest.add_argument("--manifest", help="backtest_manifest.json de prepare-backtest; por defecto el más reciente.")
     backtest.add_argument("--output-dir", default="reports/backtests")
     backtest.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(DEFAULT_MATRIX_MODELS))
-    backtest.add_argument("--modes", nargs="+", choices=[*FEDERATED_MODES, "local", "centralized", "zero-shot"],
-                          default=["local", "centralized", "federated", "zero-shot"])
-    backtest.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
-                          default=["lora", "ffa-lora", "flora", "lora-fair"])
+    backtest.add_argument("--modes", nargs="+", choices=RUN_MODES, default=list(RUN_MODES))
+    backtest.add_argument("--adaptations", nargs="+", choices=GRANITE_ADAPTATIONS,
+                          default=list(GRANITE_ADAPTATIONS),
+                          help="Métodos para Granite; zero-shot evalúa sin entrenamiento en cada modo.")
     backtest.add_argument("--seeds", nargs="+", type=int)
     backtest.add_argument("--lora-ranks", nargs="+", type=int)
     backtest.add_argument("--strategies", nargs="+", choices=["fedavg", "fedprox"])
@@ -149,6 +157,8 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
         options = {}
         if field.name == "num_server_rounds":
             options["help"] = "Número de rondas federadas; no repite el ajuste local ni centralizado."
+        elif field.name == "adaptation":
+            options["help"] = "Método para ejecuciones individuales; zero-shot evalúa Granite sin entrenar."
         elif field.name == "round_validation_fallback_epochs":
             options["help"] = "Tope de épocas en una ronda federada con entrenamiento y sin validación separable."
         for command in (simulation, baseline, backtest):

@@ -10,7 +10,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from fd_airquality.settings import FEDERATED_MODES
+from fd_airquality.settings import FEDERATED_MODES, ZERO_SHOT
 
 WEEKLY_METRICS = {
     "macro-mase": ("MASE macro", "mase-scaled-error-sum", "mase-target-count", "mase-count"),
@@ -84,9 +84,11 @@ def rank_weeks(data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     names = {}
     for config, row in configs.iterrows():
         details = [str(row["model"]), str(row["mode"])]
-        if row["adaptation"] not in {"full", "none"}:
+        if row["adaptation"] == ZERO_SHOT:
+            details.append(ZERO_SHOT)
+        elif row["adaptation"] not in {"full", "none"}:
             details += [f"{row['adaptation']} r{row['lora_rank']:g}"]
-        if row["mode"] in FEDERATED_MODES:
+        if row["mode"] in FEDERATED_MODES and row["adaptation"] != ZERO_SHOT:
             details.append(str(row["strategy"]))
         names[config] = " | ".join(details)
     repeated = Counter(names.values())
