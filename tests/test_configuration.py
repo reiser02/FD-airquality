@@ -100,9 +100,10 @@ def test_main_config_shares_batch_budget_and_controls_in_all_training_modes():
     root = Path(__file__).resolve().parents[1] / "fd-airquality.toml"
     for command in ("baseline", "simulate", "backtest"):
         args = arguments([command, "--config", str(root)])
-        assert (args.batch_size, args.pad_last_batch, args.local_epochs, args.early_stopping_patience) == (32, 0, 40, 7)
+        assert (args.batch_size, args.pad_last_batch, args.local_epochs, args.early_stopping_patience) == (64, 0, 40, 7)
         assert (args.arrival_period_hours, args.federated_update_epochs) == (240, 20)
         assert (args.round_validation_hours, args.round_validation_max_hours) == (24, 336)
+        assert args.fair_iterations == 500
     data = arguments(["prepare-backtest", "--config", str(root)])
     assert data.max_train_windows == 256 and data.station is None
     assert (data.stride, data.train_stride) == (4, 4)

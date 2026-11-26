@@ -120,7 +120,7 @@ round-validation-hours = 24
 # 0 desactiva la ampliación; nunca se consulta el bloque nuevo ni la validación o el test.
 round-validation-max-hours = 336
 # Máximo de ventanas por actualización para todos los modelos y modos.
-batch-size = 32
+batch-size = 64
 # 0 conserva el último lote aunque sea corto. 1 lo completa con ventanas de la misma época.
 pad-last-batch = 0
 # Tasa de aprendizaje de AdamW.
@@ -172,8 +172,8 @@ lora-dropout = 0.0
 # Capas lineales donde insertar LoRA; auto usa las capas seleccionadas para cada Granite.
 # También se puede indicar una lista separada por comas de nombres/rutas de capas.
 lora-targets = "auto"
-# Iteraciones de refinamiento en el agregador LoRA-FAIR; solo se usa con adaptation = "lora-fair".
-fair-iterations = 1000
+# Iteraciones de refinamiento por capa en LoRA-FAIR. En CUDA se usa una sola GPU del servidor.
+fair-iterations = 500
 # Tasa de aprendizaje del refinamiento LoRA-FAIR.
 fair-learning-rate = 0.01
 # Peso de la regularización L2 del refinamiento LoRA-FAIR.

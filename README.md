@@ -426,7 +426,7 @@ En CUDA, PatchTST divide entrenamiento y evaluación en microbatches de hasta 8
 ventanas. El DataLoader de entrenamiento conserva los batches originales: se
 acumulan gradientes ponderados por el número de targets, con un único clipping y
 paso de AdamW por batch efectivo. La configuración principal usa un máximo de
-32 ventanas por batch en todos los modos y conserva el último lote corto sin
+64 ventanas por batch en todos los modos y conserva el último lote corto sin
 repetir ventanas. FedProx se aplica una vez por batch efectivo. No se modifica
 el batch del TOML, el checkpoint ni la arquitectura; puede haber pequeñas
 diferencias por el orden de suma o por dropout.
@@ -598,8 +598,8 @@ uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_m
 ```
 
 Valores iniciales: `--lora-rank 4 --lora-alpha 8 --lora-dropout 0`.
-Un rango excesivo falla, no se recorta. FAIR añade refinamiento de servidor:
-`--fair-iterations 1000 --fair-learning-rate 0.01 --fair-lambda 1`.
+Un rango excesivo falla, no se recorta. FAIR añade refinamiento de servidor. El
+TOML principal usa `--fair-iterations 500 --fair-learning-rate 0.01 --fair-lambda 1`.
 Reducir iteraciones para una prueba de integración cambia el presupuesto de entrenamiento.
 Con `--device cuda`, FAIR refina en la primera GPU visible del servidor una capa
 cada vez, después de recibir las actualizaciones de los clientes. Los factores y
