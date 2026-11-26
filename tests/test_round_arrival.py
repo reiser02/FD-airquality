@@ -262,22 +262,23 @@ def test_server_rejects_training_outside_the_new_block(arrival_prepared, tmp_pat
         strategy.aggregate_train(2, replies)
 
 
-def test_server_checks_expanded_monitoring_reserve(arrival_prepared, tmp_path):
+def test_server_checks_validation_interval_against_each_round(arrival_prepared, tmp_path):
     _, manifest = arrival_prepared
     geometry = manifest["geometry"]
     settings = RunSettings(local_epochs=4, num_server_rounds=3, round_validation_max_hours=48)
     strategy = AuditedStrategy(settings, manifest, tmp_path)
-    start, end = round_validation_bounds(geometry, settings)
+    start, end = round_validation_bounds(geometry, settings, 1)
     expanded = start - pd.Timedelta(hours=6)
-    metrics = {"monitoring-from-ns": expanded.value, "monitoring-through-ns": end.value,
+    metrics = {"round-validation-from-ns": expanded.value, "round-validation-through-ns": end.value,
+               "round-validation-windows": 1,
                "num-examples": 1, "train-last-target-ns": expanded.value - 1}
-    strategy._check_monitoring_interval(metrics, geometry, 1, 0)
-    with pytest.raises(ValueError, match="no respeta el histórico"):
-        strategy._check_monitoring_interval(metrics | {"monitoring-through-ns": end.value + 1}, geometry, 1, 0)
-    with pytest.raises(ValueError, match="cambió entre rondas"):
-        strategy._check_monitoring_interval(metrics | {"monitoring-from-ns": start.value}, geometry, 2, 0)
-    with pytest.raises(ValueError, match="utiliza targets de monitorización"):
-        strategy._check_monitoring_interval(metrics | {"train-last-target-ns": expanded.value}, geometry, 1, 0)
+    strategy._check_round_validation(metrics, geometry, 1)
+    with pytest.raises(ValueError, match="no respeta el bloque"):
+        strategy._check_round_validation(metrics | {"round-validation-through-ns": end.value + 1}, geometry, 1)
+    with pytest.raises(ValueError, match="no respeta el bloque"):
+        strategy._check_round_validation(metrics, geometry, 2)
+    with pytest.raises(ValueError, match="utiliza targets del conjunto de validación"):
+        strategy._check_round_validation(metrics | {"train-last-target-ns": expanded.value}, geometry, 1)
 
 
 def test_empty_early_round_is_explicit_and_not_averaged_as_an_update(arrival_prepared, tmp_path, flower_grid):

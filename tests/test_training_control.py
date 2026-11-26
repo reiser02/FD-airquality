@@ -28,6 +28,7 @@ from fd_airquality.training_control import ContextSupervisionDataset, TrainingCo
     {"lr_scheduler_patience": -1}, {"lr_scheduler_factor": 1.},
     {"lr_scheduler_factor": 0.}, {"min_learning_rate": 0.}, {"min_learning_rate": .1},
     {"pad_last_batch": 2}, {"federated_update_epochs": -1}, {"round_validation_max_hours": 23},
+    {"round_validation_fallback_epochs": 0}, {"round_validation_fallback_epochs": True},
 ])
 def test_training_control_settings_reject_invalid_values(options):
     with pytest.raises(ValueError):
@@ -105,31 +106,30 @@ def test_monitor_pools_observed_errors_and_station_scales():
     assert model.training
 
 
-def test_federated_monitoring_reserve_is_past_disjoint_and_protects_fixed_scaler(
+def test_federated_validation_uses_each_rounds_tail_and_protects_fixed_scaler(
     arrival_prepared,
 ):
     path, manifest = arrival_prepared
     _, original = load_client_data(str(path), 0)
     geometry = manifest["geometry"]
-    settings = RunSettings(local_epochs=8, num_server_rounds=3, normalization="fixed")
-    lower, upper = round_validation_bounds(geometry, settings)
+    settings = RunSettings(local_epochs=8, num_server_rounds=3, normalization="fixed", round_validation_hours=12)
+    lower, upper = round_validation_bounds(geometry, settings, 1)
     assert upper == round_cutoff(geometry, settings, 1)
     artifact = normalization_artifact(original, geometry, settings)
     fit = np.isfinite(original["values"]) & (original["timestamps"] < lower.value)
     assert float(artifact["mean"]) == pytest.approx(original["values"][fit].astype(float).mean())
-    validation = round_validation_view(artifact, geometry, settings)
-    positions = validation.starts[:, None] + validation.context + np.arange(validation.horizon)
-    val_times = set(original["timestamps"][positions].flat)
-    assert min(val_times) >= lower.value and max(val_times) < upper.value
     for number in (1, 2, 3):
         train = training_view(artifact, geometry, settings, number)
-        targets = train.starts[:, None] + train.context + np.arange(train.horizon)
-        assert not val_times.intersection(original["timestamps"][targets].flat)
+        validation = round_validation_view(artifact, geometry, settings, train)
+        start, cutoff = round_validation_bounds(geometry, settings, number)
+        assert start.value <= validation.target_time_bounds()[0] <= validation.target_time_bounds()[1] < cutoff.value
+        assert train.target_time_bounds()[1] < start.value
     changed = original | {"values": original["values"].copy()}
     changed["values"][original["timestamps"] >= upper.value] = 1e8
     other = normalization_artifact(changed, geometry, settings)
     assert artifact["normalization_sha256"] == other["normalization_sha256"]
-    other_validation = round_validation_view(other, geometry, settings)
+    validation = round_validation_view(artifact, geometry, settings, training_view(artifact, geometry, settings, 1))
+    other_validation = round_validation_view(other, geometry, settings, training_view(other, geometry, settings, 1))
     for index in range(len(validation)):
         torch.testing.assert_close(validation[index][0], other_validation[index][0], equal_nan=True)
         torch.testing.assert_close(validation[index][1], other_validation[index][1], equal_nan=True)
@@ -137,7 +137,7 @@ def test_federated_monitoring_reserve_is_past_disjoint_and_protects_fixed_scaler
         normalization_artifact(original, geometry, replace(settings, normalization_reference_end=str(upper)))
 
 
-def test_federated_monitor_requires_observed_past_not_future_fallback(arrival_raw, tmp_path):
+def test_federated_validation_extends_only_within_the_round(arrival_raw, tmp_path):
     raw, config = arrival_raw
     settings = RunSettings(local_epochs=8, num_server_rounds=3)
     # The first arrival is Jan 7 and its 24-hour reserve is Jan 6.
@@ -147,23 +147,57 @@ def test_federated_monitor_requires_observed_past_not_future_fallback(arrival_ra
     frame.to_csv(source)
     path = prepare(raw, tmp_path / "prepared", "PM25", config)
     manifest, artifact = load_client_data(str(path), 0)
-    assert len(training_view(artifact, manifest["geometry"], settings, 1)) > 0
-    assert len(artifact["validation_starts"]) > 0
-    with pytest.raises(ValueError, match="Sin ventanas observadas"):
-        round_validation_view(artifact, manifest["geometry"], settings)
-    # The optional fallback uses only earlier observed targets, excluded from gradients and scaling.
-    settings = replace(settings, round_validation_max_hours=48, normalization="fixed")
     geometry = manifest["geometry"]
-    lower, cutoff = round_validation_bounds(geometry, settings, artifact)
+    original = training_view(artifact, geometry, settings, 1)
+    assert len(original) > 0
+    assert len(artifact["validation_starts"]) > 0
+    assert round_validation_view(artifact, geometry, settings, original) is None
+    # The optional extension uses only earlier targets from the same block.
+    settings = replace(settings, round_validation_max_hours=48, normalization="fixed")
     local = normalization_artifact(artifact, geometry, settings)
-    view = round_validation_view(local, geometry, settings)
+    train = training_view(local, geometry, settings, 1)
+    lower, cutoff = train.round_validation_interval
+    view = round_validation_view(local, geometry, settings, train)
     assert lower < pd.Timestamp("2025-01-06")
     assert cutoff == pd.Timestamp("2025-01-07")
     assert view.target_time_bounds()[0] == lower.value
     assert view.target_time_bounds()[1] < cutoff.value
     assert local["normalization_reference_mask"].any()
     assert not local["normalization_reference_mask"][local["timestamps"] >= lower.value].any()
-    assert training_view(local, geometry, settings, 1).target_time_bounds()[1] < lower.value
+    assert train.target_time_bounds()[1] < lower.value
+
+
+@pytest.mark.parametrize(("cap", "expected_epochs"), [(10, 10), (3, 3), (20, 12)])
+def test_federated_fallback_limits_epochs_without_separate_validation(
+    arrival_raw, tmp_path, flower_grid, cap, expected_epochs,
+):
+    raw, config = arrival_raw
+    source = raw / "a" / "PM25.csv"
+    frame = pd.read_csv(source, index_col=0, parse_dates=True)
+    frame.loc[(frame.index >= "2025-01-07") & (frame.index < "2025-01-08")] = np.nan
+    frame.to_csv(source)
+    path = prepare(raw, tmp_path / "prepared", "PM25", config)
+    settings = RunSettings(
+        manifest=str(path), output_dir=str(tmp_path / "runs"), model="mlp", hidden_size=8, batch_size=64,
+        num_server_rounds=2, local_epochs=12, round_validation_hours=24,
+        arrival_period_hours=24, round_validation_fallback_epochs=cap, mlflow_tracking_uri="disabled",
+    )
+    # The second block is as short as the validation interval. Its windows
+    # must still be available to train, without recycling the previous split.
+    output = run_server(flower_grid(settings, 2), settings)
+    training = pd.read_csv(output / "station_metrics.csv").query("split == 'train'")
+    initial = training.loc[training["round"] == 1].set_index("station")
+    assert initial.loc["b", "round-validation-windows"] > 0
+    assert initial.loc["a", "round-validation-fallback"] == 1
+    assert initial.loc["a", "epochs-completed"] == expected_epochs
+    fallback = training.loc[training["round"] == 2]
+    assert len(fallback) == 2
+    assert fallback["round-validation-fallback"].eq(1).all()
+    assert fallback["round-validation-windows"].eq(0).all()
+    assert fallback["epochs-completed"].eq(expected_epochs).all()
+    assert fallback["early-stopped"].eq(0).all()
+    assert fallback["learning-rate-reductions"].eq(0).all()
+    assert fallback["train-last-target-ns"].gt(fallback["available-from-ns"]).all()
 
 
 @pytest.mark.parametrize("padding", ["none", "both"])
@@ -172,7 +206,7 @@ def test_old_labels_are_not_reused_by_autoencoder_auxiliary_loss(arrival_raw, tm
     raw, config = arrival_raw
     path = prepare(raw, tmp_path / "prepared", "PM25", replace(config, window_padding=padding))
     manifest, artifact = load_client_data(str(path), 0)
-    settings = RunSettings(model="autoencoder", local_epochs=epochs, num_server_rounds=3)
+    settings = RunSettings(model="autoencoder", local_epochs=epochs, num_server_rounds=3, round_validation_hours=12)
     geometry = manifest["geometry"]
     train = training_view(artifact, geometry, settings, 2)
     # The first target is at the lower edge of the new block, the next starts
@@ -205,6 +239,7 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
         local_epochs=8, hidden_size=8, batch_size=8, early_stopping_patience=2,
         early_stopping_min_delta=1e6, lr_scheduler_patience=0, mlflow_tracking_uri="disabled",
         model=model_name, probabilistic=int(model_name in {"mlp", "nlinear", "nhits"}),
+        round_validation_hours=6,
         missing_policy="ffill" if model_name == "flowstate-r1" else "auto",
         lora_targets="proj" if model_name == "flowstate-r1" else "auto",
     )
@@ -221,10 +256,11 @@ def test_training_paths_apply_patience_lr_and_preserve_all_arrivals(
     assert train["num-examples"].eq(10 if mode == "centralized" else 5).all()
     assert train["replacement-window-occurrences"].eq(12 if mode == "centralized" else 6).all()
     if mode == "federated":
-        cutoff = round_cutoff(json.loads(path.read_text())["geometry"], settings, 1)
-        assert train["monitoring-through-ns"].eq(cutoff.value).all()
-        initial = train.loc[train["round"] == 1]
-        assert (initial["train-last-target-ns"] < initial["monitoring-from-ns"]).all()
+        geometry = json.loads(path.read_text())["geometry"]
+        for number, rows in train.groupby("round"):
+            cutoff = round_cutoff(geometry, settings, number)
+            assert rows["round-validation-through-ns"].eq(cutoff.value).all()
+            assert (rows["train-last-target-ns"] < rows["round-validation-from-ns"]).all()
     if mode != "centralized":
         assert train["learning-rate-final"].eq(settings.learning_rate / 4).all()
     run = json.loads((output / "run.json").read_text())

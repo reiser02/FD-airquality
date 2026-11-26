@@ -95,7 +95,7 @@ def train_local(
     grouped = isinstance(dataset, ConcatDataset)
     children = dataset.datasets if grouped else [dataset]
     restrict_reconstruction = any(getattr(child, "arrival_lower", None) is not None
-                                  or getattr(child, "monitoring_interval", None) is not None
+                                   or getattr(child, "round_validation_interval", None) is not None
                                   for child in children)
     loader_dataset = dataset
     if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight and restrict_reconstruction:
@@ -305,7 +305,7 @@ def _training_validation_totals(model, dataset, settings, device):
     for inputs, actual in loader:
         prediction = forecast(model, inputs.to(device), settings).cpu()
         if prediction.shape != actual.shape or not torch.isfinite(prediction).all():
-            raise ValueError("Predicciones de monitorización incompatibles o no finitas.")
+            raise ValueError("Predicciones de validación incompatibles o no finitas.")
         if isinstance(dataset, WindowDataset):
             starts = dataset.starts[offset:offset + len(actual)]
             actual = torch.from_numpy(dataset.target_values(starts).astype(np.float64))

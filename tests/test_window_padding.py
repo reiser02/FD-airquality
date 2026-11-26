@@ -162,12 +162,13 @@ def test_padding_preparation_integrity_preserves_canonical_arrays_and_evaluation
 def test_arrival_padding_keeps_targets_in_their_block_and_outside_the_reserve(padding_prepared):
     path, manifest = padding_prepared
     geometry = manifest["geometry"]
-    settings = RunSettings(num_server_rounds=3, local_epochs=3)
+    settings = RunSettings(num_server_rounds=3, local_epochs=3, round_validation_hours=12)
     _, artifact = load_client_data(str(path), 0)
     seen_targets = set()
-    lower, upper = round_validation_bounds(geometry, settings)
     for number in (1, 2, 3):
         dataset = training_view(artifact, geometry, settings, number)
+        lower, upper = round_validation_bounds(geometry, settings, number)
+        assert dataset.round_validation_interval == (lower, upper)
         positions = dataset.starts[:, None] + dataset.context + np.arange(dataset.horizon)
         truth = dataset.target_values()
         observed = np.isfinite(truth)

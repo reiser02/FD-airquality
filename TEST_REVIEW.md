@@ -17,7 +17,7 @@ producción ni el worktree de origen.
 
 Las pruebas de selección ahora fuerzan que MAE y MASE elijan rondas distintas y
 comprueban qué pesos se evalúan, no solo que exista un checkpoint. También se
-comprueba que una reserva de monitorización sin targets observados no use la
+comprueba que un conjunto de validación sin targets observados no use la
 validación futura como sustituto, aunque esta tenga datos.
 
 ## Qué se mantuvo

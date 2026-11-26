@@ -113,12 +113,15 @@ lr-scheduler-patience = 2
 lr-scheduler-factor = 0.5
 # Suelo positivo de la tasa de aprendizaje; no debe superar learning-rate.
 min-learning-rate = 0.000001
-# En federado con llegadas y control de épocas: horas reservadas para monitorizar
-# antes de la primera ronda. Se usa al menos horizon y no se entrena con esos targets.
+# En federado con llegadas: horas del final de cada bloque para validación.
+# Se usa al menos horizon y no se entrena con esos targets.
 round-validation-hours = 24
-# Si falta cobertura, permite ampliar hacia atrás la reserva de esa estación hasta este límite.
-# 0 desactiva la ampliación; nunca se consulta el bloque nuevo ni la validación o el test.
+# Si faltan ventanas de validación, permite buscar hacia atrás dentro del mismo bloque.
+# 0 mantiene el tramo nominal; habilitar una ampliación no permite cruzar el inicio del bloque.
 round-validation-max-hours = 336
+# Tope si el cliente tiene datos para entrenar pero no permite separar la validación.
+# En esa ronda no se aplican early stopping ni el scheduler.
+round-validation-fallback-epochs = 10
 # Máximo de ventanas por actualización para todos los modelos y modos.
 batch-size = 64
 # 0 conserva el último lote aunque sea corto. 1 lo completa con ventanas de la misma época.
@@ -208,7 +211,7 @@ normalization = "window"
 scaler-type = "standard"
 # Solo con normalización "fixed" y cortes globales: fin exclusivo del tramo para ajustar
 # el escalador, como fecha horaria sin zona. Si se omite, se calcula por fold.
-# No puede superar la primera llegada, invadir la reserva de monitorización ni dejar el ajuste sin datos.
+# No puede superar la primera llegada, invadir su reserva de validación ni dejar el ajuste sin datos.
 # normalization-reference-end = "2026-02-20 00:00"
 # Umbral por defecto de entrenamiento: un decimal para ambos mínimos o dos
 # [contexto, targets], entre 0.0 y 1.0. 0.0 todavía exige una observación real de

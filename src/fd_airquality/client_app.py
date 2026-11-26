@@ -56,7 +56,8 @@ def _execute_task(message, settings, partition, training):
         if training:
             metrics.update({"uplink-tensor-bytes": 0, "downlink-tensor-bytes": 0,
                             "candidate-windows": 0, "availability-excluded-windows": 0,
-                            "monitoring-excluded-windows": 0, "arrival-unobserved-windows": 0})
+                             "round-validation-excluded-windows": 0, "round-validation-windows": 0,
+                             "round-validation-fallback": 0, "arrival-unobserved-windows": 0})
         return Message(content=RecordDict({"metrics": MetricRecord(metrics)}), reply_to=message)
     log_dir = Path(config["log-dir"]) if "log-dir" in config else None
     artifacts = []
@@ -146,10 +147,19 @@ def _fit_client(model, geometry, settings, device, seed, config, artifacts):
     dataset = ConcatDataset(views) if gateway else views[0]
     update = replace(settings, local_epochs=round_epoch_limit(geometry, settings, round_number))
     rows, options = [], {}
+    fallback = False
     if len(dataset) and controls_enabled(update):
-        monitoring = [round_validation_view(artifact, geometry, settings)
-                      for artifact, view in zip(artifacts, views, strict=True) if len(view)]
-        options["validation_data"] = ConcatDataset(monitoring) if gateway else monitoring[0]
+        validation = [
+            held_out for artifact, view in zip(artifacts, views, strict=True)
+            if len(view) and (held_out := round_validation_view(artifact, geometry, settings, view)) is not None
+        ]
+        if validation:
+            options["validation_data"] = ConcatDataset(validation) if gateway else validation[0]
+        else:
+            fallback = True
+            update = replace(update, local_epochs=min(update.local_epochs, update.round_validation_fallback_epochs),
+                             early_stopping=0, lr_scheduler="none")
+            report_progress("training-validation", f"Sin conjunto de validación separado; épocas={update.local_epochs}.")
     if gateway:
         options["group_metrics"] = rows
     metrics = train_local(
@@ -163,12 +173,14 @@ def _fit_client(model, geometry, settings, device, seed, config, artifacts):
         if config.get("available-from-ns") != diagnostic.get("available-from-ns"):
             raise ValueError("El bloque de llegada del cliente no coincide con el del servidor.")
     metrics["idle-client"] = int(not len(dataset))
+    metrics["round-validation-fallback"] = int(fallback)
     if gateway:
         if not rows:
             rows = [_idle_training() for _ in views]
         for row, diagnostic in zip(rows, diagnostics, strict=True):
             row.update(diagnostic)
-        for key in ("candidate-windows", "availability-excluded-windows", "monitoring-excluded-windows",
+        for key in ("candidate-windows", "availability-excluded-windows", "round-validation-windows",
+                    "round-validation-excluded-windows",
                     "arrival-unobserved-windows"):
             metrics[key] = sum(row[key] for row in diagnostics)
     else:

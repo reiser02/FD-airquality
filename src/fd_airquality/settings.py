@@ -68,6 +68,7 @@ class RunSettings:
     min_learning_rate: float = 0.000001
     round_validation_hours: int = 24
     round_validation_max_hours: int = 0
+    round_validation_fallback_epochs: int = 10
     federation_mode: str = "federated"
     gateway_num_clients: int = 4
     gateway_seed: int = 42
@@ -135,7 +136,7 @@ class RunSettings:
             raise ValueError("pad_last_batch debe ser 0/1.")
         if type(self.early_stopping) is not int or self.early_stopping not in {0, 1}:
             raise ValueError("early_stopping debe ser 0/1.")
-        for name in ("early_stopping_patience", "round_validation_hours"):
+        for name in ("early_stopping_patience", "round_validation_hours", "round_validation_fallback_epochs"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} debe ser un entero positivo.")
         max_hours = self.round_validation_max_hours

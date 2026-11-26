@@ -54,7 +54,7 @@ def test_gateway_backtest_keeps_the_topology_and_station_support(
     settings = RunSettings(
         manifest=str(manifest), output_dir=str(tmp_path / "results"), mlflow_tracking_uri="disabled",
         gateway_num_clients=3, batch_size=5, pad_last_batch=1, num_server_rounds=2, local_epochs=2,
-        federated_update_epochs=1, arrival_period_hours=24, normalization="fixed",
+        round_validation_fallback_epochs=1, arrival_period_hours=24, normalization="fixed",
         probabilistic=1, calibrate_point_forecasts=1, calibration_min_pairs=2,
     )
     modes = ["local", "centralized", "federated", GATEWAY_MODE]
@@ -77,6 +77,11 @@ def test_gateway_backtest_keeps_the_topology_and_station_support(
         idle = gateways.query("`num-stations` == 0")
         assert len(idle) == 2 and not idle["uplink-tensor-bytes"].any()
         assert not idle["downlink-tensor-bytes"].any()
+        updates = gateways.query("round == 2 and `num-stations` > 0")
+        assert len(updates) == 2
+        assert updates["round-validation-fallback"].eq(1).all()
+        assert updates["round-validation-windows"].eq(0).all()
+        assert updates["epochs-completed"].eq(1).all()
         stations = pd.read_csv(run / "station_metrics.csv")
         expected = {row["station"]: row["gateway_id"] for row in topology["stations"]}
         assert stations["station"].map(expected).eq(stations["gateway-id"]).all()

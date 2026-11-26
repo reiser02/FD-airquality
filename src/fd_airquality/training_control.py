@@ -26,7 +26,7 @@ def controls_enabled(settings) -> bool:
 
 
 class ContextSupervisionDataset(Dataset):
-    """Old and monitoring values may give context, but not reconstruction labels."""
+    """Old and held-out values may give context, but not reconstruction labels."""
 
     def __init__(self, dataset):
         self.dataset = dataset
@@ -37,14 +37,14 @@ class ContextSupervisionDataset(Dataset):
     def __getitem__(self, index):
         inputs, actual = self.dataset[index]
         arrival = getattr(self.dataset, "arrival_lower", None)
-        monitor = getattr(self.dataset, "monitoring_interval", None)
+        validation = getattr(self.dataset, "round_validation_interval", None)
         allowed = np.ones(len(inputs), dtype=bool)
-        if arrival is not None or monitor is not None:
+        if arrival is not None or validation is not None:
             times = self.dataset.context_timestamps(index)
             if arrival is not None:
                 allowed &= times >= arrival.value
-            if monitor is not None:
-                lower, upper = monitor
+            if validation is not None:
+                lower, upper = validation
                 allowed &= (times < lower.value) | (times >= upper.value)
         return inputs, actual, torch.from_numpy(allowed)
 
@@ -63,7 +63,7 @@ class TrainingControl:
 
     def observe(self, epoch: int, score: float) -> bool:
         if not math.isfinite(score):
-            raise ValueError("La métrica de monitorización de entrenamiento no es finita.")
+            raise ValueError("La métrica de validación para el control de épocas no es finita.")
         if score < self.best_score - self.settings.early_stopping_min_delta:
             self.best_score, self.best_epoch, self.bad_epochs = score, epoch, 0
             self.best_state = {key: value.detach().cpu().clone() for key, value in shared_state(self.model).items()}

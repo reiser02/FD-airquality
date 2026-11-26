@@ -487,9 +487,11 @@ con validación; los presupuestos de entrenamiento no son equivalentes.
 
 La configuración principal añade early stopping con paciencia y
 `ReduceLROnPlateau` en las épocas locales, con MSE observado en unidades cuadradas.
-En federado se monitoriza una reserva
-de pasado anterior a la primera ronda, sin consultar validación futura ni omitir
-las siguientes llegadas. Consulta [muestreo, padding, folds y controles de
+En federado con llegadas, cada estación separa el tramo final disponible en
+su ronda como conjunto de validación para esos controles. Si un cliente no
+puede separar entrenamiento y validación, ajusta los pesos con un máximo de
+10 épocas (`round-validation-fallback-epochs`), sin parada temprana ni scheduler.
+Consulta [muestreo, padding, folds y controles de
 entrenamiento](TRAINING_CONTROLS.md) para las reglas y opciones.
 
 Se selecciona por **MASE macro de validación**. MASE/RMSSE usan diferencias a

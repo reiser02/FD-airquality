@@ -34,7 +34,7 @@ from fd_airquality.neural import trained_quantiles
 from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.run_logging import flush_run_logs
 from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings
-from fd_airquality.training_control import training_stage_count
+from fd_airquality.training_control import controls_enabled, training_stage_count
 
 MODEL_LABELS = {
     "mlp": "MLP", "autoencoder": "Autoencoder", "autoencoder-tiny": "Autoencoder Tiny",
@@ -61,7 +61,7 @@ _TRACKED_METRICS = {
         "train-seconds", "peak-cuda-allocated-mib", "trainable-parameters",
         "uplink-tensor-bytes", "downlink-tensor-bytes", "global-state-tensor-bytes",
         "server-aggregation-seconds", "server-aggregation-cuda", "replacement-window-occurrences",
-        "active-gateways",
+        "active-gateways", "round-validation-windows", "round-validation-fallback",
     ),
     "validation": _EVALUATION_METRICS,
     "test": _EVALUATION_METRICS,
@@ -265,9 +265,10 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "scheduler_patience": settings.lr_scheduler_patience,
             "scheduler_factor": settings.lr_scheduler_factor,
             "min_lr": settings.min_learning_rate,
-            "federated_monitor": "fixed_reserve_before_round_one" if progressive else None,
+            "federated_validation": "tail_of_each_round" if progressive and controls_enabled(settings) else None,
             "round_validation_hours": settings.round_validation_hours if progressive else None,
             "round_validation_max_hours": settings.round_validation_max_hours if progressive else None,
+            "round_validation_fallback_epochs": settings.round_validation_fallback_epochs if progressive else None,
             "single_epoch_budget": settings.local_epochs == 1,
         },
     }, indent=2, allow_nan=False) + "\n", encoding="utf-8")
@@ -350,6 +351,8 @@ class RunTracker:
                            "gateway_topology_sha256": file_digest(self.output / TOPOLOGY_FILENAME)})
         if self.mode in FEDERATED_MODES and geometry.get("split_mode") == "global":
             params["arrival_period_hours"] = settings.arrival_period_hours
+            if settings.arrival_period_hours and controls_enabled(settings):
+                params["round_validation_fallback_epochs"] = settings.round_validation_fallback_epochs
             if settings.arrival_period_hours and settings.num_server_rounds > 1:
                 params["federated_update_epochs"] = round_epoch_limit(geometry, settings, 2)
         for key in ("revision", "inference_parameters", "inference_macs"):

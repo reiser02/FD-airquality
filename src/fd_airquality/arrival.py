@@ -43,7 +43,7 @@ def round_epoch_limit(geometry: dict, settings, round_number: int) -> int:
     return settings.local_epochs
 
 
-def _monitoring_starts(artifact, geometry, lower, cutoff):
+def _round_validation_starts(artifact, geometry, lower, cutoff):
     times = artifact["timestamps"]
     starts = artifact["train_starts"]
     first, last = starts + geometry["context"], starts + geometry["context"] + geometry["horizon"] - 1
@@ -52,43 +52,45 @@ def _monitoring_starts(artifact, geometry, lower, cutoff):
     return starts[(times[first] >= lower.value) & (times[last] < cutoff.value)]
 
 
-def round_validation_bounds(geometry: dict, settings, artifact=None):
-    """Fixed monitoring reserve, wholly available BEFORE round one."""
-    if not controls_enabled(settings):
+def round_validation_bounds(geometry: dict, settings, round_number: int, *, allow_extension: bool = False):
+    """The trailing validation interval for this round, clipped to its training block."""
+    lower, cutoff = round_bounds(geometry, settings, round_number)
+    if cutoff is None or not controls_enabled(settings) or round_epoch_limit(geometry, settings, round_number) == 1:
         return None
-    end = round_cutoff(geometry, settings, 1)
-    if end is None:
-        return None
-    hours = max(settings.round_validation_hours, geometry["horizon"])
-    start = end - pd.Timedelta(hours=hours)
-    train_start = pd.Timestamp(geometry["train_start"]) if geometry.get("train_start") else None
-    if train_start is not None and start < train_start:
-        raise ValueError("El histórico del fold no alcanza la reserva de monitorización de la primera ronda.")
-    if artifact is not None and settings.round_validation_max_hours > hours:
-        earliest = end - pd.Timedelta(hours=settings.round_validation_max_hours)
-        if train_start is not None:
-            earliest = max(earliest, train_start)
-        starts = _monitoring_starts(artifact, geometry, earliest, end)
-        if len(starts):
-            # Move the start just enough to include the nearest past horizon.
-            # The end is never allowed to cross the first arrival.
-            last_origin = artifact["timestamps"][starts[-1] + geometry["context"]]
-            start = min(start, pd.Timestamp(last_origin))
-    return start, end
+    horizon = pd.Timedelta(hours=geometry["horizon"])
+    hours = settings.round_validation_max_hours if allow_extension else 0
+    start = cutoff - max(horizon, pd.Timedelta(hours=max(hours, settings.round_validation_hours)))
+    if lower is not None:
+        start = max(start, lower)
+    if geometry.get("train_start"):
+        start = max(start, pd.Timestamp(geometry["train_start"]))
+    return (start, cutoff) if cutoff - start >= horizon else None
 
 
-def round_validation_view(artifact: dict, geometry: dict, settings):
-    bounds = round_validation_bounds(geometry, settings, artifact)
+def _round_validation_plan(artifact, geometry, settings, round_number):
+    bounds = round_validation_bounds(geometry, settings, round_number)
     if bounds is None:
-        return validation_view(artifact, geometry, settings)
-    lower, cutoff = bounds
-    times = artifact["timestamps"]
-    starts = _monitoring_starts(artifact, geometry, lower, cutoff)
-    size = int(np.searchsorted(times, cutoff.value))
-    local = artifact | {"validation_starts": starts, "values": artifact["values"][:size],
-                        "timestamps": times[:size]}
+        return None
+    start, cutoff = bounds
+    earliest, _ = round_validation_bounds(geometry, settings, round_number, allow_extension=True)
+    starts = _round_validation_starts(artifact, geometry, earliest, cutoff)
     if not len(starts):
-        raise ValueError("Sin ventanas observadas en la reserva de monitorización anterior a la primera ronda.")
+        return None
+    origins = artifact["timestamps"][starts + geometry["context"]]
+    # Extend only when the nominal tail has no validation windows.
+    start = min(start, pd.Timestamp(origins[-1]))
+    return (start, cutoff), starts[origins >= start.value]
+
+
+def round_validation_view(artifact: dict, geometry: dict, settings, training):
+    if training.available_through is None:
+        return validation_view(artifact, geometry, settings)
+    if training.round_validation_interval is None:
+        return None
+    times = artifact["timestamps"]
+    size = int(np.searchsorted(times, training.available_through.value))
+    local = artifact | {"validation_starts": training.round_validation_starts,
+                        "values": artifact["values"][:size], "timestamps": times[:size]}
     return WindowDataset(local, "validation", geometry["context"], geometry["horizon"])
 
 
@@ -100,18 +102,20 @@ def normalization_artifact(artifact: dict, geometry: dict, settings) -> dict:
         result.update(mean=np.array(0.), scale=np.array(1.))
     elif geometry.get("split_mode") == "global":
         first_arrival = round_cutoff(geometry, settings, 1)
-        bounds = round_validation_bounds(geometry, settings, artifact)
+        bounds = training_view(artifact, geometry, settings, 1).round_validation_interval
+        allowed = np.isfinite(artifact["values"])
+        if geometry.get("train_start"):
+            allowed &= artifact["timestamps"] >= pd.Timestamp(geometry["train_start"]).value
+        validation_start = bounds[0] if bounds is not None else None
         reference_end = settings.normalization_reference_end or str(
-            bounds[0] if bounds is not None else first_arrival or pd.Timestamp(geometry["validation_start"]),
+            validation_start or first_arrival or pd.Timestamp(geometry["validation_start"]),
         )
         cutoff = pd.Timestamp(reference_end)
         if cutoff > (first_arrival or pd.Timestamp(geometry["validation_start"])):
             raise ValueError("La normalización fija utiliza datos aún no disponibles en la primera ronda.")
-        if bounds is not None and cutoff > bounds[0]:
-            raise ValueError("La normalización fija invade la reserva de monitorización.")
-        mask = np.isfinite(artifact["values"]) & (artifact["timestamps"] < cutoff.value)
-        if geometry.get("train_start"):
-            mask &= artifact["timestamps"] >= pd.Timestamp(geometry["train_start"]).value
+        if validation_start is not None and cutoff > validation_start:
+            raise ValueError("La normalización fija invade la reserva de validación de la primera ronda.")
+        mask = allowed & (artifact["timestamps"] < cutoff.value)
         values = artifact["values"][mask].astype(np.float64)
         if not len(values):
             raise ValueError("No hay observaciones autorizadas para ajustar la normalización fija.")
@@ -147,9 +151,6 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
     lower, cutoff = round_bounds(geometry, settings, round_number) if round_number is not None else (None, None)
     starts = artifact["train_starts"]
     padded = str(artifact.get("window_padding", "none")) != "none"
-    monitoring_excluded = 0
-    arrival_unobserved = 0
-    bounds = None
     target_end = int(artifact.get("train_target_end", len(artifact["values"])))
     if cutoff is not None:
         times = artifact["timestamps"]
@@ -160,21 +161,35 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
             # Only forecast targets must be new. Their context may precede the
             # block; a padded horizon can extend right, never back into old labels.
             starts = starts[times[starts + geometry["context"]] >= lower.value]
-        bounds = round_validation_bounds(geometry, settings, artifact)
-        if bounds is not None:
-            first = times[starts + geometry["context"]]
-            if padded:
-                keep = (first < bounds[0].value) | (first >= bounds[1].value)
-            else:
-                last = times[starts + geometry["context"] + geometry["horizon"] - 1]
-                keep = (last < bounds[0].value) | (first >= bounds[1].value)
-            monitoring_excluded = int((~keep).sum())
-            starts = starts[keep]
-            if round_number == 1:
-                target_end = min(target_end, int(np.searchsorted(times, bounds[0].value)))
         size = int(np.searchsorted(times, cutoff.value))
         local["values"], local["timestamps"] = artifact["values"][:size], times[:size]
         target_end = min(target_end, size)
+    plan = _round_validation_plan(artifact, geometry, settings, round_number) if cutoff is not None else None
+    validation_excluded = 0
+    if plan is not None:
+        bounds, _ = plan
+        training_end = min(target_end, int(np.searchsorted(times, bounds[0].value)))
+        last = starts + geometry["context"] + (0 if padded else geometry["horizon"] - 1)
+        training_starts = starts[last < training_end]
+        dataset, arrival_unobserved = _admissible_training(
+            local, geometry, settings, training_starts, training_end, padded,
+        )
+        if len(dataset):
+            validation_excluded = len(starts) - len(training_starts)
+        else:
+            plan = None
+    if plan is None:
+        dataset, arrival_unobserved = _admissible_training(local, geometry, settings, starts, target_end, padded)
+    dataset.available_through = cutoff
+    dataset.arrival_lower = lower
+    dataset.round_validation_interval, dataset.round_validation_starts = plan if plan is not None else (None, ())
+    dataset.round_validation_excluded_windows = validation_excluded
+    dataset.arrival_unobserved_windows = arrival_unobserved
+    return dataset
+
+
+def _admissible_training(local, geometry, settings, starts, target_end, padded):
+    arrival_unobserved = 0
     if padded:
         context_counts, target_counts = window_observation_counts(
             local["values"], starts, geometry["context"], geometry["horizon"], target_end,
@@ -183,18 +198,11 @@ def training_view(artifact: dict, geometry: dict, settings, round_number: int | 
                 & (target_counts >= geometry.get("min_target_observed", 1)))
         arrival_unobserved = int((~keep).sum())
         starts = starts[keep]
-    local["train_target_end"] = np.array(target_end)
-    local["train_starts"] = starts
+    local = local | {"train_target_end": np.array(target_end), "train_starts": starts}
     dataset = filter_training_windows(WindowDataset(
         local, "train", geometry["context"], geometry["horizon"], allow_empty=True,
     ), settings)
-    dataset.available_through = cutoff
-    dataset.arrival_lower = lower
-    dataset.timestamps = local["timestamps"]
-    dataset.monitoring_excluded_windows = monitoring_excluded
-    dataset.monitoring_interval = bounds
-    dataset.arrival_unobserved_windows = arrival_unobserved
-    return dataset
+    return dataset, arrival_unobserved
 
 
 def arrival_metrics(dataset) -> dict:
@@ -203,14 +211,15 @@ def arrival_metrics(dataset) -> dict:
         "availability-excluded-windows": dataset.availability_excluded_windows,
         "minimum-context-observed": dataset.availability_minima[0],
         "minimum-target-observed": dataset.availability_minima[1],
-        "monitoring-excluded-windows": dataset.monitoring_excluded_windows,
+        "round-validation-windows": len(dataset.round_validation_starts),
+        "round-validation-excluded-windows": dataset.round_validation_excluded_windows,
         "arrival-unobserved-windows": dataset.arrival_unobserved_windows,
     }
     if dataset.available_through is not None:
         metrics["available-through-ns"] = dataset.available_through.value
-        if dataset.monitoring_interval is not None:
-            start, end = dataset.monitoring_interval
-            metrics.update({"monitoring-from-ns": start.value, "monitoring-through-ns": end.value})
+        if dataset.round_validation_interval is not None:
+            start, end = dataset.round_validation_interval
+            metrics.update({"round-validation-from-ns": start.value, "round-validation-through-ns": end.value})
         if dataset.arrival_lower is not None:
             metrics["available-from-ns"] = dataset.arrival_lower.value
     return metrics

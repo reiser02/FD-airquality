@@ -24,7 +24,7 @@ En federado se sortea solo del bloque autorizado de la ronda; en local, del
 entrenamiento autorizado del fold. En centralizado se aplica la cuota por estación
 y luego se mezclan las selecciones en los lotes. El orden de operaciones es:
 
-1. Corte de llegada y exclusión de la reserva de monitorización.
+1. Corte de llegada y exclusión del conjunto de validación de la ronda.
 2. Mínimos de observaciones y umbrales de disponibilidad del modelo.
 3. Sorteo sin reemplazo de hasta `max-train-windows` distintas por estación.
 4. Formación de batches (`batch-size`). Con `pad-last-batch=0` el último lote
@@ -114,9 +114,8 @@ se alteran. Las preparaciones de esquemas anteriores no se reinterpretan con pad
 
 El padding es **solo de entrenamiento**. Validación, test, sus máscaras y sus firmas
 de evaluación no cambian. En federado no se supervisan targets anteriores al
-bloque, posteriores al corte ni de la reserva de monitorización. La primera ronda
-puede completar un horizonte con posiciones enmascaradas antes de esa reserva;
-las siguientes hacen lo mismo en el extremo derecho de su bloque.
+bloque, posteriores al corte ni reservados para validación. El entrenamiento
+puede completar el horizonte con posiciones enmascaradas al final de su tramo.
 
 `padded-context-slots` y `padded-target-slots` cuentan posiciones virtuales en
 las ventanas distintas visitadas, una sola vez aunque se repitan en otras épocas
@@ -155,8 +154,9 @@ Una métrica indefinida en un fold no se elimina silenciosamente de su media
 simple: se registra el número de folds definidos y la media queda indefinida.
 Las semillas siguen siendo réplicas, no candidatos que seleccionar.
 
-La validación interna de **cada** fold sigue existiendo: monitoriza el ajuste
-y/o selecciona su checkpoint, no es un «fold de desarrollo» externo.
+La validación de **cada** fold sigue existiendo y permite seleccionar su
+checkpoint. En federado con llegadas se usa además la validación de cada
+ronda para el control de épocas locales.
 
 Para buscar configuraciones hay que solicitarlo:
 
@@ -195,10 +195,11 @@ lr-scheduler-patience = 2
 lr-scheduler-factor = 0.5
 min-learning-rate = 0.000001
 round-validation-hours = 24
-round-validation-max-hours = 336  # ampliación hacia atrás solo si falta cobertura
+round-validation-max-hours = 336  # ampliación solo dentro del mismo bloque
+round-validation-fallback-epochs = 10  # tope cuando no se puede separar la validación
 ```
 
-Tras cada época se monitoriza **MSE por targets originales observados, en
+Tras cada época se calcula en el conjunto de validación el **MSE por targets originales observados, en
 unidades físicas al cuadrado**. Se suman errores cuadrados y conteos; no se
 promedian medias de lotes ni se extrae la raíz. El cambio de MAE a MSE puede
 cambiar qué época se elige y cuándo se reduce el LR.
@@ -227,41 +228,41 @@ principal permite 40 en el ajuste inicial y hasta 20 en las rondas de llegada
 posteriores; el smoke de integración mantiene una sola. Para desactivar
 explícitamente ambos controles: `early-stopping=0` y `lr-scheduler="none"`.
 
-### Reserva causal para monitorizar rondas federadas
+### Conjunto de validación de cada ronda federada
 
 La validación completa del fold empieza **después** de su entrenamiento. No se
 puede consultar desde rondas anteriores sin adelantar información.
 
-Para el control local de épocas se reserva un intervalo fijo, anterior al corte
-de la primera ronda: las últimas `max(round-validation-hours, H)` horas de ese
-prefijo. Si no contienen una ventana de monitorización admisible y se configura
-`round-validation-max-hours`, se busca la más reciente antes de la primera
-llegada, dentro de ese límite. La reserva ampliada se fija para toda la
-ejecución de esa estación y nunca toma observaciones futuras. Por ejemplo:
+Se reservan las últimas `max(round-validation-hours, H)` horas del bloque
+disponible en cada ronda: del histórico inicial en la primera y del bloque
+nuevo en las siguientes. Si faltan ventanas de validación, se puede ampliar el
+tramo hacia atrás hasta `round-validation-max-hours`, sin salir del propio
+bloque. Por ejemplo, con bloques de diez días y validación de 24 horas:
 
 ```text
-Primera llegada: antes del 7 de enero
-  ajuste inicial: targets anteriores al 6 de enero
-  monitorización: targets del [6 de enero, 7 de enero)
-
-Ronda 2: ajustar solo [7 de enero, 8 de enero), monitorizar la reserva ya conocida
-Ronda 3: ajustar solo [8 de enero, 9 de enero), monitorizar la misma reserva
+Ronda 1 (corte: 7 de enero): ajustar hasta el 6 de enero; validar [6, 7).
+Ronda 2 (corte: 17 de enero): ajustar [7, 16); validar [16, 17).
+Ronda 3 (corte: 27 de enero): ajustar [17, 26); validar [26, 27).
 ```
 
-Los targets de la reserva nunca aportan gradientes de pronóstico, ni se ajusta
-con ellos el scaler fijo. En rondas posteriores, el autoencoder solo usa como
+Los targets reservados no aportan gradientes de pronóstico. El escalador fijo,
+si se usa, se ajusta con el histórico de la primera ronda previo a su
+validación y se conserva. En rondas posteriores, el autoencoder solo usa como
 etiquetas de reconstrucción las lecturas del bloque nuevo. Las lecturas
 antiguas y las de la reserva pueden aparecer como entradas conocidas, no como
 objetivos de entrenamiento.
 
-Si no existe una reserva con verdad observada, se informa el error: no se
-sustituye por validación futura ni por pérdida de entrenamiento. La validación
-completa del fold se mantiene al final del flujo federado; la evaluación externa
-mantiene los pesos fijos. La reserva, los mejores pesos y todos los controles
-reinician entre folds.
+Si una estación no puede separar ventanas válidas de entrenamiento y validación,
+sus ventanas admisibles del bloque se usan para entrenar. Un gateway reúne la
+validación de las estaciones activas que sí pueden separarla. Si el cliente
+(estación o gateway) queda sin validación pero tiene datos de entrenamiento,
+usa el menor entre las épocas previstas y `round-validation-fallback-epochs`,
+sin parada temprana ni scheduler. Sin ventanas de entrenamiento, queda inactivo.
+La validación completa del fold se mantiene al final del flujo federado.
 
-La auditoría local (`station_metrics.csv`, `round_metrics.csv` y logs) conserva
-los diagnósticos de épocas, paradas, LR y `training-validation-mse`.
+La auditoría local conserva los límites y el número de ventanas de validación
+por estación, el indicador `round-validation-fallback` por cliente y los
+diagnósticos de épocas, paradas, LR y `training-validation-mse`.
 `num-targets` usado para agregar clientes mide el soporte medio por época; un
 cliente no gana peso por ejecutar más épocas o completar un lote corto.
 
@@ -273,7 +274,7 @@ omisiones**, incluidos los checkpoints reales. La
 La integración completó **48 ejecuciones acotadas en CPU** en los modos local,
 centralizado y federado, con Flower/Ray en las federaciones. Se reprodujeron los
 sorteos con sus semillas y se verificaron el soporte observado, los límites de
-cada ronda y la exclusión de la reserva de monitorización.
+cada ronda y la exclusión del conjunto de validación.
 
 Con una cuota de 13 y lotes de 8, la primera ronda seleccionó 13 ventanas por
 estación en cada época y visitó **25–26 distintas en dos épocas**. Los dos lotes
@@ -291,7 +292,7 @@ Esa suite incluía:
 - Reemplazo sin inflar el soporte federado ni el límite de ventanas distintas.
 - Los tres modos de padding, ceros observados, ausencias originales, horizontes
   parciales y validación/test sin padding ni reemplazo.
-- Exclusión de targets futuros y de monitorización, bloques disjuntos,
+- Exclusión de targets futuros y de validación, bloques disjuntos,
   umbrales completos, protección de la reconstrucción e integridad del esquema 6.
 - Gradientes equivalentes con microbatches y checkpoints reales Granite con
   contextos casi vacíos, targets parciales y batches completados.

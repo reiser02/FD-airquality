@@ -23,6 +23,7 @@ from fd_airquality.run_logging import report_progress
 from fd_airquality.settings import RunSettings
 from fd_airquality.task import selection_value
 from fd_airquality.tracking import RunTracker
+from fd_airquality.training_control import controls_enabled
 
 
 def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> MetricRecord:
@@ -43,7 +44,8 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
             metrics["train-objective-normalized"] = sum(
                 record["train-objective-normalized"] * record["num-targets"] for record in records
             ) / total_targets
-    for key in ("candidate-windows", "availability-excluded-windows", "idle-client", "monitoring-excluded-windows",
+    for key in ("candidate-windows", "availability-excluded-windows", "idle-client", "round-validation-excluded-windows",
+                "round-validation-windows", "round-validation-fallback",
                 "arrival-unobserved-windows", "admissible-windows", "unique-training-windows",
                 "padded-context-slots", "padded-target-slots"):
         if all(key in record for record in records):
@@ -204,7 +206,6 @@ class AuditedStrategy(Strategy):
         self.gateway_history: list[dict] = []
         self.runtime_nodes: dict[int, int] = {}
         self.validation_support: dict[int, tuple[int, int]] = {}
-        self.monitoring_intervals: dict[int, tuple[int, int]] = {}
         self.trained_targets = 0
 
     def summary(self) -> None:
@@ -278,21 +279,35 @@ class AuditedStrategy(Strategy):
                                   dst_node_id=node, message_type=message.metadata.message_type))
         return result
 
-    def _check_monitoring_interval(self, metrics, geometry, server_round, partition) -> None:
-        bounds = round_validation_bounds(geometry, self.settings)
-        if bounds is None:
+    def _check_round_validation(self, metrics, geometry, server_round) -> None:
+        windows = metrics.get("round-validation-windows", 0)
+        lower, upper = metrics.get("round-validation-from-ns"), metrics.get("round-validation-through-ns")
+        if windows == 0 and lower is None and upper is None:
             return
-        start, end = bounds
-        earliest = min(start, end - pd.Timedelta(hours=self.settings.round_validation_max_hours))
-        if geometry.get("train_start"):
-            earliest = max(earliest, pd.Timestamp(geometry["train_start"]))
-        lower, upper = metrics.get("monitoring-from-ns"), metrics.get("monitoring-through-ns")
-        if type(lower) is not int or upper != end.value or not earliest.value <= lower <= start.value:
-            raise ValueError("La reserva de monitorización no respeta el histórico de la primera ronda.")
-        if self.monitoring_intervals.setdefault(partition, (lower, upper)) != (lower, upper):
-            raise ValueError("La reserva de monitorización cambió entre rondas.")
-        if server_round == 1 and metrics["num-examples"] and metrics["train-last-target-ns"] >= lower:
-            raise ValueError("El entrenamiento inicial utiliza targets de monitorización.")
+        nominal = round_validation_bounds(geometry, self.settings, server_round)
+        extended = round_validation_bounds(geometry, self.settings, server_round, allow_extension=True)
+        if (nominal is None or type(windows) is not int or windows < 1
+                or type(lower) is not int or type(upper) is not int or upper != nominal[1].value
+                or not extended[0].value <= lower <= nominal[0].value or not metrics["num-examples"]):
+            raise ValueError("El conjunto de validación no respeta el bloque de la ronda.")
+        if metrics["train-last-target-ns"] >= lower:
+            raise ValueError("El entrenamiento utiliza targets del conjunto de validación de la ronda.")
+
+    def _check_round_validation_budget(self, metrics, geometry, server_round) -> None:
+        if not metrics["num-examples"] or not controls_enabled(self.settings):
+            return
+        epochs = round_epoch_limit(geometry, self.settings, server_round)
+        if epochs == 1:
+            return
+        windows = metrics["round-validation-windows"]
+        if metrics["round-validation-fallback"] != int(not windows):
+            raise ValueError("El estado de validación no coincide con el soporte declarado.")
+        if windows:
+            if metrics.get("training-validation-windows") != windows:
+                raise ValueError("La evaluación de validación no usa el conjunto declarado.")
+        elif (metrics["epochs-completed"] != min(epochs, self.settings.round_validation_fallback_epochs)
+              or "training-validation-windows" in metrics):
+            raise ValueError("El cliente excede o no respeta el presupuesto sin validación.")
 
     def _check_panel(self, replies: Iterable[Message], split: str, server_round: int = 0) -> list[Message]:
         replies = list(replies)
@@ -310,6 +325,8 @@ class AuditedStrategy(Strategy):
                 self._check_station(metrics, partition, split, server_round)
                 if split == "train" and "admissible-windows" in metrics:
                     _check_training_sampling(metrics, self.settings, self.manifest["geometry"]["horizon"])
+                    if self.progressive:
+                        self._check_round_validation_budget(metrics, self.manifest["geometry"], server_round)
             else:
                 if self.runtime_nodes.get(reply.metadata.src_node_id) != partition:
                     raise ValueError(f"La identidad del nodo no coincide con el gateway {partition}.")
@@ -351,7 +368,7 @@ class AuditedStrategy(Strategy):
                     raise ValueError("Un target de entrenamiento aún no ha llegado.")
                 if lower is not None and first < lower.value:
                     raise ValueError("Un target de entrenamiento pertenece a un bloque anterior.")
-            self._check_monitoring_interval(metrics, geometry, server_round, partition)
+            self._check_round_validation(metrics, geometry, server_round)
         if any(not np.isfinite(value) for value in metrics.values()):
             raise ValueError("Una estación devolvió métricas no finitas.")
         if split == "train":
@@ -393,12 +410,14 @@ class AuditedStrategy(Strategy):
                         or row["num-targets"] != row["selected-target-occurrences"] / (epochs or 1)):
                     raise ValueError("Soporte local incompatible con las épocas del gateway.")
             for key in ("num-examples", "admissible-windows", "unique-training-windows",
-                        "selected-target-occurrences"):
+                        "selected-target-occurrences", "round-validation-windows"):
                 if metrics[key] != sum(row[key] for row in rows):
                     raise ValueError(f"La suma de las estaciones no coincide con el gateway: {key}.")
             if ("arrays" in content) != bool(metrics["num-examples"]):
                 raise ValueError("El gateway debe actualizar pesos solo cuando entrenó con datos.")
             _check_training_sampling(metrics, self.settings, self.manifest["geometry"]["horizon"])
+            if self.progressive:
+                self._check_round_validation_budget(metrics, self.manifest["geometry"], server_round)
 
     def _station_contents(self, replies: list[Message]) -> list[RecordDict]:
         if self.gateway_members is None:
@@ -473,16 +492,20 @@ class AuditedStrategy(Strategy):
             metrics = aggregate_training([reply.content for reply in replies], "num-examples")
             metrics.update(diagnostics)
         else:
-            if self.gateway_members is not None:
-                # Flower expects one metric record per update; station records are
-                # audited here and are only used for panel metrics.
-                projected = []
-                for reply in active:
-                    message = copy(reply)
-                    message.content = RecordDict({key: reply.content[key] for key in ("arrays", "metrics")})
-                    projected.append(message)
-                active = projected
-            arrays, _ = self.delegate.aggregate_train(server_round, active)
+            # Flower requires identical metric keys across replies. Validation
+            # diagnostics are optional; retain the full records for our audit,
+            # and send only the common metrics and model update to the delegate.
+            keys = set.intersection(*(set(reply.content["metrics"]) for reply in active))
+            projected = []
+            for reply in active:
+                message = copy(reply)
+                metrics = reply.content["metrics"]
+                message.content = RecordDict({
+                    "arrays": reply.content["arrays"],
+                    "metrics": MetricRecord({key: value for key, value in metrics.items() if key in keys}),
+                })
+                projected.append(message)
+            arrays, _ = self.delegate.aggregate_train(server_round, projected)
             metrics = aggregate_training([reply.content for reply in replies], "num-examples")
         if arrays is None or metrics is None:
             raise RuntimeError("Flower no produjo pesos agregados.")

@@ -102,8 +102,8 @@ scaler-type = "standard"  # identity | standard | robust | minmax
 - **`fixed`:** media/desviación por estación, solo sobre el prefijo observado
   disponible en la primera ronda **de cada fold**, limitado a su histórico
   autorizado. Se ajusta de nuevo en cada fold, sin heredar estadísticas del
-  anterior. Al activar el control de épocas se excluye también la reserva de
-  monitorización. Se registra un hash local de su referencia y estadísticas.
+  anterior. Si se separa un conjunto de validación en la primera ronda, se
+  excluye del ajuste del escalador. Se registra un hash local de su referencia y estadísticas.
   `normalization-reference-end` permite fijar un extremo explícito, nunca
   posterior a la primera llegada ni fuera del historial de ajuste.
 - **`none`:** sin escalado externo ni temporal adicional.
@@ -312,7 +312,8 @@ Nunca se retrocede a targets del bloque anterior. Un bloque más corto que el
 horizonte puede aportar una ventana parcial si alcanza los mínimos observados;
 si no los alcanza queda sin ventanas. No se borran timestamps ni se añaden
 etiquetas artificiales. El dataset se trunca físicamente al prefijo llegado y
-el extremo autorizado de targets puede ser aún anterior si hay monitorización.
+el extremo autorizado de targets puede ser aún anterior si se separa
+un conjunto de validación en la ronda.
 
 No existe un selector de histórico dentro del fold. Se han eliminado
 `arrival-history` y `arrival-history-hours` de Python, CLI, TOML y Flower.
@@ -509,7 +510,7 @@ externo. Informe: `reports/epoch_window_sampling_validation.json`.
 **674 pruebas aprobadas, cero fallos y cero omisiones**, con checkpoints reales
 habilitados. JUnit: `reports/window_sampling_padding_tests.xml`. Se comprueban
 reemplazo de lotes cortos, preservación del soporte federado, los tres modos de
-padding, límites de llegada/monitorización, esquema 6, evaluación sin padding y
+padding, límites de llegada y validación de la ronda, esquema 6, evaluación sin padding y
 los tres backbones Granite con targets parciales. Los detalles y la reproducción
 están en [TRAINING_CONTROLS.md](TRAINING_CONTROLS.md).
 La integración CLI completó **48 casos reales acotados** con padding activado y
