@@ -12,10 +12,15 @@ import numpy as np
 import pandas as pd
 
 from fd_airquality.artifacts import create_run_dir, file_digest
-from fd_airquality.data import DataConfig, _source_files, prepare, read_manifest
+from fd_airquality.data import DataConfig, _source_files, prepare, preprocess_station, read_manifest
 from fd_airquality.execution import execute_plan
 from fd_airquality.lightweight import STATION_CONTROLS
-from fd_airquality.loaders import load_pollutant_file, normalize_pollutant
+from fd_airquality.loaders import (
+    MompeanReference,
+    load_mompean,
+    load_pollutant_file,
+    normalize_pollutant,
+)
 from fd_airquality.models import (
     GRANITE,
     MODEL_NAMES,
@@ -24,7 +29,7 @@ from fd_airquality.models import (
     validate_run_mode,
 )
 from fd_airquality.panels import EXCLUSION_COLUMNS, prepare_runtime_panel, selection_exclusions
-from fd_airquality.preprocessing import preprocess
+from fd_airquality.preprocessing import QUALITY_EXCLUSION_COLUMNS, TFG_SOURCE, quality_policy
 from fd_airquality.quality import evaluation_identity
 from fd_airquality.run_logging import RunLogging, report_progress
 from fd_airquality.settings import RunSettings
@@ -73,25 +78,23 @@ def _block_cuts(start: pd.Timestamp, end: pd.Timestamp, folds: int,
 
 
 def _observed_calendar(raw_root: Path, pollutant: str, config: DataConfig,
-                        stations: set[str] | None) -> list[tuple[pd.Timestamp, pd.Timestamp]]:
+                       stations: set[str] | None, reference: MompeanReference | None
+                       ) -> tuple[list[tuple[pd.Timestamp, pd.Timestamp]], list[dict]]:
     files = _source_files(raw_root, pollutant, stations)
     if not files:
         raise FileNotFoundError(f"No hay CSV de {pollutant} bajo {raw_root} para las estaciones elegidas.")
     if stations and (missing := stations - {path.parent.name for path in files}):
         raise ValueError(f"Estaciones sin CSV de {pollutant}: {sorted(missing)}")
     report_progress("calendar", f"Analizando {len(files)} CSV de {pollutant} para detectar horas observadas.")
-    bounds = []
+    bounds, exclusions = [], []
     for path in files:
         loaded = load_pollutant_file(str(path), pollutant, grid_tolerance_seconds=config.grid_tolerance_seconds,
                                      upct_valid_flags=config.upct_valid_flags)
         if loaded is None:
             continue
-        _, raw = loaded
-        (hourly,), _ = preprocess(
-            [raw], pollutant, min_run=config.min_run, min_useful=config.min_useful,
-            zero_run_hours=config.zero_run_hours, quality_mode=config.quality_mode,
-            hourly_repeat_filter=config.hourly_repeat_filter,
-        )
+        station, raw = loaded
+        hourly, _, removed = preprocess_station(raw, station, pollutant, config, reference)
+        exclusions.extend(removed)
         observed = hourly.index[np.isfinite(hourly.iloc[:, 0])]
         if len(observed):
             bounds.append((observed[0], observed[-1] + _HOUR))
@@ -103,7 +106,7 @@ def _observed_calendar(raw_root: Path, pollutant: str, config: DataConfig,
         message = "No hay horas observadas tras el filtrado para preparar el backtest."
         LOGGER.critical("stage=calendar %s", message)
         raise ValueError(message)
-    return bounds
+    return bounds, exclusions
 
 
 def fold_configurations(config: DataConfig, folds: int, *,
@@ -216,7 +219,11 @@ def prepare_backtest(raw_root: Path, output: Path, pollutant: str, config: DataC
     selection = "all" if stations is None else "subset"
     report_progress("panel", f"Mínimo de estaciones comunes: {minimum} "
                     f"({'todas las estaciones' if stations is None else 'selección explícita de estaciones'}).")
-    bounds = _observed_calendar(raw_root, pollutant, config, stations)
+    reference = load_mompean(config.mompean_csv) if config.mompean_csv else None
+    policy = quality_policy(config.exclude_may_june_2026, reference)
+    if policy:
+        LOGGER.warning("%s Reglas activas: %s.", TFG_SOURCE, ", ".join(policy))
+    bounds, exclusions = _observed_calendar(raw_root, pollutant, config, stations, reference)
     _require_panel_size(
         len(bounds), minimum, stage="calendar",
         detail="Estaciones con datos observados antes de preparar los folds. "
@@ -231,6 +238,12 @@ def prepare_backtest(raw_root: Path, output: Path, pollutant: str, config: DataC
                     f"validación {calendar['validation_hours']}/{validation_hours} h y "
                     f"test {calendar['test_hours']}/{test_hours} h por fold (efectivo/solicitado)")
     root = create_run_dir(output.resolve(), f"{pollutant}_{datetime.now(UTC):%Y%m%d_%H%M%S}")
+    if policy:
+        audit_path = root / "quality_exclusions.csv"
+        pd.DataFrame(exclusions, columns=QUALITY_EXCLUSION_COLUMNS).to_csv(audit_path, index=False)
+        policy["report"] = audit_path.name
+        policy["removed_hours"] = sum(row["removed_hours"] for row in exclusions)
+        report_progress("quality", f"{policy['removed_hours']} horas-estación anuladas; detalle={audit_path}.")
     entries = []
     shared_stations: set[str] | None = None
     calendar_start = pd.Timestamp(calendar["calendar_start"])
@@ -244,7 +257,8 @@ def prepare_backtest(raw_root: Path, output: Path, pollutant: str, config: DataC
             f"test [{geometry.test_start}, {geometry.test_end}) ({geometry.test_hours} h)",
         )
         try:
-            path = prepare(raw_root, root / f"fold_{index + 1:03d}", pollutant, geometry, stations)
+            path = prepare(raw_root, root / f"fold_{index + 1:03d}", pollutant, geometry, stations,
+                           reference=reference)
         except (ValueError, FileNotFoundError) as exc:
             LOGGER.critical("stage=prepare-fold %s No se pudo preparar el fold: %s", label, exc)
             raise
@@ -270,7 +284,8 @@ def prepare_backtest(raw_root: Path, output: Path, pollutant: str, config: DataC
                                 "train_history": train_history,
                                 "min_stations": minimum, "station_selection": selection,
                                 "requested_validation_hours": validation_hours, "requested_test_hours": test_hours,
-                                **calendar, "folds": entries,
+                                 **calendar, "folds": entries,
+                                 **({"external_quality": policy} if policy else {}),
                                 "final_holdout_fold": None, "potential_holdout_fold": folds,
                                 "note": "Simulación retrospectiva. El último fold solo se reserva al solicitar development/final."},
                                indent=2, allow_nan=False) + "\n", encoding="utf-8")

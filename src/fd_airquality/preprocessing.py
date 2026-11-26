@@ -2,15 +2,104 @@
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import numpy as np
 import pandas as pd
 
-from fd_airquality.loaders import POLLUTANT, normalize_pollutant
+from fd_airquality.loaders import POLLUTANT, MompeanReference, normalize_pollutant
 
 DETECTION_LIMITS = {POLLUTANT: 0.0}
 MIN_RUN = 6
 MIN_USEFUL = 1
 ZERO_RUN_HOURS = 24
+
+# TFG_NO_PUBLICADO: Mario Sáez (UPCT), clasificación por correlación y nivel e
+# incidencia PM de mayo–junio. Sustituir esta atribución al publicarse el TFG.
+TFG_SOURCE = "TFG_NO_PUBLICADO: Mario Sáez (UPCT). PENDIENTE: sustituir por la cita publicada."
+INCIDENT_START = pd.Timestamp("2026-05-08 22:00")
+INCIDENT_END = pd.Timestamp("2026-06-12 01:00")
+REFERENCE_DAYS = 28
+REFERENCE_MIN_PAIRS = 168
+REFERENCE_MIN_PEARSON = 0.30
+# The TFG's 0.15 is relative to the low-cost network, whose typical PM2.5
+# level is about 0.5 times Mompeán's. Keep the threshold on the reference scale.
+REFERENCE_MIN_LEVEL_RATIO = 0.15 * 0.5
+INCIDENT_FLAG = 64
+REFERENCE_PEARSON_FLAG = 128
+REFERENCE_LEVEL_FLAG = 256
+QUALITY_EXCLUSION_COLUMNS = ["station", "start_utc", "end_utc_exclusive", "removed_hours",
+                             "reason", "paired_hours_at_start", "pearson_at_start", "level_ratio_at_start"]
+
+
+def quality_policy(exclude_incident: bool, reference: MompeanReference | None) -> dict:
+    policy = {}
+    if exclude_incident:
+        policy["incident"] = {"start_utc": str(INCIDENT_START), "end_utc_exclusive": str(INCIDENT_END)}
+    if reference is not None:
+        policy["mompean"] = {
+            "path": str(reference.path), "sha256": reference.sha256,
+            "interval_label": "Europe/Madrid end-of-hour, converted to UTC start-of-hour",
+            "lookback_days": REFERENCE_DAYS, "min_paired_hours": REFERENCE_MIN_PAIRS,
+            "min_pearson": REFERENCE_MIN_PEARSON, "min_level_ratio": REFERENCE_MIN_LEVEL_RATIO,
+        }
+    return policy
+
+
+def apply_quality_filters(
+    hourly: pd.DataFrame, station: str, *, exclude_incident: bool, reference: MompeanReference | None,
+) -> list[dict]:
+    """Mask observed hours in place, using the reference available at hour close."""
+    if station == f"UPCT_{POLLUTANT}" or (not exclude_incident and reference is None):
+        return []
+    values = hourly.iloc[:, 0]
+    observed = values.notna()
+    flags = hourly.attrs["quality_flags"].copy()
+    removed = np.zeros(len(values), dtype=np.uint16)
+    incident = observed & (values.index >= INCIDENT_START) & (values.index < INCIDENT_END)
+    if exclude_incident:
+        removed[incident.to_numpy()] |= INCIDENT_FLAG
+    eligible = observed & (removed == 0)
+    support = 0
+    pairs = pearson = ratio = pd.Series(np.nan, index=values.index)
+    if reference is not None:
+        x = values.mask(removed != 0)
+        y = reference.values.reindex(values.index).where(x.notna())
+        x = x.where(y.notna())
+        window = pd.Timedelta(days=REFERENCE_DAYS)
+        x_window = x.rolling(window, min_periods=REFERENCE_MIN_PAIRS)
+        y_window = y.rolling(window, min_periods=REFERENCE_MIN_PAIRS)
+        pairs = x.notna().rolling(window).sum()
+        support = int((eligible & pairs.ge(REFERENCE_MIN_PAIRS)).sum())
+        x_min, x_max = x_window.min(), x_window.max()
+        y_varies = y_window.min().lt(y_window.max())
+        pearson = x_window.corr(y).where(x_min.lt(x_max) & y_varies)
+        y_median = y_window.median()
+        ratio = x_window.median().div(y_median.where(y_median.gt(0)))
+        constant = x_min.eq(x_max) & y_varies
+        removed[(eligible & (pearson.lt(REFERENCE_MIN_PEARSON) | constant)).to_numpy()] |= REFERENCE_PEARSON_FLAG
+        removed[(eligible & ratio.lt(REFERENCE_MIN_LEVEL_RATIO)).to_numpy()] |= REFERENCE_LEVEL_FLAG
+    masked = removed != 0
+    hourly.loc[masked, hourly.columns[0]] = np.nan
+    hourly.attrs["quality_flags"] = flags | removed
+    hourly.attrs["quality_counts"] |= {
+        "incident_removed_hours": int(((removed & INCIDENT_FLAG) != 0).sum()),
+        "mompean_pearson_removed_hours": int(((removed & REFERENCE_PEARSON_FLAG) != 0).sum()),
+        "mompean_level_removed_hours": int(((removed & REFERENCE_LEVEL_FLAG) != 0).sum()),
+        "mompean_supported_hours": support,
+        "external_quality_removed_hours": int(masked.sum()),
+    }
+    reasons = {INCIDENT_FLAG: "may_june_2026_incident", REFERENCE_PEARSON_FLAG: "mompean_pearson",
+               REFERENCE_LEVEL_FLAG: "mompean_level",
+               REFERENCE_PEARSON_FLAG | REFERENCE_LEVEL_FLAG: "mompean_pearson+level"}
+    edges = np.flatnonzero(np.r_[True, removed[1:] != removed[:-1], True])
+    return [
+        {"station": station, "start_utc": values.index[start],
+         "end_utc_exclusive": values.index[end - 1] + pd.Timedelta(hours=1), "removed_hours": int(end - start),
+         "reason": reasons[removed[start]], "paired_hours_at_start": pairs.iloc[start],
+         "pearson_at_start": pearson.iloc[start], "level_ratio_at_start": ratio.iloc[start]}
+        for start, end in pairwise(edges) if start < len(removed) and removed[start]
+    ]
 
 
 def ensure_datetime_series(series: pd.Series, freq: str, name: str) -> pd.Series:

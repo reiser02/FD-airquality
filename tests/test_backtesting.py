@@ -148,9 +148,9 @@ def test_preparation_requires_enough_stations_in_common(
     raw, geometry = temporal_family
     selected = {"fold_001": first, "fold_002": {"station-b"}}
 
-    def prepare_disjoint(raw_root, output, pollutant, config, stations):
+    def prepare_disjoint(raw_root, output, pollutant, config, stations, *, reference):
         assert output.name in selected, "Debe abortar antes de preparar el tercer fold"
-        return prepare(raw_root, output, pollutant, config, selected[output.name])
+        return prepare(raw_root, output, pollutant, config, selected[output.name], reference=reference)
 
     monkeypatch.setattr("fd_airquality.backtesting.prepare", prepare_disjoint)
     output = tmp_path / "prepared"

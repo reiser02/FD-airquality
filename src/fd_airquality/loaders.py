@@ -5,12 +5,47 @@ from __future__ import annotations
 import logging
 import math
 import re
+from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 POLLUTANT = "PM25"
+
+
+@dataclass(frozen=True)
+class MompeanReference:
+    path: Path
+    sha256: str
+    values: pd.Series
+
+
+def load_mompean(path: str) -> MompeanReference:
+    source = Path(path).expanduser().resolve()
+    try:
+        content = source.read_bytes()
+    except FileNotFoundError as exc:
+        raise FileNotFoundError(
+            f"No existe el CSV de Mompeán: {source}. Descárgalo con python -m fd_airquality.fetch_mompean."
+        ) from exc
+    frame = pd.read_csv(BytesIO(content), usecols=["fecha", POLLUTANT])
+    index = pd.DatetimeIndex(pd.to_datetime(frame["fecha"], errors="raise", format="%Y-%m-%d %H:%M:%S"))
+    if (index.tz is not None or index.hasnans or not index.is_unique or not index.equals(index.floor("h"))):
+        raise ValueError("Mompeán debe tener marcas horarias únicas en hora civil de Madrid, sin zona.")
+    # CARM labels the end of each hourly interval. Convert before subtracting
+    # one elapsed hour; a naive ambiguous/nonexistent DST label cannot be paired.
+    index = index.tz_localize("Europe/Madrid", ambiguous="NaT", nonexistent="NaT").tz_convert("UTC")
+    index = (index - pd.Timedelta(hours=1)).tz_localize(None)
+    values = pd.to_numeric(frame[POLLUTANT], errors="coerce").to_numpy(dtype=float)
+    series = pd.Series(values, index=index).loc[~index.isna()].sort_index()
+    series = series.where(np.isfinite(series) & series.ge(0)).dropna()
+    if series.empty:
+        raise ValueError("El CSV de Mompeán no contiene observaciones utilizables de PM2.5.")
+    return MompeanReference(source, sha256(content).hexdigest(), series)
 
 
 def normalize_pollutant(pollutant: str) -> str:

@@ -17,7 +17,8 @@ El único contaminante admitido es PM2.5 (`PM25`). Cada CSV de PM25 de una estac
 un cliente, sin mezclar estaciones ni sus calendarios. Los datos se leen de una
 copia física local en `data/raw/datos_estaciones_5m/`; las preparaciones se escriben
 sin alterar esos CSV. No se necesitan código, configuración ni datos de otro
-repositorio. `--raw-root` permite elegir otra fuente explícitamente.
+repositorio. `--raw-root` permite elegir otra fuente explícitamente. Para el
+control de calidad externo actual, véase [README.md](README.md#datos-brutos-y-control-de-calidad-externo).
 
 `fd_airquality.data` coordina las siguientes implementaciones locales:
 

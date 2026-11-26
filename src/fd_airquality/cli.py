@@ -47,7 +47,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     temporal_data.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"))
     temporal_data.add_argument("--output", type=Path, default=Path("data/backtests"))
     temporal_data.add_argument("--pollutant", choices=[POLLUTANT, POLLUTANT.lower()], default=POLLUTANT,
-                               help="Único contaminante admitido: PM25 (PM2.5).")
+                               help="Único contaminante de modelado: PM25 (PM2.5).")
     temporal_data.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
     defaults = DataConfig()
     for field in fields(DataConfig):
@@ -61,6 +61,12 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
                        "help": "Padding solo de entrenamiento: none lo desactiva; right a la derecha; both también a la izquierda."}
         elif field.name == "max_train_windows":
             options = {"help": "Presupuesto de ventanas distintas por estación y época; se sortea del conjunto admisible."}
+        elif field.name == "mompean_csv":
+            options = {"help": "CSV horario de CARM para aplicar el filtro de Pearson y nivel; vacío lo desactiva."}
+        elif field.name == "exclude_may_june_2026":
+            temporal_data.add_argument(flag, action=argparse.BooleanOptionalAction,
+                                       help="Anular el incidente de mayo–junio de 2026 de la red low-cost.")
+            continue
         temporal_data.add_argument(flag, type=type(value) if value is not None else int, **options)
     temporal_data.add_argument("--heartbeat-seconds", type=float, default=60.0)
     temporal_data.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
@@ -338,6 +344,8 @@ def _inspect(path: Path) -> None:
                   f"test {document['test_hours']}/{document['requested_test_hours']} h (efectivo/solicitado)")
         if "min_stations" in document:
             print(f"  Mínimo de estaciones comunes: {document['min_stations']}")
+        if quality := document.get("external_quality"):
+            print(f"  Horas-estación anuladas: {quality['removed_hours']}; detalle: {path.parent / quality['report']}")
         for entry in document["folds"]:
             validation, test, end = (entry[key] for key in ("validation_start", "test_start", "test_end"))
             block = f"bloque [{block_start}, {end}); " if block_start is not None else ""

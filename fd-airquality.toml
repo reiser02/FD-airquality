@@ -79,6 +79,10 @@ upct-valid-flags = ""
 # Horas observadas con media cero acumuladas antes de marcarlas como congeladas.
 # Las horas ausentes pausan el contador; una hora no nula lo reinicia.
 zero-run-hours = 24
+# TFG_NO_PUBLICADO: Mario Sáez (UPCT). Sustituir por la cita publicada al estar disponible.
+exclude-may-june-2026 = true
+# Una ruta vacía desactiva el filtro causal por Pearson y nivel frente a Mompeán.
+mompean-csv = "data/raw/mompean/mompean_horario.csv"
 # INFO muestra el reparto; DEBUG añade detalles por estación.
 # log-level = "INFO"
 # heartbeat-seconds = 60.0

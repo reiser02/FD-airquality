@@ -20,8 +20,8 @@ inicial; solo se mantiene aprendizaje entre rondas dentro del fold federado.
 
 ## Ejecutar
 
-Requiere Python 3.11, `uv` y los datos de cinco minutos bajo
-`data/raw/datos_estaciones_5m/` (un subdirectorio por estación).
+Requiere Python 3.11, `uv`, los datos de cinco minutos bajo
+`data/raw/datos_estaciones_5m/` y la [referencia horaria de Mompeán](#datos-brutos-y-control-de-calidad-externo).
 
 ```bash
 uv sync --locked
@@ -42,10 +42,11 @@ Ejecuta los comandos desde la raíz de este repositorio. La CLI carga automátic
 [`fd-airquality.toml`](fd-airquality.toml): PM2.5, contexto común de **90 horas**, horizonte
 de 12 y ventanas cada **4 horas** en entrenamiento y evaluación. `prepare-backtest` calcula el calendario a
 partir de los CSV, incluso con un solo fold. Los extremos derechos son exclusivos.
-Se conserva el calendario sin zona de los CSV, sin presumir que sea UTC.
+Los CSV municipales de `airquality.data.fetch` guardan marcas UTC sin zona.
 
-`PM25` es el único contaminante admitido; también se acepta `pm25` en CLI y TOML.
-Se leen únicamente los CSV de PM25, sin modificar los archivos de otros contaminantes.
+`PM25` es el único contaminante del modelado; también se acepta `pm25` en CLI y TOML.
+La descarga municipal incluye PM2.5 y PM10; el segundo sirve para contrastar
+incidencias entre canales. La preparación conserva intactos los CSV brutos.
 Los manifests históricos de otros contaminantes no se usan para nuevas ejecuciones:
 vuelve a ejecutar `prepare-backtest` para generar los de PM25.
 
@@ -186,6 +187,52 @@ desactivar el padding, añadirlo a la derecha o a ambos extremos. El TOML princi
 activa `both`; para desactivarlo, usa `window-padding = "none"` y prepara de nuevo.
 No cambia las etiquetas ni las ventanas de evaluación.
 Consulta `uv run fd-airquality prepare-backtest --help` y `uv run fd-airquality simulate --help`.
+
+### Datos brutos y control de calidad externo
+
+La red municipal se actualiza con el [`fetch` de `reiser02/airquality`](https://github.com/reiser02/airquality/blob/bc594580197ab63e6edf531e91e582ea7c0656da/src/airquality/data/fetch.py):
+
+```bash
+# Ejecutar desde una copia de reiser02/airquality. Descargar a una carpeta de verificación.
+TZ=UTC uv run python -m airquality.data.fetch --query 5min --pollutants PM25 PM10 \
+  --start-date 2022-12-31T23:00:00+00:00 --output-dir /ruta/descarga-cartagena
+```
+
+Al actualizar `data/raw/datos_estaciones_5m/`, recorta cada CSV nuevo al inicio
+del anterior y sustituye solo si, hasta el final anterior, coinciden exactamente
+las marcas, las ausencias y los valores. Conserva los ficheros que el servidor
+no extienda o devuelva con un histórico diferente.
+
+La referencia se descarga desde el portal oficial de la CARM:
+
+```bash
+uv run python -m fd_airquality.fetch_mompean --desde 2024-01-01 --hasta AAAA-MM-DD
+```
+
+**`TFG_NO_PUBLICADO` — Mario Sáez (UPCT). Pendiente de sustituir por la cita
+publicada.** Del TFG proceden las ideas del descarte de mayo–junio, Pearson y
+el cociente de niveles. La preparación muestra el recordatorio en consola y en
+`prepare.log`.
+
+Con el TOML raíz, las reglas se aplican a la red municipal antes de crear ventanas:
+
+- **Incidente conocido:** se anulan las horas que empiezan en
+  `[2026-05-08 22:00, 2026-06-12 01:00)` UTC. La exclusión fija es retrospectiva.
+- **Mompeán:** se convierte la hora civil publicada de fin de intervalo a UTC y se
+  resta una hora. Se omiten las marcas ambiguas o inexistentes del cambio de hora.
+  Para cada hora se usan los últimos 28 días hasta esa hora, con al menos 168
+  pares observados y excluyendo el incidente. Se anula la hora si Pearson es
+  menor que `0,30` (o la estación es constante y Mompeán varía), o si el cociente
+  de medianas sobre los mismos pares es menor que `0,075`, adaptación del
+  `0,15` del TFG al nivel típico de la red low-cost frente a Mompeán (`0,5`).
+  La regla supone que la hora de referencia completada está disponible al
+  emitir el siguiente pronóstico; el portal no aporta tiempos de publicación.
+
+Las exclusiones son `NaN` en contexto y objetivos. Mompeán no entra al modelo ni
+rellena huecos. `quality_exclusions.csv` da intervalos y motivos; `stations.csv`
+da recuentos. Los bits de `quality_flags` en el NPZ son `64` para el incidente,
+`128` para Pearson y `256` para nivel. Para desactivar una regla en una
+comparación, usa `--no-exclude-may-june-2026` o `--mompean-csv ""`.
 
 ## Comparar modelos con y sin federación
 
@@ -678,7 +725,8 @@ usa los archivos locales. Los logs detallados de actores Ray se conservan localm
 
 `prepare-backtest` crea una familia nueva bajo `data/backtests/`, con un
 `backtest_manifest.json` que apunta a los manifests de cada fold. La familia
-guarda `prepare.log` al ejecutar la CLI. Cada fold guarda:
+guarda `prepare.log` al ejecutar la CLI y `quality_exclusions.csv` si el
+control de calidad externo está activo. Cada fold guarda:
 
 - `manifest.json`: identidad, protocolo, hashes y metadatos de cada cliente; sin mediciones ni escaladores.
 - `clients/000/series.npz`, etc.: serie e índices de ventanas **locales** a cada estación.

@@ -17,12 +17,20 @@ from torch.utils.data import Dataset
 
 from fd_airquality.artifacts import create_run_dir, file_digest, source_fingerprints
 from fd_airquality.loaders import (
+    MompeanReference,
     filename_matches_pollutant,
+    load_mompean,
     load_pollutant_file,
     normalize_pollutant,
 )
 from fd_airquality.metrics import effective_error_scales, seasonal_error_scales
-from fd_airquality.preprocessing import ensure_datetime_series, observed_blocks, preprocess
+from fd_airquality.preprocessing import (
+    apply_quality_filters,
+    ensure_datetime_series,
+    observed_blocks,
+    preprocess,
+    quality_policy,
+)
 from fd_airquality.quality import coverage_rows, evaluation_identity, target_signature
 from fd_airquality.splitting import (
     global_window_starts,
@@ -67,6 +75,8 @@ class DataConfig:
     upct_valid_flags: str = ""
     train_start: str = ""
     window_padding: str = "none"
+    exclude_may_june_2026: bool = False
+    mompean_csv: str = ""
 
     def __post_init__(self) -> None:
         if any(
@@ -75,6 +85,7 @@ class DataConfig:
                 "split_mode", "quality_mode", "validation_start", "test_start", "test_end",
                 "window_policy", "error_scale_policy", "error_scale_epsilon", "hourly_repeat_filter",
                 "grid_tolerance_seconds", "upct_valid_flags", "train_start", "error_scale_reference", "window_padding",
+                "exclude_may_june_2026", "mompean_csv",
             }
         ):
             raise ValueError("Todas las longitudes y mínimos deben ser enteros positivos.")
@@ -97,6 +108,8 @@ class DataConfig:
             raise ValueError("grid_tolerance_seconds debe estar entre 0 y 149.")
         if self.min_useful > 12:
             raise ValueError("min_useful no puede superar las doce lecturas horarias.")
+        if type(self.exclude_may_june_2026) is not bool or not isinstance(self.mompean_csv, str):
+            raise ValueError("exclude_may_june_2026 debe ser booleano y mompean_csv una ruta de texto.")
         for name in ("train_start",):
             value = getattr(self, name)
             if value:
@@ -273,8 +286,20 @@ def _source_files(root: Path, pollutant: str, stations: set[str] | None) -> list
 
 
 def window_target_count(values: np.ndarray, starts: np.ndarray, context: int, horizon: int,
-                        target_end: int | None = None) -> int:
+                         target_end: int | None = None) -> int:
     return int(window_observation_counts(values, starts, context, horizon, target_end)[1].sum())
+
+
+def preprocess_station(raw: pd.DataFrame, station: str, pollutant: str, config: DataConfig,
+                       reference: MompeanReference | None) -> tuple[pd.DataFrame, int, list[dict]]:
+    (hourly,), (frozen,) = preprocess(
+        [raw], pollutant, min_run=config.min_run, min_useful=config.min_useful,
+        zero_run_hours=config.zero_run_hours, quality_mode=config.quality_mode,
+        hourly_repeat_filter=config.hourly_repeat_filter,
+    )
+    exclusions = apply_quality_filters(hourly, station, exclude_incident=config.exclude_may_june_2026,
+                                       reference=reference)
+    return hourly, frozen, exclusions
 
 
 def prepare(
@@ -283,9 +308,13 @@ def prepare(
     pollutant: str,
     config: DataConfig,
     stations: set[str] | None = None,
+    *,
+    reference: MompeanReference | None = None,
 ) -> Path:
-    """Prepare one local artifact per station and a metadata-only server manifest."""
+    """Write station-local artifacts for an already defined fold."""
     pollutant = normalize_pollutant(pollutant)
+    if reference is None and config.mompean_csv:
+        reference = load_mompean(config.mompean_csv)
     files = _source_files(raw_root, pollutant, stations)
     if not files:
         raise FileNotFoundError(f"No hay CSV de {pollutant} bajo {raw_root} para las estaciones elegidas.")
@@ -309,11 +338,7 @@ def prepare(
         if station in names:
             raise ValueError(f"Más de un CSV para el mismo cliente: {station}")
         names.add(station)
-        (hourly,), frozen = preprocess(
-            [raw], pollutant, min_run=config.min_run, min_useful=config.min_useful,
-            zero_run_hours=config.zero_run_hours, quality_mode=config.quality_mode,
-            hourly_repeat_filter=config.hourly_repeat_filter,
-        )
+        hourly, frozen, _ = preprocess_station(raw, station, pollutant, config, reference)
         series = ensure_datetime_series(hourly.iloc[:, 0], "h", station)
         series = series.where(np.isfinite(series))
         blocks = observed_blocks(series)
@@ -324,7 +349,7 @@ def prepare(
             "missing_hours": int(series.isna().sum()),
             "observed_blocks": len(blocks),
             "longest_block": int(blocks.hours.max()) if len(blocks) else 0,
-            "hourly_repeats_removed": frozen[0],
+            "hourly_repeats_removed": frozen,
             "last_raw_timestamp": str(raw.index.max()) if len(raw) else "",
             **raw.attrs.get("source_quality", {}), **hourly.attrs.get("quality_counts", {}),
         }
@@ -464,6 +489,8 @@ def prepare(
         "geometry": asdict(config),
         "clients": clients,
     }
+    if policy := quality_policy(config.exclude_may_june_2026, reference):
+        document["external_quality"] = policy
     document["evaluation_sha256"] = evaluation_identity(document)
     manifest.write_text(json.dumps(document, indent=2) + "\n", encoding="utf-8")
     return manifest
