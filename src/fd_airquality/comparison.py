@@ -10,15 +10,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from fd_airquality.artifacts import file_digest
+from fd_airquality.gateways import TOPOLOGY_FILENAME, gateway_partitions, read_gateway_topology
 from fd_airquality.leaderboard import WEEKLY_COLUMNS, WEEKLY_IDENTITY, station_weekly_scores
 from fd_airquality.missing import resolve_missing_policy
-from fd_airquality.temporal_results import candidate_identity
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE
+from fd_airquality.temporal_results import OPERATIONAL_SETTINGS, candidate_identity
 
 _MACRO_ERRORS = ("macro-mase", "macro-rmsse")
 _COMPARISON_METRICS = (*_MACRO_ERRORS, "crps", "macro-scaled-crps")
 _REPORT_METRICS = (
     *_MACRO_ERRORS, "pooled-mase", "pooled-rmsse", "mean-mase", "mean-rmsse",
-    "num-clients", "num-examples", "num-targets", "num-target-slots", "target-coverage",
+    "num-clients", "num-stations", "active-gateways", "num-examples", "num-targets", "num-target-slots", "target-coverage",
     "macro-mase-stations", "macro-rmsse-stations", "mase-count", "rmsse-count",
     "bias", "missing-targets", "missing-context-values", "negative-prediction-fraction",
     "probabilistic-available", "crps", "crps-count", "wis", "mean-quantile-loss", "quantile-count",
@@ -101,7 +104,9 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         mode = run.get("mode", "federated")
         model = run["settings"].get("model", "mlp")
         adaptation = run.get("model", {}).get("adaptation", "full")
-        label = f"{model}/{adaptation}/{run['settings']['strategy'] if mode == 'federated' else mode}/{path.name}"
+        strategy = run["settings"]["strategy"] if mode in FEDERATED_MODES else "none"
+        method = strategy if mode == "federated" else f"{mode}/{strategy}" if mode == GATEWAY_MODE else mode
+        label = f"{model}/{adaptation}/{method}/{path.name}"
         metrics = result["test"]
         protocol = run.get("probabilistic_protocol", {})
         quantile_postprocessing = protocol.get("quantile_postprocessing", "none")
@@ -112,12 +117,23 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
         else:
             quantile_postprocessing = None
         expected = len(run["manifest"]["clients"])
-        if metrics["num-clients"] != expected or not all(np.isfinite(value) for value in metrics.values()):
+        if (metrics.get("num-stations", metrics["num-clients"]) != expected
+                or not all(np.isfinite(value) for value in metrics.values())):
             raise ValueError(f"Test incompleto o no finito: {path}")
         stations = pd.read_csv(path / "station_metrics.csv")
         stations = stations.loc[stations["split"] == "test"].copy()
         if len(stations) != expected or set(stations["partition-id"]) != set(range(expected)):
             raise ValueError(f"Panel de test incompleto o duplicado: {path}")
+        if mode == GATEWAY_MODE:
+            topology_path = path / TOPOLOGY_FILENAME
+            if file_digest(topology_path) != run.get("gateway_topology_sha256"):
+                raise ValueError(f"La topología de la ejecución ha cambiado: {path}")
+            members = gateway_partitions(read_gateway_topology(topology_path), run["manifest"])
+            expected_gateways = {station: gateway for gateway, group in enumerate(members) for station in group}
+            if (metrics["num-clients"] != len(members) or metrics.get("active-gateways") != sum(map(bool, members))
+                    or "gateway-id" not in stations
+                    or not stations["partition-id"].map(expected_gateways).eq(stations["gateway-id"]).all()):
+                raise ValueError(f"Asignación de gateways incoherente en test: {path}")
         for client in run["manifest"]["clients"]:
             station = stations.loc[stations["partition-id"] == client["partition_id"]].iloc[0]
             if (station["station"] != client["station"] or station["num-examples"] != client["num_test_windows"]
@@ -137,20 +153,21 @@ def compare_runs(paths: list[Path], output: Path, *, allow_training_differences:
             "flowstate_scale_factor": run["settings"].get("flowstate_scale_factor") if model == "flowstate-r1" else None,
             "revision": run.get("model", {}).get("revision"),
             "selection_metric": result.get("selection_metric"),
+            "gateway_topology_sha256": run.get("gateway_topology_sha256"),
             "missing_policy": _missing_policy(run),
             "quantile_postprocessing": quantile_postprocessing,
             "quantile_source": protocol.get("quantile_source"),
             "quantile_levels": json.dumps(protocol["quantile_levels"]) if protocol.get("quantile_levels") else None,
             "candidate_configuration": sha256(json.dumps({
                 "settings": {key: value for key, value in run["settings"].items()
-                             if key not in {"seed", "output_dir", "manifest", "mlflow_tracking_uri",
-                                            "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level"}},
+                             if key not in OPERATIONAL_SETTINGS},
+                "gateway_topology_sha256": run.get("gateway_topology_sha256"),
                 "mode": mode, "manifest": run["manifest_sha256"], "model": run.get("model"),
                 "application_sources": run.get("application_sources"), "versions": run["versions"],
                 "granite_source": run.get("granite_source"),
                 "probabilistic_protocol": run.get("probabilistic_protocol"),
             }, sort_keys=True).encode()).hexdigest(),
-            "strategy": run["settings"]["strategy"] if mode == "federated" else "none",
+            "strategy": strategy,
             "selected_round": result["selected_round"], **scores,
         })
         station_weeks = station_weekly_scores(stations)

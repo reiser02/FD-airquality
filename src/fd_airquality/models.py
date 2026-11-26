@@ -26,7 +26,7 @@ from fd_airquality.lightweight import (
     LagLinear,
     SeasonalNaive,
 )
-from fd_airquality.settings import RunSettings
+from fd_airquality.settings import FEDERATED_MODES, RunSettings
 
 # Immutable Hugging Face revisions; never silently substitute R2 for TTM-R3.
 GRANITE = {
@@ -193,7 +193,7 @@ def validate_run_mode(settings: RunSettings, mode: str) -> None:
             raise ValueError("zero-shot exige adaptation=none.")
     elif algorithm == "none":
         raise ValueError("adaptation=none está reservado a zero-shot.")
-    if algorithm in {"flora", "lora-fair"} and (mode != "federated" or settings.strategy != "fedavg"):
+    if algorithm in {"flora", "lora-fair"} and (mode not in FEDERATED_MODES or settings.strategy != "fedavg"):
         raise ValueError("FLoRA/LoRA-FAIR especifican su agregación y solo se ejecutan en federación, sin FedProx.")
 
 

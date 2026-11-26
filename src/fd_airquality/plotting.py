@@ -13,6 +13,8 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE
+
 METRICS = {
     "macro-mase": "MASE macro",
     "macro-rmsse": "RMSSE macro",
@@ -20,7 +22,7 @@ METRICS = {
 IDENTITY_COLUMNS = ("run", "model", "mode", "adaptation", "strategy", "seed")
 CONTEXT_COLUMNS = (
     "lora_rank", "revision", "flowstate_scale_factor", "missing_policy", "selection_metric",
-    "selected_round", "num-clients", "num-examples", "num-targets", "target-coverage",
+    "selected_round", "num-clients", "num-stations", "num-examples", "num-targets", "target-coverage",
 )
 MODELS = {
     "mlp": "MLP", "autoencoder": "Autoencoder", "autoencoder-tiny": "Autoencoder Tiny",
@@ -59,8 +61,9 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
         raise ValueError(f"Faltan columnas en comparison.csv: {sorted(missing)}")
     # Older reports can contain non-scaled metrics. Never include them in new exports.
     columns = [key for key in (*IDENTITY_COLUMNS, *CONTEXT_COLUMNS, *METRICS) if key in rows]
-    rows = rows.loc[rows["mode"].isin(["federated", "centralized"]), columns].copy()
-    if set(rows["mode"]) != {"federated", "centralized"}:
+    rows = rows.loc[rows["mode"].isin([*FEDERATED_MODES, "centralized"]), columns].copy()
+    modes = set(rows["mode"])
+    if "centralized" not in modes or not modes.intersection(FEDERATED_MODES):
         raise ValueError("Se necesitan resultados federados y centralizados en la misma comparación.")
     if rows["run"].duplicated().any():
         raise ValueError("La comparación contiene ejecuciones duplicadas.")
@@ -75,8 +78,10 @@ def load_comparison(source: Path) -> tuple[Path, pd.DataFrame, dict]:
     labels = []
     for _, row in rows.iterrows():
         label = f"{MODELS.get(row['model'], row['model'])} · {ADAPTATIONS.get(row['adaptation'], row['adaptation'])}"
-        if row["mode"] == "federated":
+        if row["mode"] in FEDERATED_MODES:
             label += f" · {row['strategy']}"
+        if row["mode"] == GATEWAY_MODE:
+            label += " · gateways"
         details = []
         for key, prefix in (("seed", "s"), ("lora_rank", "r")):
             if (key in rows and rows[key].nunique() > 1 and pd.notna(row[key])
@@ -93,7 +98,7 @@ def matched_pairs(rows: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     """Match configurations, not test winners; FL-only adapters use a labelled LoRA control."""
     centralized = rows.loc[rows["mode"] == "centralized"]
     pairs, warnings = [], []
-    for _, fed in rows.loc[rows["mode"] == "federated"].iterrows():
+    for _, fed in rows.loc[rows["mode"].isin(FEDERATED_MODES)].iterrows():
         control = fed["adaptation"] in {"flora", "lora-fair"}
         adaptation = "lora" if control else fed["adaptation"]
         candidates = centralized.loc[
@@ -130,7 +135,7 @@ def matched_pairs(rows: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 def cross_pairs(rows: pd.DataFrame) -> pd.DataFrame:
     """Every federated vs every centralized candidate, without claiming causal attribution."""
     records = []
-    for _, fed in rows.loc[rows["mode"] == "federated"].iterrows():
+    for _, fed in rows.loc[rows["mode"].isin(FEDERATED_MODES)].iterrows():
         for _, central in rows.loc[rows["mode"] == "centralized"].iterrows():
             for metric in METRICS:
                 a, b = fed[metric], central[metric]
@@ -204,7 +209,7 @@ def _paired(pairs: pd.DataFrame, title: str, subtitle: str) -> Figure:
 
 
 def _matrix(rows: pd.DataFrame, subtitle: str) -> Figure:
-    fed = rows.loc[rows["mode"] == "federated"]
+    fed = rows.loc[rows["mode"].isin(FEDERATED_MODES)]
     central = rows.loc[rows["mode"] == "centralized"]
     a = fed["macro-mase"].to_numpy()[:, None]
     b = central["macro-mase"].to_numpy()[None, :]
@@ -236,7 +241,7 @@ def plot_comparison(source: Path, output: Path | None = None) -> Path:
     source, rows, metadata = load_comparison(source)
     pairs, warnings = matched_pairs(rows)
     warnings = list(metadata.get("warnings", [])) + warnings
-    has_scaled_matrix = rows.groupby("mode")["macro-mase"].count().gt(0).all()
+    has_scaled_matrix = rows.groupby(rows["mode"].isin(FEDERATED_MODES))["macro-mase"].count().gt(0).all()
     if not has_scaled_matrix:
         warnings.append("No hay MASE macro en ambos modos; no se genera su matriz de cruces.")
     output = (output or source / "plots").expanduser().resolve()
@@ -247,10 +252,14 @@ def plot_comparison(source: Path, output: Path | None = None) -> Path:
     pairs.to_csv(output / "matched_pairs.csv", index=False)
     cross_pairs(rows).to_csv(output / "cross_model_pairs.csv", index=False)
     context = []
-    for key, name in (("num-clients", "estaciones"), ("num-examples", "ventanas test"),
+    context_rows = rows
+    if "num-clients" in rows:
+        count = rows.get("num-stations", rows["num-clients"]).fillna(rows["num-clients"])
+        context_rows = rows.assign(**{"station-count": count})
+    for key, name in (("station-count", "estaciones"), ("num-examples", "ventanas test"),
                       ("seed", "semilla"), ("lora_rank", "rango LoRA")):
-        if key in rows:
-            values = ", ".join(f"{v:g}" for v in sorted(rows[key].dropna().unique()))
+        if key in context_rows:
+            values = ", ".join(f"{v:g}" for v in sorted(context_rows[key].dropna().unique()))
             context.append(f"{name}: {values}")
     subtitle = " | ".join(context)
     figures = []
@@ -265,8 +274,11 @@ def plot_comparison(source: Path, output: Path | None = None) -> Path:
         for mode, stem, title in (
             ("federated", "01_federado", "Modelos federados · todas las adaptaciones"),
             ("centralized", "02_centralizado", "Modelos centralizados · todas las adaptaciones"),
+            (GATEWAY_MODE, "05_federado_gateways", "Modelos federados por gateways · todas las adaptaciones"),
         ):
-            save(_overview(rows.loc[rows["mode"] == mode], title, subtitle), stem, title)
+            subset = rows.loc[rows["mode"] == mode]
+            if not subset.empty:
+                save(_overview(subset, title, subtitle), stem, title)
         if not pairs.empty:
             title = "Federado frente a centralizado · mismo modelo"
             save(_paired(pairs, title, subtitle), "03_federado_vs_centralizado", title)

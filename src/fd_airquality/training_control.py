@@ -10,13 +10,14 @@ from torch.utils.data import Dataset
 
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.models import load_shared_state, shared_state
+from fd_airquality.settings import FEDERATED_MODES
 
 
 def training_stage_count(settings, mode: str) -> int:
     """Count training fits, not validation checkpoints."""
     if mode == "zero-shot" or settings.model in STATION_CONTROLS:
         return 0
-    return settings.num_server_rounds if mode == "federated" else 1
+    return settings.num_server_rounds if mode in FEDERATED_MODES else 1
 
 
 def controls_enabled(settings) -> bool:
@@ -35,13 +36,16 @@ class ContextSupervisionDataset(Dataset):
 
     def __getitem__(self, index):
         inputs, actual = self.dataset[index]
-        times = self.dataset.context_timestamps(index)
-        allowed = np.ones_like(times, dtype=bool)
-        if self.dataset.arrival_lower is not None:
-            allowed &= times >= self.dataset.arrival_lower.value
-        if self.dataset.monitoring_interval is not None:
-            lower, upper = self.dataset.monitoring_interval
-            allowed &= (times < lower.value) | (times >= upper.value)
+        arrival = getattr(self.dataset, "arrival_lower", None)
+        monitor = getattr(self.dataset, "monitoring_interval", None)
+        allowed = np.ones(len(inputs), dtype=bool)
+        if arrival is not None or monitor is not None:
+            times = self.dataset.context_timestamps(index)
+            if arrival is not None:
+                allowed &= times >= arrival.value
+            if monitor is not None:
+                lower, upper = monitor
+                allowed &= (times < lower.value) | (times >= upper.value)
         return inputs, actual, torch.from_numpy(allowed)
 
 

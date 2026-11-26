@@ -117,9 +117,16 @@ lr-scheduler-factor = 0.5
 min-learning-rate = 0.000001
 round-validation-hours = 24
 round-validation-max-hours = 0
+federation-mode = "federated"
+gateway-num-clients = 4
+gateway-seed = 42
+gateway-topology = ""
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+fd_airquality = ["station_locations.csv", "cartagena_osm.png"]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }

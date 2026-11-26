@@ -80,6 +80,7 @@ def train_local(
     *,
     max_train_windows: int | None = None,
     validation_data: Dataset | None = None,
+    group_metrics: list[dict[str, float | int]] | None = None,
 ) -> dict[str, float | int]:
     started = time.perf_counter()
     model.to(device).train()
@@ -91,12 +92,16 @@ def train_local(
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     reference = [parameter.detach().clone() for parameter in parameters] if proximal_mu else []
-    restrict_reconstruction = (getattr(dataset, "arrival_lower", None) is not None
-                               or getattr(dataset, "monitoring_interval", None) is not None)
-    loader_dataset = (ContextSupervisionDataset(dataset)
-                      if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight
-                      and restrict_reconstruction else dataset)
-    group_sizes = [len(child) for child in dataset.datasets] if isinstance(dataset, ConcatDataset) else None
+    grouped = isinstance(dataset, ConcatDataset)
+    children = dataset.datasets if grouped else [dataset]
+    restrict_reconstruction = any(getattr(child, "arrival_lower", None) is not None
+                                  or getattr(child, "monitoring_interval", None) is not None
+                                  for child in children)
+    loader_dataset = dataset
+    if isinstance(model, ForecastAutoencoder) and settings.reconstruction_weight and restrict_reconstruction:
+        supervised = [ContextSupervisionDataset(child) for child in children]
+        loader_dataset = ConcatDataset(supervised) if grouped else supervised[0]
+    group_sizes = [len(child) for child in children] if grouped else None
     sampler = CompleteBatchSampler(
         len(dataset), settings.batch_size, torch.Generator().manual_seed(seed),
         max_windows=max_train_windows, group_sizes=group_sizes, pad_last_batch=bool(settings.pad_last_batch),
@@ -104,6 +109,11 @@ def train_local(
     loader = DataLoader(loader_dataset, batch_sampler=sampler, num_workers=0,
                         generator=torch.Generator().manual_seed(seed))
     visited = np.zeros(len(dataset), dtype=bool) if sampler.epoch_size < len(dataset) else None
+    if group_metrics is not None:
+        if not grouped:
+            raise ValueError("La auditoría por grupo requiere un ConcatDataset.")
+        observed_by_draw = np.empty(sampler.epoch_size, dtype=np.int64)
+        group_targets = np.zeros(len(children), dtype=np.int64)
     # Local optimizer state is deliberately reset at each communication round.
     optimizer = torch.optim.AdamW(
         parameters, lr=settings.learning_rate, weight_decay=settings.weight_decay
@@ -129,8 +139,12 @@ def train_local(
             observed = torch.isfinite(actual)
             observed_targets = int(observed.sum())
             # Only the suffix of the final batch can contain replacement draws.
-            remaining = sampler.epoch_size - (batch - 1) * settings.batch_size
-            selected_targets += observed_targets if remaining >= len(actual) else int(observed[:remaining].sum())
+            first_draw = (batch - 1) * settings.batch_size
+            remaining = sampler.epoch_size - first_draw
+            original = observed[:remaining]
+            selected_targets += observed_targets if remaining >= len(actual) else int(original.sum())
+            if group_metrics is not None:
+                observed_by_draw[first_draw:first_draw + len(original)] = original.sum(dim=1).numpy()
             if not observed_targets:
                 continue
             optimizer.zero_grad(set_to_none=True)
@@ -189,6 +203,11 @@ def train_local(
                 last_report = time.monotonic()
         if visited is not None:
             visited[sampler.selected_indices.numpy()] = True
+        if group_metrics is not None:
+            selected_groups = np.searchsorted(
+                dataset.cumulative_sizes, sampler.selected_indices.numpy(), side="right",
+            )
+            np.add.at(group_targets, selected_groups, observed_by_draw)
         if not targets:
             raise ValueError("No hay targets de entrenamiento observados; no se puede optimizar.")
         report_progress("train", f"epoch={epoch}/{settings.local_epochs} batches={len(loader)}/{len(loader)} "
@@ -242,6 +261,22 @@ def train_local(
         metrics.update({"train-first-target-ns": first, "train-last-target-ns": last})
     if device.type == "cuda":
         metrics["peak-cuda-allocated-mib"] = torch.cuda.max_memory_allocated(device) / 1024**2
+    if group_metrics is not None:
+        offset = 0
+        for child, count, support in zip(children, sampler.group_samples, group_targets, strict=True):
+            end = offset + len(child)
+            used = visited[offset:end] if visited is not None else None
+            row = {
+                "num-examples": count, "num-targets": int(support) / epochs_completed,
+                "admissible-windows": len(child), "epochs-completed": epochs_completed if count else 0,
+                "selected-target-occurrences": int(support),
+                "unique-training-windows": len(child) if used is None else int(used.sum()),
+            }
+            if count and getattr(child, "available_through", None) is not None:
+                first, last = child.target_time_bounds(child.starts[used] if used is not None else None)
+                row.update({"train-first-target-ns": first, "train-last-target-ns": last})
+            group_metrics.append(row)
+            offset = end
     return metrics
 
 

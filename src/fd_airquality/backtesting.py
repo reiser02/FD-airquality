@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,12 @@ import pandas as pd
 from fd_airquality.artifacts import create_run_dir, file_digest
 from fd_airquality.data import DataConfig, _source_files, prepare, preprocess_station, read_manifest
 from fd_airquality.execution import execute_plan
+from fd_airquality.gateways import (
+    TOPOLOGY_FILENAME,
+    gateway_partitions,
+    read_gateway_topology,
+    write_gateway_topology,
+)
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.loaders import (
     MompeanReference,
@@ -32,7 +39,7 @@ from fd_airquality.panels import EXCLUSION_COLUMNS, prepare_runtime_panel, selec
 from fd_airquality.preprocessing import QUALITY_EXCLUSION_COLUMNS, TFG_SOURCE, quality_policy
 from fd_airquality.quality import evaluation_identity
 from fd_airquality.run_logging import RunLogging, report_progress
-from fd_airquality.settings import RunSettings
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings
 from fd_airquality.temporal_results import (
     select_configuration,
     summarize_cv,
@@ -379,7 +386,7 @@ def build_candidate_matrix(models: list[str], modes: list[str], adaptations: lis
     for values in (models, modes, adaptations, strategies):
         if not values or len(set(values)) != len(values):
             raise ValueError("La matriz no admite listas vacías ni valores repetidos.")
-    if (set(models) - set(MODEL_NAMES) or set(modes) - {"federated", "local", "centralized", "zero-shot"}
+    if (set(models) - set(MODEL_NAMES) or set(modes) - {*FEDERATED_MODES, "local", "centralized", "zero-shot"}
             or set(adaptations) - {"lora", "ffa-lora", "flora", "lora-fair"}
             or set(strategies) - {"fedavg", "fedprox"}):
         raise ValueError("Combinación desconocida en la matriz.")
@@ -396,11 +403,11 @@ def build_candidate_matrix(models: list[str], modes: list[str], adaptations: lis
                 if foundation:
                     matrix.append({"model": model, "mode": mode, "adaptation": "none", "strategy": "fedavg"})
                 continue
-            algorithms = adaptations if foundation and mode == "federated" else controls if foundation else ["auto"]
+            algorithms = adaptations if foundation and mode in FEDERATED_MODES else controls if foundation else ["auto"]
             for algorithm in algorithms:
                 if algorithm in {"flora", "lora-fair"} and "fedavg" not in strategies:
                     raise ValueError("FLoRA/LoRA-FAIR requieren su agregación sin FedProx; incluye fedavg en --strategies.")
-                choices = ["fedavg"] if mode != "federated" or algorithm in {"flora", "lora-fair"} else strategies
+                choices = ["fedavg"] if mode not in FEDERATED_MODES or algorithm in {"flora", "lora-fair"} else strategies
                 for strategy in choices:
                     matrix.append({"model": model, "mode": mode, "adaptation": algorithm, "strategy": strategy})
     return matrix
@@ -515,6 +522,16 @@ def run_backtest(settings: RunSettings, models: list[str], modes: list[str], *, 
     plan = _candidate_plan(settings, models, modes, adaptations, seeds, lora_ranks, strategies)
     settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
     root = create_run_dir(Path(settings.output_dir).resolve(), f"backtest_{datetime.now(UTC):%Y%m%d_%H%M%S}")
+    if any(case["mode"] == GATEWAY_MODE for case in plan):
+        path = root / TOPOLOGY_FILENAME
+        if recipe is None:
+            write_gateway_topology(path, settings.gateway_num_clients, settings.gateway_seed)
+        else:
+            development = Path(recipe["run_records"][0]["run_json"]).with_name(TOPOLOGY_FILENAME)
+            shutil.copyfile(development, path)
+            if file_digest(path) != original.get("gateway_topology_sha256"):
+                raise ValueError("Cambió la topología congelada desde el desarrollo.")
+        settings = replace(settings, gateway_topology=str(path))
     with RunLogging(root, f"backtest {stage}", filename="backtest.log", level=settings.log_level,
                     heartbeat_seconds=settings.heartbeat_seconds) as log:
         report_progress("backtest", f"manifest={settings.manifest}; "
@@ -543,6 +560,13 @@ def _run_prepared_backtest(settings: RunSettings, family: dict, root: Path, plan
                           "configuration_selection": stage in {"development", "all"},
                           "primary_summary": "cv_fold_mean.csv" if stage == "evaluation" else "cv_summary.csv",
                           "exploratory": stage == "all"}
+    if settings.gateway_topology:
+        path = Path(settings.gateway_topology)
+        topology = read_gateway_topology(path, num_clients=settings.gateway_num_clients,
+                                         seed=settings.gateway_seed)
+        for index in indices:
+            gateway_partitions(topology, read_manifest(manifests[index]))
+        progress.update({"gateway_topology": path.name, "gateway_topology_sha256": file_digest(path)})
     rows, summaries, weekly = [], [], []
     cv_rows, cv_stations = [], []
     # Record access before running: a failed partial holdout is not untouched.

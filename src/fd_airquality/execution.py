@@ -13,6 +13,7 @@ from pathlib import Path
 
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE
 from fd_airquality.task import resolve_device
 
 LOGGER = logging.getLogger(__name__)
@@ -46,7 +47,10 @@ def write_progress(path: Path, rows: list[dict]) -> None:
 
 
 def _case_settings(settings, case, root, index):
+    mode = case["mode"]
     return replace(settings, output_dir=str(root / "runs" / f"case_{index + 1:04d}"),
+                   federation_mode=mode if mode in FEDERATED_MODES else "federated",
+                   gateway_topology=settings.gateway_topology if mode == GATEWAY_MODE else "",
                    **{key: value for key, value in case.items() if key != "mode"})
 
 
@@ -55,6 +59,7 @@ def _candidate_process(settings, mode: str, gpu: str, log_path: Path, runner: Pr
     config.write_text("[run]\n" + "\n".join(
         f"{key} = {json.dumps(value, ensure_ascii=False)}"
         for key, value in settings.flower_config().items()
+        if key not in {"federation-mode", "gateway-topology"}
     ) + "\n", encoding="utf-8")
     env = os.environ.copy()
     env.update(CUDA_VISIBLE_DEVICES=gpu, PYTHONUNBUFFERED="1",
@@ -115,17 +120,17 @@ def execute_plan(settings, plan: list[dict], root: Path, *,
     try:
         for mode in dict.fromkeys(case["mode"] for case in plan):
             indices = [i for i, case in enumerate(plan) if case["mode"] == mode]
+            federated = mode in FEDERATED_MODES
             report_progress(mode, f"mode-start candidates={len(indices)} "
-                            f"parallel={min(len(slots), len(indices)) if mode != 'federated' and slots else 1}")
-            if mode == "federated" or not slots:
+                            f"parallel={min(len(slots), len(indices)) if not federated and slots else 1}")
+            if federated or not slots:
                 for index in indices:
                     current = start(index, None)
                     try:
                         with RunLogging(root / "logs", run_label(current, mode),
                                         filename=f"case_{index + 1:04d}.log", level=settings.log_level,
                                         heartbeat_seconds=settings.heartbeat_seconds):
-                            path = (launch(current, dry_run=False)
-                                    if mode == "federated" else baseline(current, mode))
+                            path = launch(current, dry_run=False) if federated else baseline(current, mode)
                     except Exception as exc:
                         failed(index, exc)
                         raise

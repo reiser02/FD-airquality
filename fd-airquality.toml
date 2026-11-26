@@ -248,12 +248,20 @@ flowstate-r1 = "native"
 # mlp = [0.75, 1.0]
 # nlinear = 0.5
 
+[gateways]
+# Cada medoid de k-medoids es la ubicación de un gateway y un cliente Flower.
+num-clients = 4
+# Semilla de la topología, independiente de las semillas de entrenamiento.
+seed = 42
+
 [simulate]
 # Manifest de un fold o de una preparación con folds = 1. Por defecto se busca la última de un solo fold.
 # manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # Directorio base para los resultados de las simulaciones Flower.
 output-dir = "reports/federated"
-# Paralelismo automático: un cliente por GPU utilizable, hasta el número de estaciones.
+# "federated" usa un cliente por estación; "federated-gateways", por gateway.
+mode = "federated"
+# Paralelismo automático: un cliente por GPU utilizable, hasta el número de clientes.
 # true imprime/prepara el comando de Flower sin iniciar la simulación.
 print-command = false
 
@@ -283,7 +291,7 @@ stage = "evaluation"
 # Controles clásicos y Granite. PatchTST-FM-R2 queda fuera salvo selección explícita.
 models = ["mlp", "autoencoder", "autoencoder-tiny", "nlinear", "nlinear-point", "nhits",
           "linear-6lags", "seasonal-naive", "holt", "ttm-r3", "flowstate-r1"]
-# Métodos comparados: entrenamiento local por estación, centralizado, federado y zero-shot.
+# Añade "federated-gateways" para incluir la federación por gateways geográficos.
 # Zero-shot solo se genera para los modelos Granite.
 modes = ["local", "centralized", "federated", "zero-shot"]
 # Adaptaciones Granite: en federado compara LoRA, FFA-LoRA (A congelada), FLoRA

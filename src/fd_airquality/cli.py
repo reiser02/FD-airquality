@@ -19,6 +19,13 @@ from fd_airquality.backtesting import DEFAULT_EVALUATION_HOURS, DEFAULT_MIN_STAT
 from fd_airquality.configuration import INTERNAL_FOLD_FIELDS, parse_configured_args
 from fd_airquality.data import DataConfig, read_manifest
 from fd_airquality.execution import usable_gpu_slots
+from fd_airquality.gateways import (
+    TOPOLOGY_FILENAME,
+    build_gateway_topology,
+    gateway_partitions,
+    read_gateway_topology,
+    write_gateway_topology,
+)
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.loaders import POLLUTANT
 from fd_airquality.models import (
@@ -31,7 +38,7 @@ from fd_airquality.models import (
 from fd_airquality.panels import prepare_runtime_panel
 from fd_airquality.processes import ProcessRunner
 from fd_airquality.run_logging import RunLogging, report_progress, run_label
-from fd_airquality.settings import RunSettings, resolve_manifest
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings, resolve_manifest
 from fd_airquality.task import validate_selection_coverage
 from fd_airquality.tracking import tracking_uri
 
@@ -83,6 +90,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     audit = commands.add_parser("inspect", help="Resumen del soporte y las exclusiones, sin entrenar.")
     audit.add_argument("--manifest")
     simulation = commands.add_parser("simulate", help="Ejecutar flwr run en el simulador local oficial.")
+    simulation.add_argument("--mode", choices=FEDERATED_MODES, default="federated")
     simulation.add_argument("--manifest", help="Por defecto: la preparación más reciente.")
     simulation.add_argument("--output-dir", default="reports/federated")
     simulation.add_argument("--print-command", action=argparse.BooleanOptionalAction, default=False,
@@ -98,7 +106,7 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     backtest.add_argument("--manifest", help="backtest_manifest.json de prepare-backtest; por defecto el más reciente.")
     backtest.add_argument("--output-dir", default="reports/backtests")
     backtest.add_argument("--models", nargs="+", choices=MODEL_NAMES, default=list(DEFAULT_MATRIX_MODELS))
-    backtest.add_argument("--modes", nargs="+", choices=["federated", "local", "centralized", "zero-shot"],
+    backtest.add_argument("--modes", nargs="+", choices=[*FEDERATED_MODES, "local", "centralized", "zero-shot"],
                           default=["local", "centralized", "federated", "zero-shot"])
     backtest.add_argument("--adaptations", nargs="+", choices=["lora", "ffa-lora", "flora", "lora-fair"],
                           default=["lora", "ffa-lora", "flora", "lora-fair"])
@@ -118,13 +126,24 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     plots.add_argument("source", type=Path, help="Directorio del fold o de la comparación, o comparison.csv.")
     plots.add_argument("--output", type=Path, help="Directorio nuevo; por defecto <comparación>/plots.")
     plots.add_argument("--weekly", action="store_true", help="Graficar la clasificación por semana de origen.")
+    gateway_map = commands.add_parser("plot-gateways", help="Dibujar las estaciones y gateways sobre OpenStreetMap.")
+    gateway_map.add_argument("--topology", type=Path, help="gateway_topology.json de una ejecución anterior.")
+    gateway_map.add_argument("--output", type=Path, default=Path("reports/mapa-gateways.png"))
     commands.add_parser("models", help="Listar modelos, adaptación y requisitos sin descargarlos.")
     for command in commands.choices.values():
         command.add_argument("--config", type=Path, default=argparse.SUPPRESS,
                              help="Archivo TOML; por defecto fd-airquality.toml en el directorio actual.")
     defaults = RunSettings()
+    for command in (simulation, baseline, backtest):
+        command.set_defaults(federation_mode=defaults.federation_mode, gateway_topology=defaults.gateway_topology)
+    baseline.set_defaults(gateway_num_clients=defaults.gateway_num_clients, gateway_seed=defaults.gateway_seed)
+    for command in (simulation, backtest, gateway_map):
+        command.add_argument("--gateway-num-clients", type=int, default=defaults.gateway_num_clients,
+                             help="Número de medoids y clientes de Flower en federated-gateways.")
+        command.add_argument("--gateway-seed", type=int, default=defaults.gateway_seed,
+                             help="Semilla del agrupamiento geográfico, independiente del entrenamiento.")
     for field in fields(RunSettings):
-        if field.name in {"manifest", "output_dir"}:
+        if field.name in {"manifest", "output_dir", "federation_mode"} or field.name.startswith("gateway_"):
             continue
         value = getattr(defaults, field.name)
         options = {}
@@ -156,7 +175,8 @@ def launch_simulation(settings: RunSettings, dry_run: bool) -> Path | None:
 
 
 def _launch_simulation(settings, dry_run, home, overrides):
-    validate_run_mode(settings, "federated")
+    mode = settings.federation_mode
+    validate_run_mode(settings, mode)
     slots = usable_gpu_slots(settings.device)
     if settings.device == "cuda" and not slots:
         logging.getLogger(__name__).warning("Ninguna GPU utilizable; simulación secuencial en CPU.")
@@ -164,11 +184,22 @@ def _launch_simulation(settings, dry_run, home, overrides):
     manifest = read_manifest(settings.manifest)
     validate_model_geometry(manifest["geometry"], settings)
     settings, manifest = prepare_runtime_panel(settings, overrides.with_suffix(""))
-    validate_selection_coverage(manifest, settings, "federated")
+    validate_selection_coverage(manifest, settings, mode)
+    stations = len(manifest["clients"])
+    nodes = stations
+    if mode == GATEWAY_MODE:
+        if settings.gateway_topology:
+            path = Path(settings.gateway_topology).resolve()
+            topology = read_gateway_topology(path, num_clients=settings.gateway_num_clients,
+                                             seed=settings.gateway_seed)
+        else:
+            path = overrides.with_suffix("") / TOPOLOGY_FILENAME
+            topology = write_gateway_topology(path, settings.gateway_num_clients, settings.gateway_seed)
+        nodes = len(gateway_partitions(topology, manifest))
+        settings = replace(settings, gateway_topology=str(path))
     overrides.write_text("\n".join(
         f"{key} = {_toml_scalar(value)}" for key, value in settings.flower_config().items()
     ) + "\n", encoding="utf-8")
-    nodes = len(manifest["clients"])
     parallel_clients = min(len(slots) if slots else 1, nodes)
     client_gpus = 1.0 if slots else 0.0
     federation = (
@@ -180,7 +211,8 @@ def _launch_simulation(settings, dry_run, home, overrides):
         "uv", "run", "--frozen", "flwr", "run", ".", "local", "--stream",
         "--run-config", str(overrides), "--federation-config", federation,
     ]
-    print(f"{nodes} estaciones; {len(slots)} GPU utilizables; "
+    gateway_count = f"{nodes} gateways; " if mode == GATEWAY_MODE else ""
+    print(f"{stations} estaciones; {gateway_count}{len(slots)} GPU utilizables; "
           f"hasta {parallel_clients} clientes federados simultáneos.", flush=True)
     display_command = ["env", f"CUDA_VISIBLE_DEVICES={','.join(slots)}", *command] if slots else command
     print(shlex.join(display_command), flush=True)
@@ -300,6 +332,12 @@ def main(argv: list[str] | None = None) -> None:
                 from fd_airquality.plotting import plot_comparison
 
                 plot_comparison(args.source, args.output)
+        elif args.command == "plot-gateways":
+            from fd_airquality.gateway_plot import plot_gateway_map
+
+            topology = (read_gateway_topology(args.topology.expanduser()) if args.topology else
+                        build_gateway_topology(args.gateway_num_clients, args.gateway_seed))
+            print(f"Mapa de gateways: {plot_gateway_map(topology, args.output)}")
         else:
             manifest = resolve_manifest(args.manifest, backtest=args.command == "backtest")
             settings = RunSettings(**{
@@ -312,7 +350,7 @@ def main(argv: list[str] | None = None) -> None:
             if args.command != "backtest":
                 settings = replace(settings, mlflow_tracking_uri=tracking_uri(settings))
             if args.command == "simulate":
-                launch_simulation(settings, args.print_command)
+                launch_simulation(replace(settings, federation_mode=args.mode), args.print_command)
             elif args.command == "baseline":
                 from fd_airquality.baselines import run_baseline
 
@@ -326,7 +364,7 @@ def main(argv: list[str] | None = None) -> None:
                                        stage=args.stage, selection=args.selection,
                                        weekly_leaderboard=args.weekly_leaderboard)
                 print(f"Resultados temporales: {result}")
-    except (ValueError, FileNotFoundError, RuntimeError, subprocess.CalledProcessError) as exc:
+    except (ValueError, FileNotFoundError, FileExistsError, RuntimeError, subprocess.CalledProcessError) as exc:
         log_hint = f"\nLog de preparación: {preparation_log}" if preparation_log is not None else ""
         parser.exit(2, f"Error: {exc}{log_hint}\n")
 

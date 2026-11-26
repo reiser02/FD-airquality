@@ -1,7 +1,7 @@
 # FD-airquality
 
-Simulación de predicción de PM2.5 (`PM25`) con Flower (`flwr`): una estación
-por cliente y un servidor que agrega pesos, sin recibir las series de los clientes.
+Simulación de predicción de PM2.5 (`PM25`) con Flower (`flwr`): clientes por
+estación o por gateway geográfico y un servidor que agrega pesos.
 Es independiente: contiene su propio tratamiento de datos y lee una copia local
 de los CSV, sin importar código ni configuración de otro proyecto.
 
@@ -52,10 +52,10 @@ vuelve a ejecutar `prepare-backtest` para generar los de PM25.
 
 Para depurar una ejecución individual, ejecuta `prepare-backtest --folds 1`.
 `simulate` usa la preparación de PM25 de un fold más reciente, calcula cuántas
-estaciones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
+particiones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
 Ray y la API de mensajes de Flower 1.40. Con el TOML raíz ejecuta cinco rondas
 con hasta 50 épocas locales por ronda. Ejecuta un cliente simultáneo por GPU
-utilizable, hasta el número de estaciones; en CPU, uno cada vez. No emplea la API
+utilizable, hasta el número de clientes; en CPU, uno cada vez. No emplea la API
 obsoleta `start_simulation`. FedAvg/FedProx clásicos son oficiales; las variantes
 LoRA tienen su propia agregación de factores auditada.
 
@@ -63,7 +63,7 @@ Con `--device cuda` se comprueba una operación real y su sincronización, no so
 `torch.cuda.is_available()`. Si CUDA no está disponible o no puede ejecutar los
 kernels, se avisa y se continúa en CPU; el dispositivo efectivo queda en `run.json`.
 El launcher configura automáticamente Ray: una GPU completa por cliente y tantos
-clientes simultáneos como GPUs utilizables (sin superar las estaciones del panel).
+clientes simultáneos como GPUs utilizables (sin superar el número de clientes).
 En CPU/fallback no se reservan GPUs y el entrenamiento de clientes es secuencial.
 No hay que configurar `workers` ni `client-gpus`; esas opciones ya no se admiten.
 
@@ -77,6 +77,8 @@ Para una misma clave, la prioridad es:
 
 - `[prepare-backtest]`: fuentes, filtrado, geometría, folds, panel e historial.
 - `[run]`: opciones compartidas por `simulate`, `baseline` y `backtest`.
+- `[gateways]`: número de clientes y semilla del agrupamiento geográfico para
+  `simulate`, `backtest` y `plot-gateways`.
 - `[simulate]`, `[baseline]`, `[backtest]`: opciones específicas y valores que
   sobrescriben `[run]`. Conviene fijar `manifest` y `output-dir` en estas tablas:
   `backtest` usa `backtest_manifest.json`; `simulate` y `baseline` admiten el de
@@ -156,6 +158,57 @@ Para comparar estrategias, usa **la misma preparación de folds**:
 ```bash
 uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_manifest.json \
   --models mlp --modes federated --strategies fedavg fedprox --proximal-mu 0.01 --num-server-rounds 10
+```
+
+### Federación por gateways geográficos
+
+`federated-gateways` usa un cliente de Flower por gateway. **K-medoids** agrupa
+las estaciones por distancia Haversine sobre el
+[catálogo municipal de PM2.5](src/fd_airquality/station_locations.csv), reconciliado
+con `Datos_nuevos/station_coords.txt` del TFG de Mario Sáez (UPCT). El medoid
+define el emplazamiento virtual. La semilla de la topología es independiente
+de las semillas de los modelos. `num-clients` admite entre 1 y 25.
+
+```toml
+[gateways]
+num-clients = 4
+seed = 42
+
+[backtest]
+modes = ["local", "centralized", "federated", "federated-gateways"]
+```
+
+Selecciona cualquier subconjunto con `--modes`, o ejecuta solo este modo:
+
+```bash
+uv run fd-airquality backtest --modes federated-gateways
+uv run fd-airquality simulate --mode federated-gateways --manifest <manifest-del-fold>
+```
+
+El backtest guarda `gateway_topology.json` una vez para todos los folds y
+semillas de entrenamiento. Cada fold usa las estaciones elegibles de cada
+gateway, incluso si el medoid queda fuera del panel. Flower mantiene el
+número configurado de clientes; los gateways inactivos no agregan pesos.
+Las ventanas y los escaladores se construyen por estación. El gateway reúne
+esas ventanas para entrenar, aplicando la cuota por estación y época. El
+servidor recibe actualizaciones de gateways y evalúa MASE/RMSSE macro por
+estación sobre el panel habitual. `gateway_metrics.csv` muestra actividad,
+soporte y tamaño de los tensores por gateway; `station_metrics.csv` añade la
+asignación de cada estación.
+
+El mapa superpone las estaciones y sus gateways sobre un recorte de
+[OpenStreetMap](https://www.openstreetmap.org/#map=16/37.6057/-0.984). El
+fondo local `src/fd_airquality/cartagena_osm.png` se dibujó con datos de
+OpenStreetMap del 26-11-2026 por medio de Overpass (ODbL; véase
+[openstreetmap.org/copyright](https://www.openstreetmap.org/copyright)).
+Puede generarse sin conexión, sin preparar datos y sin entrenar. Lee
+`[gateways]` por defecto o usa la asignación exacta de una ejecución anterior:
+
+```bash
+uv run fd-airquality plot-gateways --output reports/mapa-gateways.png
+uv run fd-airquality plot-gateways \
+  --topology reports/backtests/<backtest>/gateway_topology.json \
+  --output reports/mapa-guardado.png
 ```
 
 ### Prueba pequeña con datos reales

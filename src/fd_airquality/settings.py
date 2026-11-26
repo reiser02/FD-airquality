@@ -7,6 +7,9 @@ from dataclasses import asdict, dataclass, fields
 from math import isfinite
 from pathlib import Path
 
+GATEWAY_MODE = "federated-gateways"
+FEDERATED_MODES = ("federated", GATEWAY_MODE)
+
 
 @dataclass(frozen=True)
 class RunSettings:
@@ -65,8 +68,14 @@ class RunSettings:
     min_learning_rate: float = 0.000001
     round_validation_hours: int = 24
     round_validation_max_hours: int = 0
+    federation_mode: str = "federated"
+    gateway_num_clients: int = 4
+    gateway_seed: int = 42
+    gateway_topology: str = ""
 
     def __post_init__(self) -> None:
+        if self.federation_mode not in FEDERATED_MODES:
+            raise ValueError("Modo de simulación federada desconocido.")
         for name in ("num_server_rounds", "local_epochs", "batch_size", "hidden_size", "torch_threads", "latent_size", "lora_rank", "fair_iterations"):
             value = getattr(self, name)
             if not isinstance(value, int) or isinstance(value, bool) or value < 1:

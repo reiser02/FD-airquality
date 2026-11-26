@@ -26,13 +26,14 @@ from fd_airquality.calibration import (
     SCALED_CRPS_PROTOCOL,
     calibration_enabled,
 )
+from fd_airquality.gateways import TOPOLOGY_FILENAME
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.missing import resolve_missing_policy
 from fd_airquality.models import GRANITE, model_metadata
 from fd_airquality.neural import trained_quantiles
 from fd_airquality.probabilistic import MEDIAN_ANCHORED_REARRANGEMENT
 from fd_airquality.run_logging import flush_run_logs
-from fd_airquality.settings import RunSettings
+from fd_airquality.settings import FEDERATED_MODES, GATEWAY_MODE, RunSettings
 from fd_airquality.training_control import training_stage_count
 
 MODEL_LABELS = {
@@ -42,7 +43,8 @@ MODEL_LABELS = {
     "seasonal-naive": "SeasonalNaive", "holt": "Holt",
     "ttm-r3": "TTM-R3", "patchtst-fm-r2": "PatchTST-FM-R2", "flowstate-r1": "FlowState-R1",
 }
-MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "federado", "zero-shot": "zero-shot"}
+MODE_LABELS = {"local": "local", "centralized": "centralizado", "federated": "federado",
+               GATEWAY_MODE: "federado por gateways", "zero-shot": "zero-shot"}
 ADAPTATION_LABELS = {
     "full": "completo", "none": "sin adaptación", "lora": "LoRA", "ffa-lora": "FFA-LoRA",
     "flora": "FLoRA", "lora-fair": "LoRA-FAIR",
@@ -52,13 +54,14 @@ _EVALUATION_METRICS = (
     "macro-mase", "macro-rmsse", "crps", "macro-scaled-crps", "wis", "target-coverage",
     "scaled-crps-count", "macro-scaled-crps-stations", "scaled-crps-eligible-stations",
     "interval-80-coverage", "interval-90-coverage",
-    "robust-num-clients", "robust-macro-mase", "robust-macro-rmsse",
+    "robust-num-clients", "robust-macro-mase", "robust-macro-rmsse", "active-gateways",
 )
 _TRACKED_METRICS = {
     "train": (
         "train-seconds", "peak-cuda-allocated-mib", "trainable-parameters",
         "uplink-tensor-bytes", "downlink-tensor-bytes", "global-state-tensor-bytes",
         "server-aggregation-seconds", "server-aggregation-cuda", "replacement-window-occurrences",
+        "active-gateways",
     ),
     "validation": _EVALUATION_METRICS,
     "test": _EVALUATION_METRICS,
@@ -98,7 +101,7 @@ def run_labels(settings: RunSettings, mode: str, pollutant: str, adaptation: str
     """Use the effective method in the display name; seed and rank stay in params."""
     parts = [MODEL_LABELS.get(settings.model, settings.model), MODE_LABELS.get(mode, mode),
              ADAPTATION_LABELS.get(adaptation, adaptation)]
-    if mode == "federated":
+    if mode in FEDERATED_MODES:
         parts.append("FedProx" if settings.strategy == "fedprox" else "FedAvg")
     candidate = " | ".join(parts)
     tags = backtest_tags(settings.output_dir, pollutant)
@@ -193,7 +196,8 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
         hardware["gpus"] = [{"name": torch.cuda.get_device_properties(index).name,
                              "total_memory": torch.cuda.get_device_properties(index).total_memory}
                             for index in range(torch.cuda.device_count())]
-    progressive = bool(mode == "federated" and settings.arrival_period_hours
+    federated = mode in FEDERATED_MODES
+    progressive = bool(federated and settings.arrival_period_hours
                        and manifest["geometry"].get("split_mode") == "global")
     update_epochs = (
         round_epoch_limit(manifest["geometry"], settings, 2)
@@ -201,11 +205,13 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
     )
     stages = training_stage_count(settings, mode)
     validation_schedule = "after_final_arrival" if progressive else "each_stage"
-    if mode != "federated":
+    if not federated:
         validation_schedule = "before_and_after_fit" if stages else "reference_only"
     metadata = model_metadata(manifest["geometry"], settings)
     (output / "run.json").write_text(json.dumps({
         "mode": mode, "settings": asdict(settings),
+        **({"gateway_topology_sha256": file_digest(output / TOPOLOGY_FILENAME)}
+           if mode == GATEWAY_MODE else {}),
         "manifest_sha256": file_digest(Path(settings.manifest)), "manifest": manifest,
         "model": metadata,
         "python": sys.version, "versions": versions,
@@ -239,7 +245,7 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
                               "training_targets": "current_block_only" if progressive else "full_fold_training",
                               "block_schedule": "initial_prefix_then_calendar_increments" if progressive else None,
                                "validation": validation_schedule,
-                               "weight_continuity": "within_fold_rounds_only" if mode == "federated" else None},
+                                "weight_continuity": "within_fold_rounds_only" if federated else None},
         "metric_protocol": {"implementation": "masked_seasonal_errors_v2",
                              "reference": manifest["geometry"].get("error_scale_reference", "pre-evaluation"),
                              "policy": manifest["geometry"].get("error_scale_policy", "unfloored")},
@@ -247,10 +253,10 @@ def write_run(output: Path, settings: RunSettings, manifest: dict, mode: str) ->
             "stages": stages,
             "epochs_per_stage": settings.local_epochs,
             "federated_update_epochs": update_epochs,
-            "optimizer_reset_each_stage": mode == "federated",
+            "optimizer_reset_each_stage": federated,
         },
         "training_controls": {
-            "scope": "local_epochs_per_stage_or_round" if mode == "federated" else ("single_fit" if stages else None),
+            "scope": "local_epochs_per_stage_or_round" if federated else ("single_fit" if stages else None),
             "monitor": "pooled_observed_mse_original_units",
             "early_stopping": settings.early_stopping,
             "patience": settings.early_stopping_patience,
@@ -322,7 +328,7 @@ class RunTracker:
             keys.append("scaler_type")
         if training_stage_count(settings, self.mode):
             keys.extend(("local_epochs", "batch_size", "pad_last_batch", "learning_rate", "weight_decay"))
-        if self.mode == "federated":
+        if self.mode in FEDERATED_MODES:
             keys.extend(("num_server_rounds", "strategy"))
             if settings.strategy == "fedprox":
                 keys.append("proximal_mu")
@@ -337,7 +343,12 @@ class RunTracker:
             "num_clients": len(self.manifest["clients"]),
             "missing_policy": resolve_missing_policy(settings.model, settings.missing_policy, settings.missing_policies),
         }
-        if self.mode == "federated" and geometry.get("split_mode") == "global":
+        if self.mode == GATEWAY_MODE:
+            params.update({"num_clients": settings.gateway_num_clients,
+                           "num_stations": len(self.manifest["clients"]),
+                           "gateway_seed": settings.gateway_seed,
+                           "gateway_topology_sha256": file_digest(self.output / TOPOLOGY_FILENAME)})
+        if self.mode in FEDERATED_MODES and geometry.get("split_mode") == "global":
             params["arrival_period_hours"] = settings.arrival_period_hours
             if settings.arrival_period_hours and settings.num_server_rounds > 1:
                 params["federated_update_epochs"] = round_epoch_limit(geometry, settings, 2)

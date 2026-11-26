@@ -12,6 +12,7 @@ from fd_airquality.settings import RunSettings
 
 DEFAULT_CONFIG = Path("fd-airquality.toml")
 RUN_COMMANDS = {"simulate", "baseline", "backtest"}
+GATEWAY_COMMANDS = {"simulate", "backtest", "plot-gateways"}
 FIXED_PREPARE_DATES = {"train_start", "validation_start", "test_start", "test_end"}
 INTERNAL_FOLD_FIELDS = FIXED_PREPARE_DATES | {"validation_hours", "test_hours", "split_mode", "quality_mode"}
 
@@ -52,7 +53,7 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
     if "prepare" in document:
         raise ValueError(f"{path}: [prepare] ya no se admite. Traslada el preprocesamiento a [prepare-backtest] "
                          "y usa folds = 1 para un único corte automático.")
-    unknown = document.keys() - (commands.keys() | {"run", "missing", "availability"})
+    unknown = document.keys() - (commands.keys() | {"run", "missing", "availability", "gateways"})
     if unknown:
         raise ValueError(f"Secciones desconocidas en {path}: {sorted(unknown)}")
     sections = {}
@@ -75,6 +76,16 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
             for value in options.values():
                 parse_threshold(value)
             sections[section] = options
+            continue
+        if section == "gateways":
+            keys = {"num-clients": "gateway_num_clients", "seed": "gateway_seed"}
+            if unknown := options.keys() - keys.keys():
+                raise ValueError(f"Opciones desconocidas en {path}: [gateways] {sorted(unknown)}.")
+            actions = {action.dest: action for action in commands["plot-gateways"]._actions}
+            sections[section] = {
+                keys[key]: _value(actions[keys[key]], value, f"{path}: [gateways].{key}")
+                for key, value in options.items()
+            }
             continue
         command = commands["simulate" if section == "run" else section]
         actions = {action.dest: action for action in command._actions if action.dest not in {"help", "config"}}
@@ -118,7 +129,11 @@ def parse_configured_args(parser: argparse.ArgumentParser, commands: dict[str, a
     except TypeError as exc:
         raise ValueError(str(exc)) from exc
     command = defaults["command"]
-    configured = (sections.get("run", {}) if command in RUN_COMMANDS else {}) | sections.get(command, {})
+    configured = (
+        (sections.get("run", {}) if command in RUN_COMMANDS else {})
+        | (sections.get("gateways", {}) if command in GATEWAY_COMMANDS else {})
+        | sections.get(command, {})
+    )
     if command in RUN_COMMANDS and "missing" in sections:
         configured.setdefault("missing_policies", json.dumps(sections["missing"], sort_keys=True))
     if command in RUN_COMMANDS and "availability" in sections:

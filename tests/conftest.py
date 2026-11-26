@@ -12,6 +12,7 @@ from torch import nn
 
 from fd_airquality.client_app import build_client_app
 from fd_airquality.data import DataConfig, prepare, read_manifest
+from fd_airquality.settings import GATEWAY_MODE
 
 
 @pytest.fixture(autouse=True)
@@ -126,7 +127,8 @@ def in_process_federation(monkeypatch, flower_grid):
 
     def launch(settings, dry_run=False):
         assert not dry_run
-        count = len(read_manifest(settings.manifest)["clients"])
+        count = (settings.gateway_num_clients if settings.federation_mode == GATEWAY_MODE
+                 else len(read_manifest(settings.manifest)["clients"]))
         return run_server(flower_grid(settings, count), settings)
 
     monkeypatch.setattr("fd_airquality.cli.launch_simulation", launch)

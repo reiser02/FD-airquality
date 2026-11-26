@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Iterable
+from copy import copy
 from pathlib import Path
 
 import numpy as np
@@ -61,8 +62,8 @@ def aggregate_training(contents: list[RecordDict], weighted_by_key: str) -> Metr
     return MetricRecord(metrics)
 
 
-def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: bool, settings, horizon: int,
-                             epoch_limit: int) -> None:
+def _check_training_windows(metrics, available: int, cap: int | None, dynamic: bool,
+                            epoch_limit: int) -> None:
     admissible = metrics["admissible-windows"]
     selected = metrics["num-examples"]
     unique = metrics["unique-training-windows"]
@@ -72,6 +73,10 @@ def _check_training_sampling(metrics, available: int, cap: int | None, dynamic: 
             and selected <= unique <= min(admissible, selected * epochs)
             and int(selected > 0) <= epochs <= (epoch_limit if selected else 0)):
         raise ValueError("Número de ventanas o épocas incompatible con el presupuesto de muestreo.")
+
+
+def _check_training_sampling(metrics, settings, horizon: int) -> None:
+    selected, epochs = metrics["num-examples"], metrics["epochs-completed"]
     sampled = metrics["sampled-window-occurrences"]
     replacement = metrics["replacement-window-occurrences"]
     originals = selected * epochs
@@ -172,10 +177,13 @@ def coverage_metrics(contents: list[RecordDict], manifest: dict) -> dict:
 class AuditedStrategy(Strategy):
     """Require the full declared station panel and select weights on validation only."""
 
-    def __init__(self, settings: RunSettings, manifest: dict, output: Path, tracker: RunTracker | None = None):
+    def __init__(self, settings: RunSettings, manifest: dict, output: Path, tracker: RunTracker | None = None,
+                 *, gateway_members: list[list[int]] | None = None):
         self.settings, self.manifest, self.output = settings, manifest, output
         self.tracker = tracker
-        count = len(manifest["clients"])
+        self.gateway_members = gateway_members
+        count = len(manifest["clients"]) if gateway_members is None else len(gateway_members)
+        self.client_count = count
         kwargs = {
             "fraction_train": 1.0, "fraction_evaluate": 1.0,
             "min_train_nodes": count, "min_evaluate_nodes": count, "min_available_nodes": count,
@@ -193,6 +201,7 @@ class AuditedStrategy(Strategy):
         self.best_score, self.best_round = float("inf"), -1
         self.history: list[dict] = []
         self.station_history: list[dict] = []
+        self.gateway_history: list[dict] = []
         self.runtime_nodes: dict[int, int] = {}
         self.validation_support: dict[int, tuple[int, int]] = {}
         self.monitoring_intervals: dict[int, tuple[int, int]] = {}
@@ -207,7 +216,7 @@ class AuditedStrategy(Strategy):
         geometry = self.manifest["geometry"]
         report_progress("train", f"round={server_round}/{self.settings.num_server_rounds} "
                         f"max_epochs={round_epoch_limit(geometry, self.settings, server_round)} "
-                        f"waiting_clients={len(self.manifest['clients'])}; clientes gestionados por Ray")
+                        f"waiting_clients={self.client_count}; clientes gestionados por Ray")
         self.current_arrays = arrays
         lower, cutoff = round_bounds(geometry, self.settings, server_round)
         if cutoff is not None:
@@ -227,7 +236,7 @@ class AuditedStrategy(Strategy):
                 and self.progressive and server_round < self.settings.num_server_rounds):
             return []
         report_progress(str(config.get("split", "validation")), f"round={server_round} "
-                        f"waiting_clients={len(self.manifest['clients'])}")
+                        f"waiting_clients={self.client_count}")
         return self._runtime_messages(self.delegate.configure_evaluate(server_round, arrays, config, grid))
 
     @property
@@ -237,11 +246,13 @@ class AuditedStrategy(Strategy):
 
     def _runtime_messages(self, messages: Iterable[Message]) -> list[Message]:
         messages = list(messages)
-        filtered = "runtime_selection" in self.manifest
+        filtered = self.gateway_members is not None or "runtime_selection" in self.manifest
         if filtered:
             available = {message.metadata.dst_node_id for message in messages}
+            count = self.client_count
+            if self.gateway_members is not None and len(available) != count:
+                raise RuntimeError(f"Flower debe proporcionar {count} nodos para la topología de gateways.")
             if not self.runtime_nodes:
-                count = len(self.manifest["clients"])
                 if len(available) < count:
                     raise RuntimeError("No hay suficientes nodos para el panel efectivo.")
                 self.runtime_nodes = {node: partition for partition, node in enumerate(sorted(available)[:count])}
@@ -253,12 +264,17 @@ class AuditedStrategy(Strategy):
             if filtered and node not in self.runtime_nodes:
                 continue
             extra = {"log-dir": str(self.output / "clients")}
+            contents = dict(message.content)
             if filtered:
-                extra.update({
-                "manifest": self.settings.manifest, "partition-id": self.runtime_nodes[node],
-                })
+                partition = self.runtime_nodes[node]
+                extra.update({"manifest": self.settings.manifest, "partition-id": partition})
+                if self.gateway_members is not None:
+                    members = self.gateway_members[partition]
+                    extra["station-partitions"] = members
+                    if not members:
+                        del contents["arrays"]
             config = ConfigRecord(dict(message.content["config"]) | extra)
-            result.append(Message(content=RecordDict(dict(message.content) | {"config": config}),
+            result.append(Message(content=RecordDict(contents | {"config": config}),
                                   dst_node_id=node, message_type=message.metadata.message_type))
         return result
 
@@ -280,79 +296,137 @@ class AuditedStrategy(Strategy):
 
     def _check_panel(self, replies: Iterable[Message], split: str, server_round: int = 0) -> list[Message]:
         replies = list(replies)
-        expected = set(range(len(self.manifest["clients"])))
+        expected = set(range(self.client_count))
         seen = set()
         for reply in replies:
             if reply.has_error():
-                raise RuntimeError(f"Falló una estación: {reply.error.reason}")
+                raise RuntimeError(f"Falló un cliente: {reply.error.reason}")
             metrics = reply.content["metrics"]
             partition = metrics["partition-id"]
             if partition not in expected or partition in seen:
                 raise ValueError(f"Identidad de cliente incorrecta o repetida: {partition}")
             seen.add(partition)
-            client = self.manifest["clients"][partition]
-            geometry = self.manifest["geometry"]
-            horizon = geometry["horizon"]
-            selection_half = split == "validation" and calibration_enabled(self.settings)
-            dynamic = selection_half or split == "train" and (
-                self.progressive
-                or self.settings.training_data_availability_threshold != "0.0"
-                or self.settings.training_availability != "{}")
-            available = client[f"num_{split}_windows"]
-            cap = geometry.get("max_train_windows") if split == "train" else None
-            limit = min(available, cap) if cap is not None else available
-            if (not 0 <= metrics["num-examples"] <= limit or (not dynamic and metrics["num-examples"] != limit)):
-                raise ValueError(f"Número de ventanas incoherente para {client['station']}.")
-            if split == "train" and self.progressive:
-                lower, cutoff = round_bounds(self.manifest["geometry"], self.settings, server_round)
-                if metrics.get("available-through-ns") != cutoff.value:
-                    raise ValueError("El cliente no respeta el reloj de llegada.")
-                if metrics.get("available-from-ns") != (lower.value if lower is not None else None):
-                    raise ValueError("El cliente no respeta el bloque de llegada.")
-                if metrics["num-examples"]:
-                    first = metrics.get("train-first-target-ns")
-                    last = metrics.get("train-last-target-ns")
-                    if first is None or last is None or first > last:
-                        raise ValueError("El cliente no acredita el intervalo de targets de entrenamiento.")
-                    if last >= cutoff.value:
-                        raise ValueError("Un target de entrenamiento aún no ha llegado.")
-                    if lower is not None and first < lower.value:
-                        raise ValueError("Un target de entrenamiento pertenece a un bloque anterior.")
-                self._check_monitoring_interval(metrics, geometry, server_round, partition)
-            if any(not np.isfinite(value) for value in metrics.values()):
-                raise ValueError("Una estación devolvió métricas no finitas.")
-            if split == "train":
-                if "admissible-windows" in metrics:
-                    epochs = round_epoch_limit(geometry, self.settings, server_round)
-                    _check_training_sampling(metrics, available, cap, dynamic, self.settings, horizon, epochs)
+            if self.gateway_members is None:
+                self._check_station(metrics, partition, split, server_round)
+                if split == "train" and "admissible-windows" in metrics:
+                    _check_training_sampling(metrics, self.settings, self.manifest["geometry"]["horizon"])
+            else:
+                if self.runtime_nodes.get(reply.metadata.src_node_id) != partition:
+                    raise ValueError(f"La identidad del nodo no coincide con el gateway {partition}.")
+                self._check_gateway(reply.content, partition, split, server_round)
+            if split == "train" and (self.gateway_members is None or metrics["num-examples"]):
                 arrays = reply.content["arrays"].to_numpy_ndarrays()
                 if any(not np.isfinite(array).all() for array in arrays):
-                    raise ValueError("Una estación devolvió pesos no finitos.")
-            elif selection_half:
-                examples, targets = metrics["num-examples"], metrics["num-targets"]
-                maximum = client.get("num_validation_targets", available * horizon)
-                support = (examples, targets)
-                if (not 0 < examples <= targets <= min(examples * horizon, maximum)
-                        or self.validation_support.setdefault(partition, support) != support):
-                    raise ValueError("Soporte de selección incoherente en la primera mitad de validación.")
-            elif metrics["num-targets"] != client.get(f"num_{split}_targets", metrics["num-examples"] * horizon):
-                raise ValueError("Número de targets incoherente.")
-            if split == "train" and self.manifest.get("schema_version", 4) >= 5:
-                support = metrics["num-targets"]
-                if (not metrics["num-examples"] <= support <= min(limit * horizon, client["num_train_targets"])
-                        or (not dynamic and limit == available and support != client["num_train_targets"])):
-                    raise ValueError("Número de targets de entrenamiento incoherente.")
+                    raise ValueError("Un cliente devolvió pesos no finitos.")
         if seen != expected:
-            raise RuntimeError(f"Panel incompleto; faltan estaciones {sorted(expected - seen)}")
+            raise RuntimeError(f"Panel incompleto; faltan clientes {sorted(expected - seen)}")
         # Ray completion order must not change floating-point aggregation order.
         return sorted(replies, key=lambda reply: reply.content["metrics"]["partition-id"])
 
+    def _check_station(self, metrics, partition: int, split: str, server_round: int) -> None:
+        client = self.manifest["clients"][partition]
+        geometry = self.manifest["geometry"]
+        horizon = geometry["horizon"]
+        selection_half = split == "validation" and calibration_enabled(self.settings)
+        dynamic = selection_half or split == "train" and (
+            self.progressive or self.settings.training_data_availability_threshold != "0.0"
+            or self.settings.training_availability != "{}")
+        available = client[f"num_{split}_windows"]
+        cap = geometry.get("max_train_windows") if split == "train" else None
+        limit = min(available, cap) if cap is not None else available
+        examples = metrics["num-examples"]
+        if not 0 <= examples <= limit or (not dynamic and examples != limit):
+            raise ValueError(f"Número de ventanas incoherente para {client['station']}.")
+        if split == "train" and self.progressive:
+            lower, cutoff = round_bounds(geometry, self.settings, server_round)
+            if metrics.get("available-through-ns") != cutoff.value:
+                raise ValueError("El cliente no respeta el reloj de llegada.")
+            if metrics.get("available-from-ns") != (lower.value if lower is not None else None):
+                raise ValueError("El cliente no respeta el bloque de llegada.")
+            if examples:
+                first, last = metrics.get("train-first-target-ns"), metrics.get("train-last-target-ns")
+                if first is None or last is None or first > last:
+                    raise ValueError("El cliente no acredita el intervalo de targets de entrenamiento.")
+                if last >= cutoff.value:
+                    raise ValueError("Un target de entrenamiento aún no ha llegado.")
+                if lower is not None and first < lower.value:
+                    raise ValueError("Un target de entrenamiento pertenece a un bloque anterior.")
+            self._check_monitoring_interval(metrics, geometry, server_round, partition)
+        if any(not np.isfinite(value) for value in metrics.values()):
+            raise ValueError("Una estación devolvió métricas no finitas.")
+        if split == "train":
+            if "admissible-windows" in metrics:
+                epochs = round_epoch_limit(geometry, self.settings, server_round)
+                _check_training_windows(metrics, available, cap, dynamic, epochs)
+            if self.manifest.get("schema_version", 4) >= 5:
+                support = metrics["num-targets"]
+                if (not examples <= support <= min(limit * horizon, client["num_train_targets"])
+                        or (not dynamic and limit == available and support != client["num_train_targets"])):
+                    raise ValueError("Número de targets de entrenamiento incoherente.")
+        elif selection_half:
+            maximum = client.get("num_validation_targets", available * horizon)
+            support = (examples, metrics["num-targets"])
+            if (not 0 < examples <= support[1] <= min(examples * horizon, maximum)
+                    or self.validation_support.setdefault(partition, support) != support):
+                raise ValueError("Soporte de selección incoherente en la primera mitad de validación.")
+        elif metrics["num-targets"] != client.get(f"num_{split}_targets", examples * horizon):
+            raise ValueError("Número de targets incoherente.")
+
+    def _check_gateway(self, content: RecordDict, partition: int, split: str, server_round: int) -> None:
+        members = self.gateway_members[partition]
+        metrics = content["metrics"]
+        if (set(content.metric_records) != {"metrics", *(f"station-{station}" for station in members)}
+                or metrics.get("num-stations") != len(members)
+                or any(not np.isfinite(value) for value in metrics.values())):
+            raise ValueError(f"Panel o métricas incorrectos para el gateway {partition}.")
+        rows = []
+        for station in members:
+            row = content[f"station-{station}"]
+            if row["partition-id"] != station:
+                raise ValueError(f"Estación incorrecta para el gateway {partition}.")
+            self._check_station(row, station, split, server_round)
+            rows.append(row)
+        if split == "train":
+            epochs = metrics["epochs-completed"]
+            for row in rows:
+                if (row["epochs-completed"] != (epochs if row["num-examples"] else 0)
+                        or row["num-targets"] != row["selected-target-occurrences"] / (epochs or 1)):
+                    raise ValueError("Soporte local incompatible con las épocas del gateway.")
+            for key in ("num-examples", "admissible-windows", "unique-training-windows",
+                        "selected-target-occurrences"):
+                if metrics[key] != sum(row[key] for row in rows):
+                    raise ValueError(f"La suma de las estaciones no coincide con el gateway: {key}.")
+            if ("arrays" in content) != bool(metrics["num-examples"]):
+                raise ValueError("El gateway debe actualizar pesos solo cuando entrenó con datos.")
+            _check_training_sampling(metrics, self.settings, self.manifest["geometry"]["horizon"])
+
+    def _station_contents(self, replies: list[Message]) -> list[RecordDict]:
+        if self.gateway_members is None:
+            return [reply.content for reply in replies]
+        stations = {}
+        for reply in replies:
+            gateway = reply.content["metrics"]["partition-id"]
+            for station in self.gateway_members[gateway]:
+                metrics = MetricRecord(dict(reply.content[f"station-{station}"]) | {"gateway-id": gateway})
+                stations[station] = RecordDict({"metrics": metrics})
+        return [stations[station] for station in sorted(stations)]
+
     def _record(self, server_round: int, split: str, replies: list, metrics: MetricRecord) -> None:
+        if self.gateway_members is not None:
+            activity_key = "num-examples" if split == "train" else "num-stations"
+            metrics.update({"num-clients": self.client_count, "num-stations": len(self.manifest["clients"]),
+                            "active-gateways": sum(reply.content["metrics"][activity_key] > 0
+                                                   for reply in replies)})
+            for reply in replies:
+                row = dict(reply.content["metrics"])
+                self.gateway_history.append({"round": server_round, "split": split,
+                                             "gateway-id": row.pop("partition-id"), **row})
+            pd.DataFrame(self.gateway_history).to_csv(self.output / "gateway_metrics.csv", index=False)
         self.history.append({"round": server_round, "split": split, **dict(metrics)})
         if self.tracker is not None:
             self.tracker.log_metrics(split, dict(metrics), server_round)
-        for reply in replies:
-            local_metrics = dict(reply.content["metrics"])
+        for content in self._station_contents(replies):
+            local_metrics = dict(content["metrics"])
             partition = local_metrics["partition-id"]
             row = {
                 "round": server_round, "split": split,
@@ -399,6 +473,15 @@ class AuditedStrategy(Strategy):
             metrics = aggregate_training([reply.content for reply in replies], "num-examples")
             metrics.update(diagnostics)
         else:
+            if self.gateway_members is not None:
+                # Flower expects one metric record per update; station records are
+                # audited here and are only used for panel metrics.
+                projected = []
+                for reply in active:
+                    message = copy(reply)
+                    message.content = RecordDict({key: reply.content[key] for key in ("arrays", "metrics")})
+                    projected.append(message)
+                active = projected
             arrays, _ = self.delegate.aggregate_train(server_round, active)
             metrics = aggregate_training([reply.content for reply in replies], "num-examples")
         if arrays is None or metrics is None:
@@ -416,10 +499,11 @@ class AuditedStrategy(Strategy):
         # Calendar support and undefined scaled metrics legitimately differ by
         # station. Our audited reducer pools them without Flower's equal-key
         # restriction; parameter aggregation still uses official FedAvg/FedProx.
-        metrics = aggregate_evaluation([reply.content for reply in replies], "num-examples")
+        contents = self._station_contents(replies)
+        metrics = aggregate_evaluation(contents, "num-examples")
         if metrics is None or self.current_arrays is None:
             raise RuntimeError("No hay evaluación o pesos globales.")
-        metrics.update(coverage_metrics([reply.content for reply in replies], self.manifest))
+        metrics.update(coverage_metrics(contents, self.manifest))
         self._record(server_round, "validation", replies, metrics)
         score = selection_value(dict(metrics), self.settings)
         if score < self.best_score:
@@ -437,10 +521,11 @@ class AuditedStrategy(Strategy):
             self.best_round, self.best_arrays, ConfigRecord({"split": "test"}), grid
         )
         replies = self._check_panel(grid.send_and_receive(messages, timeout=3600), "test")
-        metrics = aggregate_evaluation([reply.content for reply in replies], "num-examples")
+        contents = self._station_contents(replies)
+        metrics = aggregate_evaluation(contents, "num-examples")
         if metrics is None:
             raise RuntimeError("No se recibió el test federado.")
-        metrics.update(coverage_metrics([reply.content for reply in replies], self.manifest))
+        metrics.update(coverage_metrics(contents, self.manifest))
         self._record(self.best_round, "test", replies, metrics)
         if self.tracker is not None:
             self.tracker.log_metrics("selection", {"round": self.best_round, "validation_score": self.best_score}, self.best_round)

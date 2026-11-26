@@ -12,6 +12,7 @@ import pandas as pd
 OPERATIONAL_SETTINGS = {
     "seed", "manifest", "output_dir", "mlflow_tracking_uri",
     "mlflow_experiment", "mlflow_log_models", "heartbeat_seconds", "log_level",
+    "gateway_topology", "gateway_num_clients", "gateway_seed",
 }
 
 
@@ -20,6 +21,7 @@ def candidate_identity(run: dict) -> str:
         "settings": {key: value for key, value in run["settings"].items()
                      if key not in OPERATIONAL_SETTINGS},
         "mode": run["mode"], "model": run["model"],
+        "gateway_topology_sha256": run.get("gateway_topology_sha256"),
         "sources": run["application_sources"], "versions": run["versions"],
     }
     return sha256(json.dumps(definition, sort_keys=True).encode()).hexdigest()
