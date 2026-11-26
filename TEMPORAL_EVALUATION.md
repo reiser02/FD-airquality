@@ -68,7 +68,7 @@ se registra explícitamente como inactiva, con peso de agregación cero.
 
 ### Padding y completado de batches
 
-`[prepare].window-padding = "none" | "right" | "both"` controla exclusivamente el
+`[prepare-backtest].window-padding = "none" | "right" | "both"` controla exclusivamente el
 entrenamiento. `none` conserva el requisito de posiciones reales; `right` permite
 un horizonte parcial al final del intervalo autorizado; `both` permite también
 contexto virtual a la izquierda. El TOML principal usa `both`; el valor interno
@@ -180,8 +180,7 @@ history-hours = 672         # longitud de targets de ajuste si se usa sliding
 ```
 
 El calendario se detecta en los CSV seleccionados: empieza en la primera hora
-observada y acaba justo después de la última, tras el filtrado de calidad. No
-se heredan las fechas fijas de `[prepare]`. El programa reserva normalmente
+observada y acaba justo después de la última, tras el filtrado de calidad. El programa reserva normalmente
 alrededor del 40 % para el histórico inicial. Ajusta la reserva para permitir
 entrenar también con estaciones que arrancan más tarde cuando su tramo tiene
 espacio para el reparto, y para que quepan las ventanas mínimas de cada fold.
@@ -194,8 +193,7 @@ tras reservar tiempo para entrenamiento nuevo (hasta un cuarto del bloque),
 se reducen respetando los mínimos de ventanas. Las horas sobrantes pertenecen
 al entrenamiento. La CLI y el manifest
 indican las duraciones solicitadas y efectivas; si no caben los mínimos, la
-preparación falla en lugar de descartar un fold. Las duraciones de `[prepare]`
-para particiones individuales por estación no se heredan.
+preparación falla en lugar de descartar un fold.
 
 Los mínimos de ventanas se aplican por estación y fold. La preparación comprueba
 que queden al menos `min-stations` estaciones en la intersección de los folds;
@@ -363,7 +361,7 @@ estado inicial con el ajustado mediante validación antes de acceder a test.
 ## MASE y RMSSE
 
 ```toml
-[prepare]
+[prepare-backtest]
 seasonality = 24
 error-scale-hours = 672
 error-scale-reference = "training"  # o pre-evaluation

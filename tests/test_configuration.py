@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from fd_airquality.cli import _parser, main
-from fd_airquality.configuration import parse_configured_args
+from fd_airquality.configuration import INTERNAL_FOLD_FIELDS, parse_configured_args
 from fd_airquality.data import DataConfig
 from fd_airquality.settings import RunSettings
 
@@ -21,14 +21,15 @@ def test_toml_defaults_and_preparation_overrides_are_valid(tmp_path, monkeypatch
     monkeypatch.chdir(tmp_path)
     preparation = asdict(DataConfig()) | {"train_stride": 6}
     (tmp_path / "fd-airquality.toml").write_text(
-        "[prepare]\n" + "\n".join(
+        "[prepare-backtest]\n" + "\n".join(
             f"{key.replace('_', '-')} = {json.dumps(value)}"
-            for key, value in preparation.items() if value is not None
+            for key, value in preparation.items() if value is not None and key not in INTERNAL_FOLD_FIELDS
         ) + '\nstation = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]\n'
     )
-    data = arguments(["prepare"])
+    data = arguments(["prepare-backtest"])
     for key, value in asdict(DataConfig()).items():
-        assert getattr(data, key) == (6 if key == "train_stride" else value)
+        if key not in INTERNAL_FOLD_FIELDS:
+            assert getattr(data, key) == (6 if key == "train_stride" else value)
     assert data.station == ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
     for command in ("simulate", "baseline", "backtest"):
         args = arguments([command])
@@ -39,11 +40,12 @@ def test_toml_defaults_and_preparation_overrides_are_valid(tmp_path, monkeypatch
 
 def test_explicit_toml_is_valid_without_requiring_builtin_defaults(tmp_path):
     path = tmp_path / "experiment.toml"
-    path.write_text('[prepare]\npollutant = "PM25"\ncontext = 24\nhorizon = 6\nstride = 3\n'
+    path.write_text('[prepare-backtest]\npollutant = "PM25"\ncontext = 24\nhorizon = 6\nstride = 3\n'
                     '[run]\nseed = 17\nbatch-size = 16\n')
-    data = arguments(["prepare", "--config", str(path)])
+    data = arguments(["prepare-backtest", "--config", str(path)])
     geometry = DataConfig(**{field.name: getattr(data, field.name)
-                             for field in fields(DataConfig) if getattr(data, field.name) is not None})
+                             for field in fields(DataConfig) if field.name not in INTERNAL_FOLD_FIELDS
+                             and getattr(data, field.name) is not None})
     assert (geometry.context, geometry.horizon, geometry.stride) == (24, 6, 3)
     for command in ("simulate", "baseline", "backtest"):
         args = arguments([command, "--config", str(path)])
@@ -51,19 +53,18 @@ def test_explicit_toml_is_valid_without_requiring_builtin_defaults(tmp_path):
         assert (settings.seed, settings.batch_size) == (17, 16)
 
 
-@pytest.mark.parametrize("command", ["prepare", "prepare-backtest"])
-def test_window_padding_can_be_enabled_or_disabled_by_toml_and_cli(tmp_path, command):
+def test_window_padding_can_be_enabled_or_disabled_by_toml_and_cli(tmp_path):
     path = tmp_path / "padding.toml"
-    path.write_text('[prepare]\nwindow-policy = "masked"\nwindow-padding = "both"\n')
-    assert arguments([command, "--config", str(path)]).window_padding == "both"
+    path.write_text('[prepare-backtest]\nwindow-policy = "masked"\nwindow-padding = "both"\n')
+    assert arguments(["prepare-backtest", "--config", str(path)]).window_padding == "both"
     for mode in ("none", "right"):
-        assert arguments([command, "--config", str(path), "--window-padding", mode]).window_padding == mode
+        assert arguments(["prepare-backtest", "--config", str(path), "--window-padding", mode]).window_padding == mode
 
 
 def test_no_file_uses_builtin_defaults(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     assert arguments(["simulate"]).batch_size == RunSettings().batch_size
-    assert arguments(["prepare"]).context is None
+    assert arguments(["prepare-backtest"]).context is None
     assert arguments(["backtest"]).stage == "evaluation"
     assert arguments(["backtest", "--stage", "development"]).stage == "development"
 
@@ -107,12 +108,10 @@ def test_main_config_shares_batch_budget_and_controls_in_all_training_modes():
     assert (data.stride, data.train_stride) == (4, 4)
 
 
-def test_backtest_inherits_geometry_but_not_the_fixed_cuts_or_station_split_lengths(tmp_path):
+def test_backtest_accepts_geometry_and_durations_without_fixed_cuts(tmp_path):
     path = tmp_path / "experiment.toml"
-    path.write_text('[prepare]\ncontext = 16\nvalidation-start = "2026-03-01"\n'
-                    'test-start = "2026-03-29"\ntest-end = "2026-04-26"\nvalidation-hours = 48\ntest-hours = 96\n'
-                    'min-train-windows = 16\nmin-validation-windows = 7\nmin-test-windows = 15\n'
-                    '[prepare-backtest]\nfolds = 3\ntest-hours = 504\nmin-stations = 12\nmin-validation-windows = 10\n')
+    path.write_text('[prepare-backtest]\ncontext = 16\nfolds = 3\ntest-hours = 504\nmin-stations = 12\n'
+                    'min-train-windows = 16\nmin-validation-windows = 10\nmin-test-windows = 15\n')
     args = ["prepare-backtest", "--config", str(path)]
     temporal = arguments([*args, "--folds", "1", "--test-hours", "672", "--min-stations", "8"])
     assert (temporal.context, temporal.folds) == (16, 1)
@@ -121,8 +120,8 @@ def test_backtest_inherits_geometry_but_not_the_fixed_cuts_or_station_split_leng
     assert arguments(args).test_hours == 504
     assert (arguments(args).min_stations, temporal.min_stations) == (12, 8)
     assert (temporal.min_train_windows, temporal.min_validation_windows, temporal.min_test_windows) == (16, 10, 15)
-    standalone = arguments(["prepare", "--config", str(path)])
-    assert (standalone.test_end, standalone.validation_hours, standalone.test_hours) == ("2026-04-26", 48, 96)
+    with pytest.raises(SystemExit):
+        arguments(["prepare", "--config", str(path)])
 
 
 def test_new_blocks_are_default_without_changing_fold_history(tmp_path, monkeypatch):
@@ -148,7 +147,7 @@ def test_new_blocks_are_default_without_changing_fold_history(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("text", [
-    '[prepare]\npollutant = "NO2"\n',
+    '[prepare-backtest]\npollutant = "NO2"\n',
     '[run]\nbatch-size = -1\n',
     'invalid TOML [',
 ])
@@ -157,7 +156,7 @@ def test_default_config_fixture_excludes_working_directory_experiments(tmp_path,
     user_directory.mkdir()
     (user_directory / "fd-airquality.toml").write_text(text)
     monkeypatch.chdir(user_directory)
-    assert arguments(["prepare"]).pollutant == "PM25"
+    assert arguments(["prepare-backtest"]).pollutant == "PM25"
     assert arguments(["simulate"]).batch_size == RunSettings().batch_size
 
 
@@ -186,11 +185,11 @@ def test_explicit_config_works_before_and_after_command(tmp_path, monkeypatch, b
 def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "fd-airquality.toml").write_text(
-        '[prepare]\nstation = ["old-a", "old-b"]\n'
+        '[prepare-backtest]\nstation = ["old-a", "old-b"]\n'
         '[backtest]\nmodels = ["mlp", "autoencoder"]\nseeds = [1, 2]\n'
     )
-    assert arguments(["prepare"]).station == ["old-a", "old-b"]
-    assert arguments(["prepare", "--station", "new"]).station == ["new"]
+    assert arguments(["prepare-backtest"]).station == ["old-a", "old-b"]
+    assert arguments(["prepare-backtest", "--station", "new"]).station == ["new"]
     args = arguments(["backtest", "--models", "nlinear", "--seeds", "42"])
     assert (args.models, args.seeds) == (["nlinear"], [42])
 
@@ -215,7 +214,8 @@ def test_cli_lists_and_repeated_stations_replace_file_values(tmp_path, monkeypat
     ('[backtest]\nseeds = []', r"\[backtest\]\.seeds: se requiere una lista no vacía"),
     ('[simulate]\nprint-command = 1', r"\[simulate\]\.print-command: tipo inválido"),
     ('[run]\nlearning-rate = true', r"\[run\]\.learning-rate: tipo inválido"),
-    ('[prepare]\nraw-root = 1', r"\[prepare\]\.raw-root: tipo inválido"),
+    ('[prepare-backtest]\nraw-root = 1', r"\[prepare-backtest\]\.raw-root: tipo inválido"),
+    ('[prepare]\ncontext = 90', r"\[prepare\].*Traslada el preprocesamiento a \[prepare-backtest\]"),
     ('[run]\nlora-rank = 4\nlora_rank = 8', r"Opción duplicada .*\[run\]\.lora_rank"),
     ('run = 1', r"\[run\] debe ser una tabla TOML"),
     ('[run', "TOML inválido"),
@@ -250,8 +250,8 @@ def test_config_paths_and_scalar_types_follow_cli_semantics(tmp_path, monkeypatc
     nested = tmp_path / "config"
     nested.mkdir()
     path = nested / "custom.toml"
-    path.write_text('[prepare]\nraw-root = "raw"\n[run]\nlearning-rate = 1\n[simulate]\nprint-command = true\n')
-    assert arguments(["prepare", "--config", str(path)]).raw_root == Path("raw")
+    path.write_text('[prepare-backtest]\nraw-root = "raw"\n[run]\nlearning-rate = 1\n[simulate]\nprint-command = true\n')
+    assert arguments(["prepare-backtest", "--config", str(path)]).raw_root == Path("raw")
     args = arguments(["simulate", "--config", str(path)])
     assert args.print_command is True
     assert args.learning_rate == 1.0
@@ -283,20 +283,22 @@ def test_main_passes_file_geometry_and_cli_station_to_preparation(tmp_path, monk
     monkeypatch.chdir(tmp_path)
     output = tmp_path / "prepared"
     config = tmp_path / "experiment.toml"
-    config.write_text('[prepare]\ncontext = 16\nhorizon = 4\nstation = ["old"]\n'
+    config.write_text('[prepare-backtest]\ncontext = 16\nhorizon = 4\nstation = ["old"]\n'
                       'raw-root = "raw"\npollutant = "PM25"\n')
     received = []
 
-    def prepare(*args):
-        received.append(args)
+    def prepare_backtest(*args, **options):
+        received.append((args, options))
         return tmp_path / "manifest.json"
 
-    monkeypatch.setattr("fd_airquality.cli.prepare", prepare)
+    monkeypatch.setattr("fd_airquality.backtesting.prepare_backtest", prepare_backtest)
     monkeypatch.setattr("fd_airquality.cli._inspect", lambda *_: None)
-    main(["prepare", "--config", str(config), "--station", "new", "--stride", "2", "--output", str(output)])
-    (raw_root, prepared_output, pollutant, geometry, stations), = received
+    main(["prepare-backtest", "--config", str(config), "--folds", "1", "--station", "new",
+          "--stride", "2", "--output", str(output)])
+    ((raw_root, prepared_output, pollutant, geometry, stations), options), = received
     assert (geometry.context, geometry.horizon, geometry.stride) == (16, 4, 2)
     assert (raw_root, prepared_output, pollutant, stations) == (tmp_path / "raw", output, "PM25", {"new"})
+    assert options["folds"] == 1
 
 
 def test_logging_and_parallelism_options_respect_toml_and_cli_precedence(tmp_path, monkeypatch):

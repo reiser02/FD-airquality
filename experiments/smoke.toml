@@ -1,6 +1,8 @@
-[prepare]
+[prepare-backtest]
 raw-root = "data/raw/datos_estaciones_5m"
-output = "data/smoke"
+output = "data/smoke_backtests"
+folds = 2
+train-history = "expanding"
 pollutant = "PM25"
 context = 90
 horizon = 12
@@ -23,11 +25,6 @@ probabilistic = 1
 batch-size = 8
 mlflow-tracking-uri = "disabled"
 selection-metric = "macro-mase"
-
-[prepare-backtest]
-output = "data/smoke_backtests"
-folds = 2
-train-history = "expanding"
 
 [backtest]
 models = ["mlp", "autoencoder", "nlinear", "nhits"]

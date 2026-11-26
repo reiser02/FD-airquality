@@ -41,17 +41,16 @@ no se ejecuta al instalar.
 Ejecuta los comandos desde la raíz de este repositorio. La CLI carga automáticamente
 [`fd-airquality.toml`](fd-airquality.toml): PM2.5, contexto común de **90 horas**, horizonte
 de 12 y ventanas cada **4 horas** en entrenamiento y evaluación. `prepare-backtest` calcula el calendario a
-partir de los CSV, incluso con un solo fold. Las fechas de `[prepare]` se usan solo
-para preparaciones individuales con `prepare`. Los extremos derechos son exclusivos.
+partir de los CSV, incluso con un solo fold. Los extremos derechos son exclusivos.
 Se conserva el calendario sin zona de los CSV, sin presumir que sea UTC.
 
 `PM25` es el único contaminante admitido; también se acepta `pm25` en CLI y TOML.
 Se leen únicamente los CSV de PM25, sin modificar los archivos de otros contaminantes.
 Los manifests históricos de otros contaminantes no se usan para nuevas ejecuciones:
-vuelve a ejecutar `prepare` o `prepare-backtest` para generar los de PM25.
+vuelve a ejecutar `prepare-backtest` para generar los de PM25.
 
-Para depurar una ejecución individual, `simulate` usa la preparación de PM25
-más reciente creada con `prepare`, calcula automáticamente cuántas
+Para depurar una ejecución individual, ejecuta `prepare-backtest --folds 1`.
+`simulate` usa la preparación de PM25 de un fold más reciente, calcula cuántas
 estaciones hay y lanza **`uv run --frozen flwr run`**, con el simulador oficial
 Ray y la API de mensajes de Flower 1.40. Con el TOML raíz ejecuta cinco rondas
 con hasta 50 épocas locales por ronda. Ejecuta un cliente simultáneo por GPU
@@ -75,16 +74,13 @@ Para una misma clave, la prioridad es:
 
 **argumento explícito en CLI > sección del comando > `[run]` > valor interno**.
 
-- `[prepare]`: fuentes, filtrado y geometría temporal.
+- `[prepare-backtest]`: fuentes, filtrado, geometría, folds, panel e historial.
 - `[run]`: opciones compartidas por `simulate`, `baseline` y `backtest`.
 - `[simulate]`, `[baseline]`, `[backtest]`: opciones específicas y valores que
   sobrescriben `[run]`. Conviene fijar `manifest` y `output-dir` en estas tablas:
-  `backtest` requiere otro tipo de manifest. Si preparaste datos en una ruta
-  personalizada, indícalo: la búsqueda automática solo mira `data/federated/`
-  o `data/backtests/`.
-- `[prepare-backtest]`: folds, mínimo de estaciones comunes, historial y duraciones de validación y test por
-  fold. Hereda `[prepare]` salvo sus fechas fijas, duraciones por estación y directorio
-  de salida; las claves propias prevalecen sobre las heredadas.
+  `backtest` usa `backtest_manifest.json`; `simulate` y `baseline` admiten el de
+  una preparación de un fold o el `manifest.json` del fold elegido. Si preparaste
+  datos en una ruta personalizada, indícalo: la búsqueda automática mira `data/backtests/`.
 - `[missing]`: políticas de contexto por modelo cuando `missing-policy = "auto"`.
 - `[availability]`: umbrales por modelo que prevalecen sobre el umbral general
   (`training-data-availability-threshold`), sin cambiar la evaluación.
@@ -93,7 +89,7 @@ Para una misma clave, la prioridad es:
   como argumento posicional en la CLI.
 
 Las claves coinciden con los argumentos, sin `--`. Usa arrays TOML no vacíos para
-listas y comillas para las fechas de corte. `print-command` y
+listas. `print-command` y
 `allow-training-differences` usan booleanos TOML (`true`/`false`); opciones como
 `early-stopping` y `probabilistic` usan enteros `0`/`1`. Por ejemplo:
 
@@ -124,7 +120,8 @@ Los argumentos de listas sustituyen la lista del archivo, también `--station`.
 `--no-print-command` permite desactivar un `print-command = true` del archivo.
 
 Si tienes un TOML antiguo con `[benchmark]`, traslada sus opciones a `[backtest]`
-y elimina la sección antigua. Para ejecutar la matriz en un único corte global,
+y elimina la sección antigua. Las opciones de preprocesamiento de `[prepare]`
+pasan a `[prepare-backtest]`; elimina los cortes fijos. Para un único corte global,
 fija `folds = 1` en `[prepare-backtest]` o usa `prepare-backtest --folds 1`.
 
 Tras reservar el histórico inicial, el calendario observado se divide en bloques
@@ -151,8 +148,7 @@ al menos 15 estaciones en común entre los folds. Puedes cambiarlo en el TOML
 o con `prepare-backtest --min-stations N`. Para una prueba con una selección
 explícita (`--station` o `station = [...]`), basta con una estación común.
 En ambos casos siguen aplicándose los mínimos por estación y fold
-`min-train-windows`, `min-validation-windows` y `min-test-windows`, heredados de
-`[prepare]` y configurables también en `[prepare-backtest]`.
+`min-train-windows`, `min-validation-windows` y `min-test-windows`.
 
 Para comparar estrategias, usa **la misma preparación de folds**:
 
@@ -164,7 +160,7 @@ uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_m
 ### Prueba pequeña con datos reales
 
 ```bash
-uv run fd-airquality prepare --pollutant PM25 --max-train-windows 128 \
+uv run fd-airquality prepare-backtest --folds 1 --max-train-windows 128 \
   --station 'AQN1 - Puerto' --station 'AQN3 - Paseo Alfonso XIII'
 uv run fd-airquality simulate --num-server-rounds 2
 ```
@@ -173,10 +169,9 @@ uv run fd-airquality simulate --num-server-rounds 2
 batch de cada actualización. Cada época vuelve a sortear del conjunto admisible
 completo; en federado, solo del bloque de la ronda. Omite el límite para recorrer
 todas las ventanas en cada época. La preparación registra la cuota en el manifest,
-pero conserva el conjunto completo. Vuelve a ejecutar `prepare` o `prepare-backtest`
+pero conserva el conjunto completo. Vuelve a ejecutar `prepare-backtest`
 para aplicar el cambio a datos ya preparados. También admite
-`--raw-root`, `--context`, `--horizon`,
-`--validation-start`, `--test-start`, `--test-end`, `--train-stride` y mínimos
+`--raw-root`, `--context`, `--horizon`, `--train-stride` y mínimos
 `--min-train-windows`, `--min-validation-windows`, `--min-test-windows`
 (valores internos 1/7/15; el TOML raíz exige 16/7/15).
 `--error-scale-hours 672` fija la referencia de MASE/RMSSE a cuatro semanas;
@@ -186,11 +181,11 @@ al acumular 24 horas observadas a cero se marca el fallo. Los huecos pausan el
 contador, no lo reinician ni cuentan como ceros. Solo una hora válida no nula lo reinicia.
 No se exige una racha para todo el test: cada ventana de evaluación abarca
 90 + 12 horas de calendario y, con `masked`, puede contener valores ausentes.
-En entrenamiento, `[prepare].window-padding = "none" | "right" | "both"` permite
+En entrenamiento, `[prepare-backtest].window-padding = "none" | "right" | "both"` permite
 desactivar el padding, añadirlo a la derecha o a ambos extremos. El TOML principal
 activa `both`; para desactivarlo, usa `window-padding = "none"` y prepara de nuevo.
 No cambia las etiquetas ni las ventanas de evaluación.
-Consulta `uv run fd-airquality prepare --help` y `uv run fd-airquality simulate --help`.
+Consulta `uv run fd-airquality prepare-backtest --help` y `uv run fd-airquality simulate --help`.
 
 ## Comparar modelos con y sin federación
 
@@ -353,12 +348,13 @@ uv run fd-airquality backtest --manifest data/backtests/<preparacion>/backtest_m
 O ejecutar un caso individual:
 
 ```bash
-uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.json --model autoencoder
-uv run fd-airquality baseline --manifest data/federated/<preparacion>/manifest.json --model autoencoder --mode local
-uv run fd-airquality baseline --manifest data/federated/<preparacion>/manifest.json --model autoencoder --mode centralized
-uv run fd-airquality baseline --manifest data/federated/<preparacion>/manifest.json --model ttm-r3 --mode zero-shot
-uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.json --model ttm-r3 --adaptation flora
-uv run fd-airquality simulate --manifest data/federated/<preparacion>/manifest.json --model patchtst-fm-r2 --adaptation lora-fair
+uv run fd-airquality prepare-backtest --folds 1
+uv run fd-airquality simulate --model autoencoder
+uv run fd-airquality baseline --model autoencoder --mode local
+uv run fd-airquality baseline --model autoencoder --mode centralized
+uv run fd-airquality baseline --model ttm-r3 --mode zero-shot
+uv run fd-airquality simulate --model ttm-r3 --adaptation flora
+uv run fd-airquality simulate --model patchtst-fm-r2 --adaptation lora-fair
 uv run fd-airquality compare reports/<ejecucion1> reports/<ejecucion2>
 ```
 
@@ -585,7 +581,7 @@ monitor, no una prueba de avance del entrenamiento ni una estimación de finaliz
 El mismo intervalo limita los mensajes intermedios por lotes. Se puede reducir,
 por ejemplo con `--heartbeat-seconds 15`, o ajustar el nivel mediante
 `--log-level DEBUG|INFO|WARNING|ERROR` (predeterminado `INFO`). También son opciones
-de `[run]` en el TOML; para preparar datos pertenecen a `[prepare]` o `[prepare-backtest]`.
+de `[run]` en el TOML; para preparar datos pertenecen a `[prepare-backtest]`.
 
 Los baselines independientes guardan `run.log` en su directorio de resultados.
 `simulate` conserva el flujo real de Flower en `flower.log`, además del `run.log`
@@ -681,13 +677,12 @@ usa los archivos locales. Los logs detallados de actores Ray se conservan localm
 ## Resultados y auditoría
 
 `prepare-backtest` crea una familia nueva bajo `data/backtests/`, con un
-`backtest_manifest.json` que apunta a los manifests de cada fold. Tanto los folds
-como las preparaciones individuales de `prepare` (bajo `data/federated/`) guardan:
+`backtest_manifest.json` que apunta a los manifests de cada fold. La familia
+guarda `prepare.log` al ejecutar la CLI. Cada fold guarda:
 
 - `manifest.json`: identidad, protocolo, hashes y metadatos de cada cliente; sin mediciones ni escaladores.
 - `clients/000/series.npz`, etc.: serie e índices de ventanas **locales** a cada estación.
 - `stations.csv`, `blocks.csv`, `excluded_stations.csv`: fragmentación, soporte y exclusiones.
-- `prepare.log`: log de la preparación cuando se ejecuta mediante la CLI.
 - `retention.json`: ventanas y horas únicas retenidas respecto al entrenamiento
   disponible antes del corte, antes de cualquier límite de prueba.
 

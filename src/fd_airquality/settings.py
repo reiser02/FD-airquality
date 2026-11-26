@@ -10,7 +10,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class RunSettings:
-    manifest: str = "data/federated/manifest.json"
+    manifest: str = ""
     output_dir: str = "reports/federated"
     num_server_rounds: int = 5
     local_epochs: int = 1
@@ -169,17 +169,33 @@ class RunSettings:
 
 
 def resolve_manifest(path: str | None, *, backtest: bool = False) -> Path:
+    from fd_airquality.artifacts import file_digest
+    from fd_airquality.loaders import POLLUTANT, normalize_pollutant
+
     if path:
         result = Path(path).expanduser().resolve()
         if not result.is_file():
             raise FileNotFoundError(f"No existe el manifest: {result}")
+        document = json.loads(result.read_text(encoding="utf-8"))
+    else:
+        for result in sorted(Path("data/backtests").glob("*/backtest_manifest.json"),
+                             key=lambda entry: entry.stat().st_mtime_ns, reverse=True):
+            document = json.loads(result.read_text(encoding="utf-8"))
+            if document.get("pollutant") == POLLUTANT and (backtest or len(document.get("folds", [])) == 1):
+                result = result.resolve()
+                break
+        else:
+            command = "prepare-backtest" if backtest else "prepare-backtest --folds 1"
+            raise FileNotFoundError(f"No hay datos preparados de {POLLUTANT}; ejecuta uv run fd-airquality {command}.")
+    if backtest or "folds" not in document:
         return result
-    from fd_airquality.loaders import POLLUTANT
-
-    root, filename, command = (("data/backtests", "backtest_manifest.json", "prepare-backtest")
-                               if backtest else ("data/federated", "manifest.json", "prepare"))
-    candidates = [entry for entry in Path(root).glob(f"*/{filename}")
-                  if json.loads(entry.read_text(encoding="utf-8")).get("pollutant") == POLLUTANT]
-    if not candidates:
-        raise FileNotFoundError(f"No hay datos preparados de {POLLUTANT}; ejecuta uv run fd-airquality {command}.")
-    return max(candidates, key=lambda entry: entry.stat().st_mtime_ns).resolve()
+    normalize_pollutant(document.get("pollutant"))
+    if len(document["folds"]) != 1:
+        raise ValueError("Para una ejecución individual usa prepare-backtest --folds 1 o el manifest de un fold.")
+    entry = document["folds"][0]
+    fold = (result.parent / entry["manifest"]).resolve()
+    if not fold.is_file():
+        raise FileNotFoundError(f"No existe el manifest del fold: {fold}")
+    if file_digest(fold) != entry["sha256"]:
+        raise ValueError(f"El manifest del fold ha cambiado: {fold}")
+    return fold

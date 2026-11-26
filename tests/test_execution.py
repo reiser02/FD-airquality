@@ -216,6 +216,7 @@ def test_single_fold_backtest_cli_keeps_the_matrix_and_uses_isolated_processes(
 ):
     from mlflow import MlflowClient
 
+    from fd_airquality.configuration import INTERNAL_FOLD_FIELDS
     from fd_airquality.data import read_manifest
     from fd_airquality.tracking import backtest_tags
 
@@ -224,11 +225,11 @@ def test_single_fold_backtest_cli_keeps_the_matrix_and_uses_isolated_processes(
     config = tmp_path / "experiment.toml"
     data_options = "\n".join(
         f"{key.replace('_', '-')} = {json.dumps(value)}"
-        for key, value in asdict(geometry).items() if value is not None
+        for key, value in asdict(geometry).items() if value is not None and key not in INTERNAL_FOLD_FIELDS
     )
     config.write_text(
-        f'[prepare]\nraw-root = "{raw}"\n{data_options}\n'
-        '[prepare-backtest]\nfolds = 1\nvalidation-hours = 24\ntest-hours = 48\nmin-stations = 2\n'
+        f'[prepare-backtest]\nraw-root = "{raw}"\n{data_options}\n'
+        'folds = 1\nvalidation-hours = 24\ntest-hours = 48\nmin-stations = 2\n'
         f'[run]\nnum-server-rounds = 1\nhidden-size = 8\nmlflow-tracking-uri = "{mlflow_uri}"\n'
         '[backtest]\noutput-dir = "matrix"\nmodels = ["mlp", "autoencoder"]\n'
         'modes = ["local", "centralized"]\nseeds = [23]\n'

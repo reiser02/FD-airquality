@@ -37,13 +37,13 @@ Validación y test no repiten ventanas ni cambian sus lotes. Un conjunto vacío 
 fabrica muestras: una ronda federada queda inactiva; un ajuste completo sin
 ventanas falla. El sorteo y el reemplazo son reproducibles con la semilla.
 
-La cuota se configura en `[prepare]`, `[prepare-backtest]` o con
+La cuota se configura en `[prepare-backtest]` o con
 `--max-train-windows`. Queda registrada en el manifest y solo se aplica al
 entrenar. Si la cuota ya coincide, se puede reutilizar la preparación: `batch-size`
 y `pad-last-batch` se leen al arrancar el entrenamiento.
 
 ```toml
-[prepare]
+[prepare-backtest]
 max-train-windows = 1000
 
 [run]
@@ -80,7 +80,7 @@ la arquitectura ni que el resultado sea mejor.
 El padding externo del protocolo se configura al **preparar**:
 
 ```toml
-[prepare]
+[prepare-backtest]
 window-policy = "masked"
 window-padding = "both"  # none | right | both
 ```
@@ -104,7 +104,6 @@ El TOML principal activa `both`; sin esa opción, el valor interno es `none`.
 También se puede desactivar desde CLI:
 
 ```bash
-uv run --frozen fd-airquality prepare --window-padding none
 uv run --frozen fd-airquality prepare-backtest --window-padding none
 ```
 

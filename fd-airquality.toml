@@ -3,11 +3,21 @@
 # Prioridad: argumentos CLI > sección del comando > [run] > valores internos.
 # Las rutas relativas se interpretan desde el directorio de ejecución, como en CLI.
 
-[prepare]
+[prepare-backtest]
 # Carpeta con los CSV originales organizados por estación.
 raw-root = "data/raw/datos_estaciones_5m"
-# Raíz donde se guardan las preparaciones inmutables, inventarios y manifests.
-output = "data/federated"
+# Raíz de los folds y de su backtest_manifest.json.
+output = "data/backtests"
+# Número de folds; usa 1 para un solo corte automático.
+folds = 4
+# Mínimo de estaciones en el panel común al usar todas. Con una selección explícita basta una.
+min-stations = 15
+# Horas de validación y test por fold (672 = 28 días cada uno); se reducen si no caben.
+validation-hours = 672
+test-hours = 672
+# "expanding" conserva todo el pasado; "sliding" limita el histórico de targets.
+train-history = "expanding"
+history-hours = 672
 # Único contaminante admitido: "PM25" (también "pm25").
 pollutant = "PM25"
 # Horas históricas que recibe el modelo en cada ventana de entrada.
@@ -26,7 +36,7 @@ min-validation-windows = 7
 min-test-windows = 15
 # Cuota opcional por estación y época: se vuelve a sortear del conjunto admisible.
 # Si se omite, se usan todas las ventanas admisibles en cada época.
-# max-train-windows = 128
+max-train-windows = 256
 # Lista de nombres exactos de directorio; si se omite, se usan todas las estaciones.
 # station = ["AQN1 - Puerto", "AQN3 - Paseo Alfonso XIII"]
 # "masked" conserva huecos y enmascara los targets ausentes; "strict" exige ventanas completas.
@@ -69,27 +79,7 @@ upct-valid-flags = ""
 # Horas observadas con media cero acumuladas antes de marcarlas como congeladas.
 # Las horas ausentes pausan el contador; una hora no nula lo reinicia.
 zero-run-hours = 24
-# Política temporal: global usa los mismos cortes de calendario para todas las estaciones;
-# station usa holdouts por estación con validation-hours/test-hours y exige window-policy = "strict".
-split-mode = "global"
-# Filtrado de calidad causal (sin eliminar datos pasados usando observaciones futuras).
-# El protocolo global requiere causal; retrospective solo se admite con split-mode = "station".
-quality-mode = "causal"
-# Cortes globales de prepare: fechas entre comillas, alineadas a la hora y sin zona horaria.
-# Límite inferior inclusivo para targets de entrenamiento; debe preceder a validation-start.
-# Si se omite, se usa todo el pasado admisible.
-# train-start = "2026-01-01"
-# Inicio de los objetivos de validación en modo global; el intervalo termina en test-start.
-validation-start = "2026-03-01"
-# Inicio de los objetivos de test; también es el final exclusivo del periodo de validación.
-test-start = "2026-03-29"
-# Final exclusivo de los objetivos de test en modo global.
-test-end = "2026-04-26"
-# Duración horaria del holdout de validación; solo se usa con split-mode = "station".
-validation-hours = 48
-# Duración horaria del holdout de test; solo se usa con split-mode = "station".
-test-hours = 96
-# Opciones de log que también hereda prepare-backtest; ver [run] para los valores admitidos.
+# INFO muestra el reparto; DEBUG añade detalles por estación.
 # log-level = "INFO"
 # heartbeat-seconds = 60.0
 
@@ -98,7 +88,7 @@ test-hours = 96
 [run]
 # Se pueden compartir las rutas, pero es preferible fijarlas en cada comando:
 # backtest necesita un backtest_manifest.json, no el manifest.json de prepare.
-# manifest = "data/federated/<preparacion>/manifest.json"
+# manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # output-dir = "reports/experimentos"
 # Número de rondas federadas por candidato y fold. No repite los ajustes local ni centralizado.
 num-server-rounds = 5
@@ -255,8 +245,8 @@ flowstate-r1 = "native"
 # nlinear = 0.5
 
 [simulate]
-# Manifest de prepare. Si se omite, se busca el más reciente bajo data/federated/.
-# manifest = "data/federated/<preparacion>/manifest.json"
+# Manifest de un fold o de una preparación con folds = 1. Por defecto se busca la última de un solo fold.
+# manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # Directorio base para los resultados de las simulaciones Flower.
 output-dir = "reports/federated"
 # Paralelismo automático: un cliente por GPU utilizable, hasta el número de estaciones.
@@ -264,35 +254,13 @@ output-dir = "reports/federated"
 print-command = false
 
 [baseline]
-# Manifest de prepare. Si se omite, se busca el más reciente bajo data/federated/.
-# manifest = "data/federated/<preparacion>/manifest.json"
+# Manifest de un fold o de una preparación con folds = 1. Por defecto se busca la última de un solo fold.
+# manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 # Directorio base de resultados para ejecuciones sin Flower.
 output-dir = "reports/non_federated"
 # Método de control: local entrena por estación; centralized junta entrenamiento;
 # zero-shot evalúa Granite sin adaptación ni entrenamiento.
 mode = "local"
-
-[prepare-backtest]
-# Hereda opciones de [prepare] salvo output, las fechas fijas y las duraciones por estación.
-# Requiere split-mode = "global" y quality-mode = "causal".
-# Raíz para los folds y su backtest_manifest.json; no cambia la búsqueda de backtest.
-output = "data/backtests"
-# INFO muestra el reparto; DEBUG añade detalles por estación. Los avisos y errores se guardan en el log.
-# log-level = "INFO"
-# Número de folds; usa 1 para un solo corte. El calendario se calcula a partir de los CSV.
-folds = 4
-# Cuota de ventanas distintas de entrenamiento por estación y época.
-max-train-windows = 256
-# Mínimo de estaciones en el panel común al usar todas. Con una selección explícita basta una.
-min-stations = 15
-# Horas objetivo de validación y test por fold (672 = 28 días cada uno). Se reducen si no caben.
-validation-hours = 672
-test-hours = 672
-# Todos los folds reinician modelos y escaladores; solo se reutilizan datos.
-# "expanding" conserva todo el pasado; "sliding" limita el histórico de targets.
-train-history = "expanding"
-# Horas de histórico de targets si train-history = "sliding".
-history-hours = 672
 
 [backtest]
 # Directorio base; cada backtest se guarda en una subcarpeta con fecha y hora.
@@ -330,7 +298,7 @@ seeds = [42]
 # max-parallel-models = 2
 
 # [inspect]
-# Manifest individual o de backtest. Si se omite, busca la última preparación de data/federated/.
+# Manifest de un fold o del backtest. Si se omite, se busca la última preparación de data/backtests/.
 # manifest = "data/backtests/<preparacion>/backtest_manifest.json"
 
 # [compare]

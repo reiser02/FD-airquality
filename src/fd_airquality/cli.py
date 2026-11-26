@@ -16,8 +16,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from fd_airquality.backtesting import DEFAULT_EVALUATION_HOURS, DEFAULT_MIN_STATIONS
-from fd_airquality.configuration import STANDALONE_PREPARE_FIELDS, parse_configured_args
-from fd_airquality.data import DataConfig, prepare, read_manifest
+from fd_airquality.configuration import INTERNAL_FOLD_FIELDS, parse_configured_args
+from fd_airquality.data import DataConfig, read_manifest
 from fd_airquality.execution import usable_gpu_slots
 from fd_airquality.lightweight import STATION_CONTROLS
 from fd_airquality.loaders import POLLUTANT
@@ -43,27 +43,27 @@ def _parser() -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParse
     parser.add_argument("--config", type=Path, default=argparse.SUPPRESS,
                         help="Archivo TOML; por defecto fd-airquality.toml en el directorio actual.")
     commands = parser.add_subparsers(dest="command", required=True)
-    data = commands.add_parser("prepare", help="Preprocesar y auditar cada estación por separado.")
     temporal_data = commands.add_parser("prepare-backtest", help="Repartir el calendario observado en folds globales.")
-    for command in (data, temporal_data):
-        command.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"))
-        command.add_argument("--output", type=Path, default=Path("data/backtests" if command is temporal_data else "data/federated"))
-        command.add_argument("--pollutant", choices=[POLLUTANT, POLLUTANT.lower()], default=POLLUTANT,
-                             help="Único contaminante admitido: PM25 (PM2.5).")
-        command.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
-        for field in fields(DataConfig):
-            if command is temporal_data and field.name in STANDALONE_PREPARE_FIELDS:
-                continue
-            value = getattr(DataConfig(), field.name)
-            options = {}
-            if field.name == "window_padding":
-                options = {"choices": ["none", "right", "both"],
-                           "help": "Padding solo de entrenamiento: none lo desactiva; right a la derecha; both también a la izquierda."}
-            elif field.name == "max_train_windows":
-                options = {"help": "Presupuesto de ventanas distintas por estación y época; se sortea del conjunto admisible."}
-            command.add_argument(f"--{field.name.replace('_', '-')}", type=type(value) if value is not None else int, **options)
-        command.add_argument("--heartbeat-seconds", type=float, default=60.0)
-        command.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
+    temporal_data.add_argument("--raw-root", type=Path, default=Path("data/raw/datos_estaciones_5m"))
+    temporal_data.add_argument("--output", type=Path, default=Path("data/backtests"))
+    temporal_data.add_argument("--pollutant", choices=[POLLUTANT, POLLUTANT.lower()], default=POLLUTANT,
+                               help="Único contaminante admitido: PM25 (PM2.5).")
+    temporal_data.add_argument("--station", action="append", help="Nombre exacto del directorio; se puede repetir.")
+    defaults = DataConfig()
+    for field in fields(DataConfig):
+        if field.name in INTERNAL_FOLD_FIELDS:
+            continue
+        flag = f"--{field.name.replace('_', '-')}"
+        value = getattr(defaults, field.name)
+        options = {}
+        if field.name == "window_padding":
+            options = {"choices": ["none", "right", "both"],
+                       "help": "Padding solo de entrenamiento: none lo desactiva; right a la derecha; both también a la izquierda."}
+        elif field.name == "max_train_windows":
+            options = {"help": "Presupuesto de ventanas distintas por estación y época; se sortea del conjunto admisible."}
+        temporal_data.add_argument(flag, type=type(value) if value is not None else int, **options)
+    temporal_data.add_argument("--heartbeat-seconds", type=float, default=60.0)
+    temporal_data.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING", "ERROR"], default="INFO")
     temporal_data.add_argument("--folds", type=int, default=3,
                                help="Número de cortes temporales; usa 1 para evaluar un solo corte.")
     temporal_data.add_argument("--min-stations", type=int, default=DEFAULT_MIN_STATIONS,
@@ -241,34 +241,29 @@ def main(argv: list[str] | None = None) -> None:
         args = parse_configured_args(parser, commands, argv)
         if getattr(args, "config", None) is not None:
             print(f"Configuración: {args.config}", flush=True)
-        if args.command in {"prepare", "prepare-backtest"}:
-            standalone_fields = STANDALONE_PREPARE_FIELDS if args.command == "prepare-backtest" else set()
-            overrides = {field.name: value for field in fields(DataConfig) if field.name not in standalone_fields
+        if args.command == "prepare-backtest":
+            from fd_airquality.backtesting import prepare_backtest
+
+            overrides = {field.name: value for field in fields(DataConfig) if field.name not in INTERNAL_FOLD_FIELDS
                          and (value := getattr(args, field.name, None)) is not None}
             log_dir = args.output / "logs" / f"prepare_{datetime.now(UTC):%Y%m%d_%H%M%S_%f}"
             with RunLogging(log_dir, f"{args.command} pollutant={args.pollutant}", level=args.log_level,
                              heartbeat_seconds=args.heartbeat_seconds) as log:
                 preparation_log = log.path
                 report_progress("prepare", f"raw_root={args.raw_root} pollutant={args.pollutant}")
-                parameters = (args.raw_root.expanduser().resolve(), args.output, args.pollutant,
-                              DataConfig(**overrides), set(args.station) if args.station else None)
-                if args.command == "prepare-backtest":
-                    from fd_airquality.backtesting import prepare_backtest
-
-                    manifest = prepare_backtest(
-                        *parameters, folds=args.folds, validation_hours=args.validation_hours,
-                        test_hours=args.test_hours, min_stations=args.min_stations,
-                        train_history=args.train_history, history_hours=args.history_hours,
-                    )
-                else:
-                    manifest = prepare(*parameters)
+                manifest = prepare_backtest(
+                    args.raw_root.expanduser().resolve(), args.output, args.pollutant,
+                    DataConfig(**overrides), set(args.station) if args.station else None,
+                    folds=args.folds, validation_hours=args.validation_hours, test_hours=args.test_hours,
+                    min_stations=args.min_stations, train_history=args.train_history, history_hours=args.history_hours,
+                )
                 report_progress("prepare", f"manifest={manifest}")
             if manifest.is_file():
                 shutil.copyfile(log.path, manifest.parent / "prepare.log")
             print(f"Manifest: {manifest}")
             _inspect(manifest)
         elif args.command == "inspect":
-            _inspect(resolve_manifest(args.manifest))
+            _inspect(resolve_manifest(args.manifest, backtest=True))
         elif args.command == "models":
             for name in MODEL_NAMES:
                 if name in GRANITE:

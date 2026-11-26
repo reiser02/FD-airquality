@@ -62,7 +62,7 @@ serverapp = "fd_airquality.server_app:app"
 clientapp = "fd_airquality.client_app:app"
 
 [tool.flwr.app.config]
-manifest = "data/federated/manifest.json"
+manifest = ""
 output-dir = "reports/federated"
 num-server-rounds = 5
 local-epochs = 1

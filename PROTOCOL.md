@@ -37,7 +37,7 @@ detecta rachas congeladas **no nulas** desde la sexta lectura de cinco minutos y
 `min_useful=1` exige una lectura útil por hora. Se aplican los límites de detección
 locales (`0.0` para PM25, con comparación inclusiva `>=`) y se marcan
 repeticiones horarias no nulas. Los ceros se tratan por separado: una racha corta
-puede ser válida; `zero_run_hours=24` (`prepare --zero-run-hours`) marca como
+puede ser válida; `zero_run_hours=24` (`prepare-backtest --zero-run-hours`) marca como
 congelado al acumular 24 horas observadas a cero desde la última hora válida no
 nula. Un hueco horario pausa el contador, sin reiniciarlo ni sumar horas a cero;
 solo una observación válida distinta de cero lo reinicia. Los huecos y congelados
@@ -51,7 +51,7 @@ imputados ni por un test más corto. `blocks.csv` permite comprobar cuántas ven
 de cada split proceden de cada bloque observado.
 
 La geometría predeterminada se define en `DataConfig` y en el archivo local
-`fd-airquality.toml`; las opciones explícitas de `prepare` prevalecen sobre ese archivo.
+`fd-airquality.toml`; las opciones explícitas de `prepare-backtest` prevalecen sobre ese archivo.
 `--config` permite seleccionar otro TOML, sin heredar el predeterminado ni configuración
 de otro proyecto. La prioridad completa está en [README.md](README.md#configuración-por-archivo).
 El manifest de
@@ -192,7 +192,7 @@ permite cruzar un hueco. Los adaptadores reciben únicamente ventanas continuas
 que ya pasaron `WindowDataset`.
 
 El padding externo, distinto del padding interno de patches, se decide en
-`[prepare].window-padding = "none" | "right" | "both"`, solo para entrenamiento
+`[prepare-backtest].window-padding = "none" | "right" | "both"`, solo para entrenamiento
 global `masked`. El TOML principal habilita `both`. Conserva arrays originales y
 enmascara posiciones virtuales o todavía no autorizadas, nunca crea etiquetas.
 Validación/test permanecen sin padding. Cambiarlo requiere preparar de nuevo.
@@ -276,7 +276,7 @@ El servidor combina sumas escaladas y recuentos para las métricas agrupadas;
 `macro-mase` y `macro-rmsse` dan el mismo peso a cada estación con escala definida.
 
 MASE/RMSSE usan una **referencia previa de 28 días naturales** (`error_scale_hours=672`,
-opción `prepare --error-scale-hours`), separada del contexto de entrada y del
+opción `prepare-backtest --error-scale-hours`), separada del contexto de entrada y del
 historial usado para ajustar pesos. En modo global se fija por los cortes de cada
 fold. Por ejemplo, con las fechas de `prepare` y la política `pre-evaluation`:
 

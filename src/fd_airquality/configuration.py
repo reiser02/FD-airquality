@@ -13,7 +13,7 @@ from fd_airquality.settings import RunSettings
 DEFAULT_CONFIG = Path("fd-airquality.toml")
 RUN_COMMANDS = {"simulate", "baseline", "backtest"}
 FIXED_PREPARE_DATES = {"train_start", "validation_start", "test_start", "test_end"}
-STANDALONE_PREPARE_FIELDS = FIXED_PREPARE_DATES | {"validation_hours", "test_hours"}
+INTERNAL_FOLD_FIELDS = FIXED_PREPARE_DATES | {"validation_hours", "test_hours", "split_mode", "quality_mode"}
 
 
 def _value(action: argparse.Action, value, location: str):
@@ -49,6 +49,9 @@ def _load(path: Path, commands: dict[str, argparse.ArgumentParser]) -> dict[str,
             f"{path}: [benchmark] ya no se admite. Traslada sus opciones a [backtest]; "
             "para un solo corte usa folds = 1 en [prepare-backtest]."
         )
+    if "prepare" in document:
+        raise ValueError(f"{path}: [prepare] ya no se admite. Traslada el preprocesamiento a [prepare-backtest] "
+                         "y usa folds = 1 para un único corte automático.")
     unknown = document.keys() - (commands.keys() | {"run", "missing", "availability"})
     if unknown:
         raise ValueError(f"Secciones desconocidas en {path}: {sorted(unknown)}")
@@ -116,10 +119,6 @@ def parse_configured_args(parser: argparse.ArgumentParser, commands: dict[str, a
         raise ValueError(str(exc)) from exc
     command = defaults["command"]
     configured = (sections.get("run", {}) if command in RUN_COMMANDS else {}) | sections.get(command, {})
-    if command == "prepare-backtest":
-        inherited = {key: value for key, value in sections.get("prepare", {}).items()
-                     if key not in STANDALONE_PREPARE_FIELDS | {"output"}}
-        configured = inherited | configured
     if command in RUN_COMMANDS and "missing" in sections:
         configured.setdefault("missing_policies", json.dumps(sections["missing"], sort_keys=True))
     if command in RUN_COMMANDS and "availability" in sections:
